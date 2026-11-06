@@ -144,7 +144,11 @@ async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
         .map(|address| resolve_script(address, &address_params))
         .transpose()?;
     if let Some(script) = mining_script {
-        let spacing = Duration::from_secs(params.target_spacing.max(1) as u64);
+        let spacing = Duration::from_secs(
+            config
+                .block_interval
+                .unwrap_or(params.target_spacing.max(1) as u64),
+        );
         println!("mining one block every {} s", spacing.as_secs());
         tokio::spawn(mine_forever(Arc::clone(&node), script, spacing));
     }
