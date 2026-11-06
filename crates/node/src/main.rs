@@ -144,13 +144,19 @@ async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
         .map(|address| resolve_script(address, &address_params))
         .transpose()?;
     if let Some(script) = mining_script {
-        let spacing = Duration::from_secs(
-            config
-                .block_interval
-                .unwrap_or(params.target_spacing.max(1) as u64),
-        );
-        println!("mining one block every {} s", spacing.as_secs());
-        tokio::spawn(mine_forever(Arc::clone(&node), script, spacing));
+        // A real miner hashes until it finds a block, then immediately builds a
+        // fresh template. `-blockinterval` keeps the old throttled behaviour.
+        let spacing = config.block_interval.map(Duration::from_secs);
+        match spacing {
+            Some(spacing) => println!("mining one block every {} s", spacing.as_secs()),
+            None => println!("mining continuously (-gen without -blockinterval)"),
+        }
+        tokio::spawn(mine_forever(
+            Arc::clone(&node),
+            script,
+            spacing,
+            config.max_blocks,
+        ));
     }
 
     tokio::select! {
@@ -168,12 +174,26 @@ async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn mine_forever(node: SharedNode, script: ScriptBuf, spacing: Duration) {
-    let mut ticker = tokio::time::interval(spacing);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    ticker.tick().await;
-    loop {
+async fn mine_forever(
+    node: SharedNode,
+    script: ScriptBuf,
+    spacing: Option<Duration>,
+    max_blocks: Option<u32>,
+) {
+    let mut ticker = spacing.map(|spacing| {
+        let mut ticker = tokio::time::interval(spacing);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        ticker
+    });
+    if let Some(ticker) = ticker.as_mut() {
+        // The first tick fires immediately; skip it so -blockinterval waits first.
         ticker.tick().await;
+    }
+    let mut mined_this_run: u32 = 0;
+    loop {
+        if let Some(ticker) = ticker.as_mut() {
+            ticker.tick().await;
+        }
         let node = Arc::clone(&node);
         let script = script.clone();
         let mined = tokio::task::spawn_blocking(move || {
@@ -186,9 +206,20 @@ async fn mine_forever(node: SharedNode, script: ScriptBuf, spacing: Duration) {
                 for hash in hashes {
                     println!("mined block {hash}");
                 }
+                mined_this_run += 1;
             }
             Ok(Err(err)) => eprintln!("mining failed: {}", err.reject_reason()),
             Err(err) => eprintln!("mining task failed: {err}"),
+        }
+        if let Some(max) = max_blocks {
+            if mined_this_run >= max {
+                println!("-gen: reached -maxblocks {max}, mining stopped");
+                return;
+            }
+        }
+        if ticker.is_none() {
+            // Continuous mode: let RPC, P2P and the shutdown signal run between blocks.
+            tokio::task::yield_now().await;
         }
     }
 }
