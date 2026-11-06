@@ -4,38 +4,101 @@
 use bitcoin::consensus::encode::{serialize, serialize_hex};
 use bitcoin::hex::DisplayHex;
 use bitcoin::pow::{CompactTarget, Target};
-use bitcoin::Network as BitcoinNetwork;
 use bitcoin_hashes::Hash;
 use btc_primitives::{Block, BlockHash, BlockHeader, ScriptBuf, Tx, TxIn, TxOut};
-use btc_wallet::address::{encode_address, Network};
+use btc_wallet::address::{decode_address_with, encode_address_with, AddressParams};
 use serde_json::{json, Map, Value};
 
 const BLOCK_HEADER_SIZE: usize = 80;
+/// Program of pay-to-anchor (`OP_1 <0x4e73>`).
+const PAY_TO_ANCHOR_PROGRAM: [u8; 2] = [0x4e, 0x73];
 
-/// Converts satoshis to the BTC-denominated JSON number Core uses.
+/// Renders satoshis as the BTC number Core prints (`ValueFromAmount`): exactly eight
+/// decimals. Needs serde_json's `arbitrary_precision` feature to keep the digits.
 pub(crate) fn amount(sats: i64) -> Value {
-    json!(sats as f64 / 100_000_000.0)
+    let sign = if sats < 0 { "-" } else { "" };
+    let magnitude = sats.unsigned_abs();
+    let text = format!(
+        "{sign}{}.{:08}",
+        magnitude / 100_000_000,
+        magnitude % 100_000_000
+    );
+    serde_json::from_str(&text).expect("a decimal literal is valid JSON")
 }
 
-/// Maps the node's network to the one the address codec uses. Testnet4 and signet
-/// share the `tb` bech32 prefix with testnet.
-pub(crate) fn wallet_network(network: BitcoinNetwork) -> Network {
-    match network {
-        BitcoinNetwork::Bitcoin => Network::Main,
-        BitcoinNetwork::Regtest => Network::Regtest,
-        _ => Network::Test,
-    }
+pub(crate) fn script_hex(script: &ScriptBuf) -> String {
+    script.as_bytes().to_lower_hex_string()
 }
 
-pub(crate) fn script_json(script: &ScriptBuf, network: Network) -> Value {
+/// The address `script` pays to under `params`, when it has one.
+pub(crate) fn address_of(params: &AddressParams, script: &ScriptBuf) -> Option<String> {
+    encode_address_with(params, script).ok()
+}
+
+pub(crate) fn script_json(script: &ScriptBuf, params: &AddressParams) -> Value {
     let mut m = Map::new();
     m.insert("asm".into(), json!(script.to_asm_string()));
-    m.insert("hex".into(), json!(script.as_bytes().to_lower_hex_string()));
+    m.insert("hex".into(), json!(script_hex(script)));
     m.insert("type".into(), json!(script_type(script)));
-    if let Ok(address) = encode_address(network, script) {
+    if let Some(address) = address_of(params, script) {
         m.insert("address".into(), json!(address));
     }
     Value::Object(m)
+}
+
+/// `validateaddress`: the decoded address in canonical form, or `{"isvalid": false}`.
+pub(crate) fn validate_address(params: &AddressParams, text: &str) -> Value {
+    let decoded = decode_address_with(params, text)
+        .ok()
+        .and_then(|script| address_of(params, &script).map(|address| (script, address)));
+    let Some((script, address)) = decoded else {
+        return json!({ "isvalid": false });
+    };
+    let mut m = Map::new();
+    m.insert("isvalid".into(), json!(true));
+    m.insert("address".into(), json!(address));
+    m.insert("scriptPubKey".into(), json!(script_hex(&script)));
+    describe_script(&script, &mut m);
+    Value::Object(m)
+}
+
+/// The `isscript`, `iswitness` and witness fields of `DescribeAddress`.
+fn describe_script(script: &ScriptBuf, m: &mut Map<String, Value>) {
+    if script.is_p2pkh() {
+        m.insert("isscript".into(), json!(false));
+        m.insert("iswitness".into(), json!(false));
+        return;
+    }
+    if script.is_p2sh() {
+        m.insert("isscript".into(), json!(true));
+        m.insert("iswitness".into(), json!(false));
+        return;
+    }
+    let Some(version) = script.witness_version() else {
+        return;
+    };
+    let version = version.to_num();
+    let program = &script.as_bytes()[2..];
+    if version == 1 && program == PAY_TO_ANCHOR_PROGRAM.as_slice() {
+        m.insert("isscript".into(), json!(true));
+        m.insert("iswitness".into(), json!(true));
+        return;
+    }
+    match (version, program.len()) {
+        (0, 20) => {
+            m.insert("isscript".into(), json!(false));
+        }
+        (0, 32) | (1, 32) => {
+            m.insert("isscript".into(), json!(true));
+        }
+        _ => {}
+    }
+    m.insert("iswitness".into(), json!(true));
+    m.insert("witness_version".into(), json!(version));
+    m.insert(
+        "witness_program".into(),
+        json!(program.to_lower_hex_string()),
+    );
 }
 
 fn script_type(script: &ScriptBuf) -> &'static str {
@@ -100,7 +163,7 @@ pub(crate) fn block_json(
     block: &Block,
     height: u32,
     confirmations: i64,
-    network: Network,
+    params: &AddressParams,
     decode_txs: bool,
 ) -> Value {
     let size = serialize(block).len();
@@ -116,7 +179,7 @@ pub(crate) fn block_json(
         block
             .txdata
             .iter()
-            .map(|tx| tx_json(tx, network, false))
+            .map(|tx| tx_json(tx, params, false))
             .collect()
     } else {
         block
@@ -130,7 +193,7 @@ pub(crate) fn block_json(
 }
 
 /// Decoded transaction as in `TxToUniv`.
-pub(crate) fn tx_json(tx: &Tx, network: Network, with_hex: bool) -> Value {
+pub(crate) fn tx_json(tx: &Tx, params: &AddressParams, with_hex: bool) -> Value {
     let size = tx.total_size();
     let weight = stripped_size(tx) * 3 + size;
     let mut m = Map::new();
@@ -151,7 +214,7 @@ pub(crate) fn tx_json(tx: &Tx, network: Network, with_hex: bool) -> Value {
             tx.vout
                 .iter()
                 .enumerate()
-                .map(|(n, output)| vout_json(output, n, network))
+                .map(|(n, output)| vout_json(output, n, params))
                 .collect(),
         ),
     );
@@ -191,11 +254,11 @@ fn vin_json(tx: &Tx, input: &TxIn) -> Value {
     Value::Object(m)
 }
 
-fn vout_json(output: &TxOut, n: usize, network: Network) -> Value {
+fn vout_json(output: &TxOut, n: usize, params: &AddressParams) -> Value {
     json!({
         "value": amount(output.value),
         "n": n,
-        "scriptPubKey": script_json(&output.script_pubkey, network),
+        "scriptPubKey": script_json(&output.script_pubkey, params),
     })
 }
 
