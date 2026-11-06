@@ -1,5 +1,4 @@
-// btc-node
-// Modular translation of the Bitcoin Core node daemon.
-// Reference: D:\bitcoin-core-reference
+//! btc-node: daemon glue (config, node core, RPC backend, P2P loop).
 
 pub mod config;
+pub mod node;

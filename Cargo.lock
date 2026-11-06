@@ -147,10 +147,21 @@ dependencies = [
 name = "btc-node"
 version = "0.1.0"
 dependencies = [
+ "bitcoin",
+ "bitcoin_hashes",
+ "btc-chain",
  "btc-consensus",
+ "btc-network",
  "btc-primitives",
+ "btc-rpc",
+ "btc-script",
+ "btc-validation",
+ "btc-wallet",
+ "primitive-types",
  "serde",
+ "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
