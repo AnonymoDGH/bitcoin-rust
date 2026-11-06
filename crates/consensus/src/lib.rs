@@ -18,7 +18,7 @@ pub mod pow;
 pub mod subsidy;
 
 pub use compact::{decode_compact, encode_compact, CompactError};
-pub use params::{ChainParams, ChainType};
+pub use params::{ChainParams, ChainType, Deployments};
 pub use pow::{
     calculate_next_work_required, chain_work, next_work_required, work_from_bits, RetargetInput,
 };

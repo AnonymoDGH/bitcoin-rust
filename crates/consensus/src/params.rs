@@ -92,6 +92,32 @@ pub struct ChainParams {
     pub no_retargeting: bool,
     /// `enforce_BIP94` (testnet4 timewarp mitigation; off for these chains).
     pub enforce_bip94: bool,
+    /// Buried deployment heights and script-flag exceptions.
+    pub deployments: Deployments,
+}
+
+/// Buried soft-fork activation heights (`Consensus::Params`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Deployments {
+    /// BIP34: coinbase must start with the block height.
+    pub bip34_height: u32,
+    /// BIP65: OP_CHECKLOCKTIMEVERIFY.
+    pub bip65_height: u32,
+    /// BIP66: strict DER signatures.
+    pub bip66_height: u32,
+    /// BIP68/112/113: relative lock-time (CSV).
+    pub csv_height: u32,
+    /// BIP141/143/147: SegWit.
+    pub segwit_height: u32,
+    /// `script_flag_exceptions`: block hash -> script verify flags bits.
+    pub script_flag_exceptions: Vec<(BlockHash, u64)>,
+}
+
+impl Deployments {
+    /// Every rule active from block 1 (regtest / new chains).
+    pub fn all_active() -> Self {
+        Self { bip34_height: 1, bip65_height: 1, bip66_height: 1, csv_height: 1, segwit_height: 0, script_flag_exceptions: Vec::new() }
+    }
 }
 
 impl ChainParams {
@@ -112,6 +138,19 @@ impl ChainParams {
             allow_min_difficulty_blocks: false,
             no_retargeting: false,
             enforce_bip94: false,
+            deployments: Deployments {
+                bip34_height: 227_931,
+                bip65_height: 388_381,
+                bip66_height: 363_725,
+                csv_height: 419_328,
+                segwit_height: 481_824,
+                script_flag_exceptions: vec![
+                    // BIP16 exception: SCRIPT_VERIFY_NONE.
+                    (parse_hash("00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"), 0),
+                    // Taproot exception: P2SH | WITNESS.
+                    (parse_hash("0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"), (1 << 0) | (1 << 11)),
+                ],
+            },
         }
     }
 
@@ -132,6 +171,16 @@ impl ChainParams {
             allow_min_difficulty_blocks: true,
             no_retargeting: false,
             enforce_bip94: false,
+            deployments: Deployments {
+                bip34_height: 21_111,
+                bip65_height: 581_885,
+                bip66_height: 330_776,
+                csv_height: 770_112,
+                segwit_height: 834_624,
+                script_flag_exceptions: vec![
+                    (parse_hash("00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105"), 0),
+                ],
+            },
         }
     }
 
@@ -153,6 +202,7 @@ impl ChainParams {
             allow_min_difficulty_blocks: true,
             no_retargeting: true,
             enforce_bip94: false,
+            deployments: Deployments::all_active(),
         }
     }
 
