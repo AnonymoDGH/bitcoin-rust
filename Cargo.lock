@@ -155,6 +155,7 @@ dependencies = [
  "btc-primitives",
  "btc-rpc",
  "btc-script",
+ "btc-storage",
  "btc-validation",
  "btc-wallet",
  "primitive-types",

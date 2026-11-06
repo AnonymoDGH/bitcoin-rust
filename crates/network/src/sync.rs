@@ -28,8 +28,9 @@ pub const MAX_NUM_UNCONNECTING_HEADERS_MSGS: u32 = 10;
 pub const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 /// `BLOCK_DOWNLOAD_WINDOW`: blocks requested from the first one still missing.
 pub const BLOCK_DOWNLOAD_WINDOW: usize = 1024;
-/// `BLOCK_STALLING_TIMEOUT` default, in seconds.
-pub const BLOCK_STALLING_TIMEOUT_SECS: u64 = 2;
+/// Simplified stall rule: any request older than this drops the peer. Core uses
+/// an adaptive 2..64 s window-head timeout; a fixed 2 s is too tight here.
+pub const BLOCK_STALLING_TIMEOUT_SECS: u64 = 60;
 /// Bound on remembered transaction inventories, so repeated announcements are not re-fetched.
 pub const MAX_RECENT_TX_INV: usize = 10_000;
 
@@ -559,11 +560,11 @@ mod tests {
 
         sync.peer_connected(2, 20);
         sync.on_message(&chain, 2, block_inv(tip));
-        let out = sync.tick(&chain, 2);
+        let out = sync.tick(&chain, BLOCK_STALLING_TIMEOUT_SECS);
         assert!(!out.iter().any(|a| matches!(a, SyncAction::Disconnect(..))));
         assert_eq!(getdata_blocks(&out, 2), chain.path[16..20].to_vec());
 
-        let out = sync.tick(&chain, 3);
+        let out = sync.tick(&chain, BLOCK_STALLING_TIMEOUT_SECS + 1);
         assert!(out
             .iter()
             .any(|a| matches!(a, SyncAction::Disconnect(1, _))));

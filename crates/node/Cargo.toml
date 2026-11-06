@@ -12,6 +12,7 @@ btc-chain = { path = "../chain" }
 btc-network = { path = "../network" }
 btc-wallet = { path = "../wallet" }
 btc-rpc = { path = "../rpc" }
+btc-storage = { path = "../storage" }
 bitcoin = { workspace = true }
 bitcoin_hashes = { workspace = true }
 primitive-types = "0.13"
