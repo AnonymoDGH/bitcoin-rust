@@ -62,9 +62,11 @@ pub struct NodeConfig {
     pub generate: bool,
     /// Address or script hex that mined blocks pay to (`-genaddress=`).
     pub gen_address: Option<String>,
-    /// Seconds between `-gen` blocks (`-blockinterval=`). Defaults to the
-    /// chain's `target_spacing` (600 s).
+    /// Seconds between `-gen` blocks (`-blockinterval=`). `None` mines
+    /// continuously: the next template starts as soon as a block is found.
     pub block_interval: Option<u64>,
+    /// Stop `-gen` after this many blocks (`-maxblocks=`). `None` mines forever.
+    pub max_blocks: Option<u32>,
     /// Print an example chain spec and exit (`-printchainspec`).
     pub print_chainspec: bool,
 }
@@ -123,6 +125,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
     let mut generate = false;
     let mut gen_address: Option<String> = None;
     let mut block_interval: Option<u64> = None;
+    let mut max_blocks: Option<u32> = None;
     let mut print_chainspec = false;
 
     for arg in args {
@@ -171,6 +174,16 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
                     });
                 }
                 block_interval = Some(secs);
+            }
+            "maxblocks" => {
+                let blocks = parse_value::<u32>("maxblocks", value)?;
+                if blocks == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        name: "maxblocks",
+                        value: "0".to_owned(),
+                    });
+                }
+                max_blocks = Some(blocks);
             }
             "printchainspec" => print_chainspec = parse_bool("printchainspec", value)?,
             _ => return Err(ConfigError::UnknownOption(arg.to_string())),
@@ -263,6 +276,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
         generate,
         gen_address,
         block_interval,
+        max_blocks,
         print_chainspec,
     })
 }
@@ -473,6 +487,7 @@ mod tests {
         assert!(config.generate);
         assert_eq!(config.gen_address.as_deref(), Some("51"));
         assert_eq!(config.block_interval, None);
+        assert_eq!(config.max_blocks, None);
 
         assert_eq!(
             parse(&["-gen"]),
@@ -560,6 +575,20 @@ mod tests {
             parse(&["-blockinterval=0"]),
             Err(ConfigError::InvalidValue {
                 name: "blockinterval",
+                value: "0".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn maxblocks_stops_continuous_mining() {
+        let config = parse(&["-gen", "-genaddress=51", "-maxblocks=5"]).unwrap();
+        assert_eq!(config.block_interval, None, "no interval means continuous");
+        assert_eq!(config.max_blocks, Some(5));
+        assert_eq!(
+            parse(&["-maxblocks=0"]),
+            Err(ConfigError::InvalidValue {
+                name: "maxblocks",
                 value: "0".to_owned()
             })
         );
