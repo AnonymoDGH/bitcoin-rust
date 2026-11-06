@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 btc-primitives = { path = "../primitives" }
 btc-validation = { path = "../validation" }
+btc-chain = { path = "../chain" }
 bitcoin = { workspace = true }
 bitcoin_hashes = { workspace = true }
 thiserror = { workspace = true }
