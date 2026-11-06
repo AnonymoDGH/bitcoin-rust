@@ -16,6 +16,7 @@ pub mod contextual;
 pub mod connect;
 pub mod chainstate;
 pub mod miner;
+pub mod mempool_accept;
 
 pub use error::ValidationError;
 pub use index::{ActiveChain, BlockIndex, BlockStatus, BlockTree, IndexId};
