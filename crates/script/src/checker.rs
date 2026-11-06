@@ -62,10 +62,13 @@ impl SignatureChecker for TransactionSignatureChecker<'_> {
             Ok(pk) => pk,
             Err(_) => return false,
         };
-        let ecdsa_sig = match EcdsaSignature::from_der_lax(der_bytes) {
+        let mut ecdsa_sig = match EcdsaSignature::from_der_lax(der_bytes) {
             Ok(s) => s,
             Err(_) => return false,
         };
+        // Core's CPubKey::Verify normalizes to lower-S before verifying;
+        // libsecp256k1's verify rejects non-normalized signatures.
+        ecdsa_sig.normalize_s();
         let msg = match Message::from_slice(&sighash) {
             Ok(m) => m,
             Err(_) => return false,

@@ -24,15 +24,20 @@ pub(crate) fn cast_to_bool(v: &[u8]) -> bool {
 }
 
 fn is_minimal_push(data: &[u8], opcode: u8) -> bool {
-    match opcode {
-        OP_0 => data.is_empty(),
-        0x01..=0x4b => data.len() == opcode as usize && opcode as usize <= 75,
-        OP_PUSHDATA1 => data.len() > 75 && data.len() <= 255,
-        OP_PUSHDATA2 => data.len() > 255 && data.len() <= 65535,
-        OP_PUSHDATA4 => data.len() > 65535,
-        OP_1NEGATE => data.len() == 1 && data[0] == 0x81,
-        OP_1..=OP_16 => data.len() == 1 && data[0] == (opcode - 0x50),
-        _ => false,
+    // Core's CheckMinimalPush: OP_1NEGATE and OP_1..OP_16 are always minimal.
+    if opcode == OP_1NEGATE || (OP_1..=OP_16).contains(&opcode) {
+        return true;
+    }
+    match data.len() {
+        0 => opcode == OP_0,
+        // 1-byte data in 1..=16 must have been pushed as OP_1..OP_16.
+        1 if (1..=16).contains(&data[0]) => opcode == OP_1 + (data[0] - 1),
+        // 0x81 must have been pushed as OP_1NEGATE.
+        1 if data[0] == 0x81 => opcode == OP_1NEGATE,
+        1..=75 => opcode as usize == data.len(),
+        76..=255 => opcode == OP_PUSHDATA1,
+        256..=65535 => opcode == OP_PUSHDATA2,
+        _ => opcode == OP_PUSHDATA4,
     }
 }
 
@@ -189,16 +194,23 @@ fn multisig_verify_operands(
     flags: ScriptVerifyFlags,
     checker: &dyn SignatureChecker,
     sigversion: SigVersion,
+    op_count: &mut i64,
 ) -> Result<bool, ScriptError> {
     let n_num = pop_number(stack, flags.contains(ScriptVerifyFlags::MINIMALDATA), MAX_NUM_SIZE)?;
     let n = n_num.value();
     if n < 0 || n > MAX_PUBKEYS_PER_MULTISIG as i64 {
         return Err(ScriptError::PubkeyCount);
     }
+    // Core: nOpCount += nKeysCount; op count limit applies to CHECKMULTISIG too.
+    *op_count += n;
+    if *op_count > MAX_OPS_PER_SCRIPT as i64 {
+        return Err(ScriptError::OpCount);
+    }
     if stack.len() < n as usize {
         return Err(ScriptError::InvalidStackOperation);
     }
-    let pubkeys: Vec<Vec<u8>> = stack.drain(stack.len() - n as usize..).collect();
+    // Core reads operands from the top of the stack downward (stacktop(-i)); collect in that order.
+    let pubkeys: Vec<Vec<u8>> = stack.drain(stack.len() - n as usize..).rev().collect();
 
     let m_num = pop_number(stack, flags.contains(ScriptVerifyFlags::MINIMALDATA), MAX_NUM_SIZE)?;
     let m = m_num.value();
@@ -208,7 +220,7 @@ fn multisig_verify_operands(
     if stack.len() < m as usize {
         return Err(ScriptError::InvalidStackOperation);
     }
-    let sigs: Vec<Vec<u8>> = stack.drain(stack.len() - m as usize..).collect();
+    let sigs: Vec<Vec<u8>> = stack.drain(stack.len() - m as usize..).rev().collect();
 
     // Core drops the dummy argument as part of the argument cleanup; NULLDUMMY checks it here.
     let dummy = stack.pop().ok_or(ScriptError::InvalidStackOperation)?;
@@ -323,11 +335,6 @@ pub fn eval_script(
             return Ok(());
         }
 
-        // SIGPUSHONLY (only when executed).
-        if f_exec_branch && flags.contains(ScriptVerifyFlags::SIGPUSHONLY) && opcode > OP_16 {
-            return Err(ScriptError::SigPushonly);
-        }
-
         if f_exec_branch && opcode <= OP_PUSHDATA4 {
             if require_minimal && !is_minimal_push(&push_bytes, opcode) {
                 return Err(ScriptError::Minimaldata);
@@ -341,23 +348,26 @@ pub fn eval_script(
         }
 
         if !f_exec_branch {
-            match opcode {
-                OP_IF | OP_NOTIF => {
-                    f_exec.push(false);
-                }
-                OP_ELSE => {
-                    if f_exec.empty() {
-                        return Err(ScriptError::UnbalancedConditional);
+            if opcode >= OP_IF && opcode <= OP_ENDIF {
+                match opcode {
+                    OP_IF | OP_NOTIF => {
+                        f_exec.push(false);
                     }
-                    f_exec.toggle_top()?;
-                }
-                OP_ENDIF => {
-                    if f_exec.empty() {
-                        return Err(ScriptError::UnbalancedConditional);
+                    OP_ELSE => {
+                        if f_exec.empty() {
+                            return Err(ScriptError::UnbalancedConditional);
+                        }
+                        f_exec.toggle_top()?;
                     }
-                    f_exec.pop()?;
+                    OP_ENDIF => {
+                        if f_exec.empty() {
+                            return Err(ScriptError::UnbalancedConditional);
+                        }
+                        f_exec.pop()?;
+                    }
+                    // Verif/Vernotif: illegal everywhere.
+                    _ => return Err(ScriptError::BadOpcode),
                 }
-                _ => {}
             }
             opcode_pos += 1;
             continue;
@@ -447,7 +457,7 @@ pub fn eval_script(
 
             // Stack ops
             OP_TOALTSTACK => {
-                let top = stack.pop().ok_or(ScriptError::InvalidAltstackOperation)?;
+                let top = stack.pop().ok_or(ScriptError::InvalidStackOperation)?;
                 altstack.push(top);
             }
             OP_FROMALTSTACK => {
@@ -583,7 +593,7 @@ pub fn eval_script(
                     push_number(stack, if eq { 1 } else { 0 });
                 }
             }
-            OP_RESERVED1 | OP_RESERVED2 => return Err(ScriptError::DisabledOpcode), // reserved, never valid
+            OP_RESERVED1 | OP_RESERVED2 => return Err(ScriptError::BadOpcode),
 
             // Numeric ops
             OP_1ADD => {
@@ -718,7 +728,7 @@ pub fn eval_script(
                 }
             }
             OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => {
-                let ok = multisig_verify_operands(stack, script, code_start, flags, checker, sigversion)?;
+                let ok = multisig_verify_operands(stack, script, code_start, flags, checker, sigversion, &mut op_count)?;
                 if opcode == OP_CHECKMULTISIGVERIFY {
                     if !ok {
                         return Err(ScriptError::CheckMultisigVerify);
@@ -729,7 +739,7 @@ pub fn eval_script(
             }
             OP_CHECKSIGADD => {
                 if sigversion != SigVersion::Tapscript {
-                    return Err(ScriptError::DisabledOpcode);
+                    return Err(ScriptError::BadOpcode);
                 }
                 // Core: sig = stacktop(-3), num = stacktop(-2), pubkey = stacktop(-1).
                 let pubkey = stack.pop().ok_or(ScriptError::InvalidStackOperation)?;
@@ -772,6 +782,10 @@ pub fn eval_script(
     exec_data.validation_weight_left; // keep field referenced in all paths
     Ok(())
 }
+
+
+
+
 
 
 
