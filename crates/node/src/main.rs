@@ -127,7 +127,7 @@ async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
         accept_local: config.chain == ChainType::Regtest,
         ..P2pConfig::default()
     };
-    tokio::spawn(run_p2p(Arc::clone(&node), p2p_config, Arc::clone(&shutdown)));
+    let p2p_task = tokio::spawn(run_p2p(Arc::clone(&node), p2p_config, Arc::clone(&shutdown)));
 
     if let Some(script) = mining_script {
         let spacing = Duration::from_secs(params.target_spacing.max(1) as u64);
@@ -143,7 +143,9 @@ async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
         _ = shutdown.notified() => println!("shutdown requested (rpc stop)"),
         served = &mut rpc_task => return Err(format!("RPC server stopped: {served:?}").into()),
     }
-    // Let an in-flight `stop` reply reach the client before the runtime shuts down.
+    // Stop the P2P layer so it writes peers.dat, then let an in-flight `stop` reply reach the client.
+    shutdown.notify_one();
+    let _ = tokio::time::timeout(Duration::from_secs(5), p2p_task).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     Ok(())
 }

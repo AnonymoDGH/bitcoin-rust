@@ -248,9 +248,7 @@ async fn dial_loop(addr: SocketAddr, ctx: Arc<Ctx>, link: Link) {
 /// One outbound attempt, then serve the connection until it ends.
 async fn dial_once(addr: SocketAddr, ctx: &Ctx, link: Link) {
     let limit = if link == Link::Auto { DIAL_TIMEOUT } else { CONNECT_TIMEOUT };
-    let r = timeout(limit, Peer::connect(addr, &ctx.params)).await;
-    eprintln!("DBG dial {addr} {link:?} ok={}", matches!(r, Ok(Ok(_))));
-    match r {
+    match timeout(limit, Peer::connect(addr, &ctx.params)).await {
         Ok(Ok(peer)) => serve_connection(peer, ctx, addr, link).await,
         _ => {
             let _ = ctx.events.send(Event::DialFailed { addr, link }).await;
@@ -265,9 +263,7 @@ async fn serve_connection(mut peer: Peer<TcpStream>, ctx: &Ctx, addr: SocketAddr
         start_height: ctx.height(),
         ..LocalVersion::default()
     };
-    let hs = peer.handshake(&local).await;
-    eprintln!("DBG handshake {addr} {link:?} ok={}", hs.is_ok());
-    let Ok(info) = hs else {
+    let Ok(info) = peer.handshake(&local).await else {
         if link != Link::Inbound {
             let _ = ctx.events.send(Event::DialFailed { addr, link }).await;
         }
@@ -444,7 +440,6 @@ impl Manager {
         if link == Link::Inbound {
             return;
         }
-        eprintln!("DBG connected {addr} {link:?} height={start_height}");
         if link == Link::Auto {
             self.dialing.remove(&addr);
         }
@@ -464,7 +459,6 @@ impl Manager {
         if !self.peers.contains_key(&id) {
             return;
         }
-        eprintln!("DBG on_message {id} {:?}", std::mem::discriminant(&msg));
         let msg = match from_wire(self.magic, msg) {
             Inbound::Message(msg) => msg,
             Inbound::Ignored => return,
@@ -662,18 +656,17 @@ impl Manager {
             return;
         }
 
+        // Each `select` can be costly (it retries while the chance is low), so the
+        // number of draws per tick is bounded. Rejected draws are cheap to repeat later.
         let mut free = max - auto;
-        let attempts = 4 * max + 16;
-        for _ in 0..attempts {
-            if free == 0 {
-                break;
-            }
+        let mut draws = 2 * free + 2;
+        while free > 0 && draws > 0 {
+            draws -= 1;
             let candidate = lock_addrman(&self.addrman).select(false);
             let Some(candidate) = candidate else {
                 break;
             };
             let addr = SocketAddr::new(candidate.ip, candidate.port);
-            eprintln!("DBG candidate {addr} allowed={}", self.dial_allowed(addr));
             if !self.dial_allowed(addr) {
                 continue;
             }
@@ -754,7 +747,6 @@ impl Manager {
     }
 
     fn execute(&mut self, actions: Vec<SyncAction>) {
-        if !actions.is_empty() { eprintln!("DBG execute {} actions", actions.len()); }
         for action in actions {
             match action {
                 SyncAction::Send(id, msg) => {
@@ -799,7 +791,6 @@ impl Manager {
     }
 
     fn drop_peer(&mut self, id: PeerId) {
-        eprintln!("DBG drop_peer {id} link={:?}", self.peers.get(&id).map(|p| p.link));
         self.sync.peer_disconnected(id);
         self.peers.remove(&id);
     }
@@ -1438,7 +1429,7 @@ mod tests {
         let e = regtest_node().shared();
         let stop_e = Arc::new(Notify::new());
         let config_e = P2pConfig {
-            outbound_interval: Duration::from_millis(20),
+            outbound_interval: Duration::from_millis(100),
             ..config(Vec::new())
         };
         tokio::spawn(run_with_listener(e.clone(), None, config_e, known, stop_e.clone()));

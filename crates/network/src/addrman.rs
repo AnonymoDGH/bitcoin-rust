@@ -457,11 +457,9 @@ impl AddrMan {
             let start = bucket * ADDRMAN_BUCKET_SIZE;
             let mut candidates = [0u64; ADDRMAN_BUCKET_SIZE];
             let mut n = 0;
-            for slot in &table[start..start + ADDRMAN_BUCKET_SIZE] {
-                if let Some(id) = slot {
-                    candidates[n] = *id;
-                    n += 1;
-                }
+            for id in table[start..start + ADDRMAN_BUCKET_SIZE].iter().flatten() {
+                candidates[n] = *id;
+                n += 1;
             }
             if n == 0 {
                 continue;
