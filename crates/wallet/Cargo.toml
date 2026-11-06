@@ -6,7 +6,9 @@ edition = "2021"
 [dependencies]
 btc-primitives = { path = "../primitives" }
 btc-consensus = { path = "../consensus" }
+btc-script = { path = "../script" }
 bitcoin = { workspace = true }
 bitcoin_hashes = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+getrandom = "0.2"

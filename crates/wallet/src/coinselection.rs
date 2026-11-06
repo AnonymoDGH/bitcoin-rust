@@ -336,16 +336,14 @@ pub fn knapsack_solver(
         if g.amount() < target + change_target {
             total_lower += g.amount();
             applicable.push(g);
-        } else if lowest_larger.map_or(true, |l| g.amount() < l.amount()) {
+        } else if lowest_larger.is_none_or(|l| g.amount() < l.amount()) {
             lowest_larger = Some(g);
         }
     }
 
-    if total_lower == target {
-        if weight_of(&applicable) <= max_selection_weight {
-            return make_result(&applicable, target);
-        }
-        // Too heavy: fall through to the subset search, as Core does.
+    // Too heavy: fall through to the subset search, as Core does.
+    if total_lower == target && weight_of(&applicable) <= max_selection_weight {
+        return make_result(&applicable, target);
     }
 
     if total_lower < target {
