@@ -11,7 +11,9 @@ use btc_chain::mempool_accept::MempoolReject;
 use btc_chain::IndexId;
 use btc_consensus::{ChainParams, ChainType};
 use btc_primitives::{Block, BlockHash, BlockHeader, OutPoint, ScriptBuf, Tx, TxOut, Txid};
-use btc_rpc::{BlockchainInfo, MempoolInfo, RpcBackend};
+use btc_rpc::{BlockchainInfo, MempoolInfo, RpcBackend, WalletInfo, WalletRpc, WalletTx, WalletUtxo};
+use btc_wallet::{Category, ScriptKind, Wallet, WalletError};
+use crate::node::wallet_error_message;
 use btc_wallet::address::AddressParams;
 use tokio::sync::Notify;
 
@@ -162,6 +164,14 @@ impl RpcBackend for NodeRpc {
             pubkey_prefix: n.params.pubkey_address_prefix,
             script_prefix: n.params.script_address_prefix,
         })
+    }
+
+    fn wallet(&self) -> Option<&dyn WalletRpc> {
+        if self.with_node(|n| n.wallet.is_some()) {
+            Some(self)
+        } else {
+            None
+        }
     }
 
     fn stop(&self) {
@@ -357,5 +367,141 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(500), shutdown.notified())
             .await
             .expect("stop should notify the shutdown handle");
+    }
+}
+
+impl NodeRpc {
+    fn with_wallet<T>(&self, f: impl FnOnce(&mut Wallet, u32) -> T) -> Option<T> {
+        self.with_node(|n| {
+            let tip = n.chainstate.height();
+            n.wallet.as_mut().map(|w| f(w, tip))
+        })
+    }
+}
+
+fn unix_now() -> u64 {
+    crate::node::now_secs().max(0) as u64
+}
+
+impl WalletRpc for NodeRpc {
+    fn get_new_address(&self, kind: Option<&str>) -> Result<ScriptBuf, String> {
+        let kind = match kind.unwrap_or("bech32") {
+            "legacy" => ScriptKind::P2pkh,
+            "p2sh-segwit" => ScriptKind::P2shP2wpkh,
+            "bech32" => ScriptKind::P2wpkh,
+            "bech32m" => ScriptKind::P2tr,
+            other => return Err(format!("Unknown address type '{other}'")),
+        };
+        self.with_wallet(|w, _| w.new_script(kind).map_err(wallet_error_message))
+            .unwrap_or_else(|| Err("wallet disabled".into()))
+    }
+
+    fn get_balance(&self, minconf: u32) -> i64 {
+        self.with_wallet(|w, tip| w.balance(tip, minconf)).unwrap_or(0)
+    }
+
+    fn list_unspent(&self, minconf: u32, maxconf: u32) -> Vec<WalletUtxo> {
+        self.with_wallet(|w, tip| {
+            let locked = w.is_locked(unix_now());
+            w.list_unspent(tip, minconf, maxconf)
+                .into_iter()
+                .map(|(outpoint, txout, confirmations)| WalletUtxo {
+                    outpoint,
+                    script_pubkey: txout.script_pubkey,
+                    amount: txout.value,
+                    confirmations,
+                    spendable: !locked || !w.is_encrypted(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    fn send_to(&self, script: ScriptBuf, amount: i64, fee_rate: Option<i64>, subtract_fee: bool) -> Result<Txid, String> {
+        self.with_node(|n| n.wallet_send(script, amount, fee_rate, subtract_fee))
+    }
+
+    fn dump_privkey(&self, script: &ScriptBuf) -> Result<String, String> {
+        self.with_wallet(|w, _| w.dump_wif(script).map_err(wallet_error_message))
+            .unwrap_or_else(|| Err("wallet disabled".into()))
+    }
+
+    fn import_privkey(&self, wif: &str) -> Result<(), String> {
+        self.with_node(|n| {
+            let w = n.wallet.as_mut().ok_or("wallet disabled")?;
+            w.import_wif(wif).map_err(|e| match e {
+                WalletError::Key(_) => "Invalid private key encoding".to_string(),
+                other => wallet_error_message(other),
+            })?;
+            // Rescan the active chain so coins of the imported key show up.
+            let cs = &n.chainstate;
+            for height in 1..=cs.height() {
+                if let Some(block) = cs.block_hash_at(height).and_then(|h| cs.get_block(&h)) {
+                    w.block_connected(&block, height).map_err(wallet_error_message)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn wallet_info(&self) -> WalletInfo {
+        self.with_wallet(|w, tip| WalletInfo {
+            name: "wallet".into(),
+            balance: w.balance(tip, 1),
+            unconfirmed_balance: w.unconfirmed_balance(),
+            immature_balance: w.immature_balance(tip),
+            tx_count: w.transactions().len(),
+            keypool_size: 0,
+            encrypted: w.is_encrypted(),
+            unlocked_until: if w.is_encrypted() && !w.is_locked(unix_now()) { w.unlocked_until() } else { 0 },
+        })
+        .unwrap_or_default()
+    }
+
+    fn list_transactions(&self, count: usize, skip: usize) -> Vec<WalletTx> {
+        self.with_wallet(|w, tip| {
+            let all = w.transactions();
+            let end = all.len().saturating_sub(skip);
+            let start = end.saturating_sub(count);
+            all[start..end]
+                .iter()
+                .map(|r| {
+                    let confirmations = r.height.map_or(0, |h| i64::from(tip) - i64::from(h) + 1);
+                    let category = match r.category {
+                        Category::Send => "send",
+                        Category::Receive => "receive",
+                        Category::Generate if confirmations > 100 => "generate",
+                        Category::Generate => "immature",
+                    };
+                    WalletTx {
+                        txid: r.txid,
+                        category: category.into(),
+                        amount: r.amount,
+                        fee: r.fee.map(|f| -f.abs()),
+                        script_pubkey: None,
+                        confirmations,
+                        blockhash: r.block_hash,
+                        time: r.time,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    fn encrypt_wallet(&self, passphrase: &str) -> Result<(), String> {
+        self.with_wallet(|w, _| w.encrypt(passphrase).map_err(wallet_error_message))
+            .unwrap_or_else(|| Err("wallet disabled".into()))
+    }
+
+    fn wallet_passphrase(&self, passphrase: &str, timeout_secs: u64) -> Result<(), String> {
+        let until = unix_now() + timeout_secs.min(100_000_000);
+        self.with_wallet(|w, _| w.unlock(passphrase, until).map_err(wallet_error_message))
+            .unwrap_or_else(|| Err("wallet disabled".into()))
+    }
+
+    fn wallet_lock(&self) -> Result<(), String> {
+        self.with_wallet(|w, _| w.lock().map_err(wallet_error_message))
+            .unwrap_or_else(|| Err("wallet disabled".into()))
     }
 }

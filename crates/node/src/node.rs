@@ -15,9 +15,22 @@ use btc_primitives::{Block, BlockHash, BlockHeader, ScriptBuf, Tx, Txid};
 use btc_validation::coins::CoinsViewWrite;
 use btc_validation::fees::FeeEstimator;
 use btc_validation::mempool::Mempool;
+use btc_wallet::{Wallet, WalletError};
 
 /// Default `-maxmempool` expressed as an entry cap.
 pub const DEFAULT_MEMPOOL_ENTRIES: usize = 50_000;
+
+/// Core-style wallet error text (the RPC layer maps keywords to error codes).
+pub fn wallet_error_message(e: WalletError) -> String {
+    match e {
+        WalletError::Locked => "Error: Please enter the wallet passphrase with walletpassphrase first (wallet locked).".into(),
+        WalletError::WrongPassphrase => "Error: The wallet passphrase entered was incorrect.".into(),
+        WalletError::InsufficientFunds { .. } => "Insufficient funds".into(),
+        WalletError::AlreadyEncrypted => "Error: running with an encrypted wallet, but encryptwallet was called.".into(),
+        WalletError::NotEncrypted => "Error: running with an unencrypted wallet, but walletpassphrase was called.".into(),
+        other => format!("Error: {other}"),
+    }
+}
 
 pub fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
@@ -32,7 +45,12 @@ pub struct Node {
     new_tips: Vec<BlockHash>,
     /// Txids accepted since the last `take_new_txs` (for relay).
     new_txs: Vec<Txid>,
+    /// Loaded wallet (`-disablewallet` = None).
+    pub wallet: Option<Wallet>,
 }
+
+/// Fee rate used when the estimator has no data (`-fallbackfee`, sat/kvB).
+pub const FALLBACK_FEE_RATE: i64 = 1_000;
 
 pub type SharedNode = Arc<Mutex<Node>>;
 
@@ -51,6 +69,7 @@ impl Node {
             fees: FeeEstimator::new(),
             new_tips: Vec::new(),
             new_txs: Vec::new(),
+            wallet: None,
         })
     }
 
@@ -65,14 +84,78 @@ impl Node {
         }
         update_mempool_for_events(&self.chainstate, &mut self.mempool, &events);
         for event in &events {
-            if let ChainEvent::BlockConnected { hash, height } = event {
-                if let Some(block) = self.chainstate.get_block(hash) {
-                    let txids: Vec<Txid> = block.txdata.iter().map(|t| t.txid()).collect();
-                    self.fees.process_block(*height, &txids);
+            match event {
+                ChainEvent::BlockConnected { hash, height } => {
+                    if let Some(block) = self.chainstate.get_block(hash) {
+                        let txids: Vec<Txid> = block.txdata.iter().map(|t| t.txid()).collect();
+                        self.fees.process_block(*height, &txids);
+                        if let Some(w) = self.wallet.as_mut() {
+                            let _ = w.block_connected(&block, *height);
+                            let _ = w.set_best_block(*hash, *height);
+                        }
+                    }
+                    self.new_tips.push(*hash);
                 }
-                self.new_tips.push(*hash);
+                ChainEvent::BlockDisconnected { hash, height, .. } => {
+                    if let (Some(w), Some(block)) = (self.wallet.as_mut(), self.chainstate.get_block(hash)) {
+                        let _ = w.block_disconnected(&block, *height);
+                        let prev = block.header.prev_blockhash;
+                        let _ = w.set_best_block(prev, height.saturating_sub(1));
+                    }
+                }
             }
         }
+    }
+
+    /// Loads `wallet` and rescans blocks it has not seen (`AttachChain`).
+    pub fn attach_wallet(&mut self, mut wallet: Wallet) -> Result<(), WalletError> {
+        let cs = &self.chainstate;
+        let start = match wallet.best_block() {
+            Some((hash, height)) if cs.block_hash_at(height) == Some(hash) => height + 1,
+            _ => 1,
+        };
+        for height in start..=cs.height() {
+            let hash = cs.block_hash_at(height).expect("height within active chain");
+            if let Some(block) = cs.get_block(&hash) {
+                wallet.block_connected(&block, height)?;
+            }
+        }
+        wallet.set_best_block(cs.tip_hash(), cs.height())?;
+        for entry in self.mempool.sorted_by_fee_rate() {
+            wallet.tx_added_to_mempool(&entry.tx)?;
+        }
+        self.wallet = Some(wallet);
+        Ok(())
+    }
+
+    /// Fee rate for wallet sends: smart estimate for 6 blocks, else fallback.
+    pub fn wallet_fee_rate(&self) -> i64 {
+        self.fees
+            .estimate_smart_fee(6, false)
+            .map(|(rate, _)| rate as i64)
+            .unwrap_or(FALLBACK_FEE_RATE)
+            .max(FALLBACK_FEE_RATE)
+    }
+
+    /// `sendtoaddress`: build, sign, accept to mempool, then commit to the wallet.
+    pub fn wallet_send(
+        &mut self,
+        script: ScriptBuf,
+        amount: i64,
+        fee_rate: Option<i64>,
+        subtract_fee: bool,
+    ) -> Result<Txid, String> {
+        let rate = fee_rate.unwrap_or_else(|| self.wallet_fee_rate());
+        let tip = self.chainstate.height();
+        let wallet = self.wallet.as_mut().ok_or("wallet disabled")?;
+        let tx = wallet
+            .create_transaction(tip, &[(script, amount)], rate, subtract_fee)
+            .map_err(wallet_error_message)?;
+        let txid = self.submit_tx(tx.clone()).map_err(|e| format!("transaction rejected: {e:?}"))?;
+        if let Some(w) = self.wallet.as_mut() {
+            w.commit_transaction(&tx).map_err(wallet_error_message)?;
+        }
+        Ok(txid)
     }
 
     /// `ProcessNewBlock` + mempool/fee updates. Ok(true) if new.
@@ -88,7 +171,11 @@ impl Node {
 
     /// `AcceptToMemoryPool` + fee tracking.
     pub fn submit_tx(&mut self, tx: Tx) -> Result<Txid, MempoolReject> {
+        let wallet_copy = self.wallet.as_ref().map(|_| tx.clone());
         let txid = accept_to_mempool(&self.chainstate, &mut self.mempool, tx)?;
+        if let (Some(w), Some(tx)) = (self.wallet.as_mut(), wallet_copy) {
+            let _ = w.tx_added_to_mempool(&tx);
+        }
         if let Some(entry) = self.mempool.get(&txid) {
             let rate = entry.fee as f64 * 1000.0 / entry.vsize as f64;
             self.fees.process_transaction(txid, self.chainstate.height(), rate);
@@ -132,5 +219,38 @@ mod tests {
         assert_eq!(hashes.len(), 5);
         assert_eq!(node.chainstate.height(), 5);
         assert_eq!(node.take_new_tips(), hashes);
+    }
+
+    #[test]
+    fn wallet_mines_sends_and_tracks_balance() {
+        let dir = std::env::temp_dir().join(format!("btc-node-wallet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let params = ChainParams::regtest();
+        let genesis = btc_consensus::regtest_genesis_block();
+        let mut node = Node::new(params, genesis, Box::new(CoinsViewMemory::new()), Box::<MemBlockStore>::default()).unwrap();
+        node.attach_wallet(Wallet::create(&dir.join("w.json")).unwrap()).unwrap();
+
+        let mine = node.wallet.as_mut().unwrap().new_script(btc_wallet::ScriptKind::P2wpkh).unwrap();
+        node.generate(101, &mine).unwrap();
+        let w = node.wallet.as_ref().unwrap();
+        assert_eq!(w.balance(101, 1), 50 * btc_consensus::COIN);
+        assert_eq!(w.immature_balance(101), 100 * 50 * btc_consensus::COIN);
+
+        let other = ScriptBuf::from_bytes(vec![0x00, 0x14].into_iter().chain([7u8; 20]).collect());
+        let txid = node.wallet_send(other.clone(), 10 * btc_consensus::COIN, None, false).unwrap();
+        assert!(node.mempool.contains(&txid));
+        node.generate(1, &mine).unwrap();
+        assert!(!node.mempool.contains(&txid));
+        let w = node.wallet.as_ref().unwrap();
+        let bal = w.balance(102, 1);
+        // Two mature coinbases now, minus the 10 sent and the fee.
+        assert!(bal < 90 * btc_consensus::COIN && bal > 89 * btc_consensus::COIN, "balance {bal}");
+
+        // Reopen: wallet state persists and catches up.
+        drop(node.wallet.take());
+        node.attach_wallet(Wallet::open(&dir.join("w.json")).unwrap()).unwrap();
+        assert_eq!(node.wallet.as_ref().unwrap().balance(102, 1), bal);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

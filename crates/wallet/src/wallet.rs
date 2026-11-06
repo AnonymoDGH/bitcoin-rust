@@ -267,6 +267,11 @@ impl Wallet {
     }
 
     /// True unless the wallet is encrypted and not unlocked at time `now` (Unix seconds).
+    /// Unix time an unlocked encrypted wallet relocks at (0 if locked).
+    pub fn unlocked_until(&self) -> u64 {
+        self.unlocked_until.unwrap_or(0)
+    }
+
     pub fn is_locked(&self, now: u64) -> bool {
         !self.is_unlocked_at(now)
     }
