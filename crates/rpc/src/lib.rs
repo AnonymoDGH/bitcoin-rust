@@ -11,7 +11,7 @@ mod json;
 mod methods;
 mod params;
 
-pub use backend::{BlockchainInfo, MempoolInfo, RpcBackend};
+pub use backend::{BlockchainInfo, MempoolInfo, RpcBackend, WalletInfo, WalletRpc, WalletTx, WalletUtxo};
 pub use cookie::write_cookie;
 pub use dispatch::dispatch;
 pub use error::{RpcError, RpcResult};
