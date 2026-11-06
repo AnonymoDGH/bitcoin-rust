@@ -4,12 +4,20 @@
 //! `consensus/params.h`. Only the parameters needed for proof-of-work and
 //! subsidy calculations are modelled here.
 
-use bitcoin::BlockHash;
+use bitcoin::{BlockHash, ScriptBuf};
+use btc_primitives::Block;
 use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 
-use crate::compact::encode_compact;
-use crate::subsidy::block_subsidy;
+use crate::compact::{decode_compact, encode_compact};
+use crate::genesis::{create_genesis_block, mine_genesis};
+use crate::subsidy::{block_subsidy, COIN};
+
+/// Version used for custom genesis blocks (Core uses 1 for all chains).
+const GENESIS_VERSION: i32 = 1;
+/// `OP_RETURN`, used as the placeholder genesis output script of
+/// [`CustomChainSpec::default`].
+const OP_RETURN: u8 = 0x6a;
 
 /// Mainnet genesis block hash (`hashGenesisBlock`).
 pub const MAINNET_GENESIS_HASH: &str =
@@ -92,6 +100,12 @@ pub struct ChainParams {
     pub no_retargeting: bool,
     /// `enforce_BIP94` (testnet4 timewarp mitigation; off for these chains).
     pub enforce_bip94: bool,
+    /// `bech32_hrp`: human-readable part for segwit/taproot addresses.
+    pub bech32_hrp: String,
+    /// `base58Prefixes[PUBKEY_ADDRESS]`.
+    pub pubkey_address_prefix: u8,
+    /// `base58Prefixes[SCRIPT_ADDRESS]`.
+    pub script_address_prefix: u8,
     /// Buried deployment heights and script-flag exceptions.
     pub deployments: Deployments,
 }
@@ -151,6 +165,9 @@ impl ChainParams {
                     (parse_hash("0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"), (1 << 0) | (1 << 11)),
                 ],
             },
+            bech32_hrp: "bc".to_string(),
+            pubkey_address_prefix: 0,
+            script_address_prefix: 5,
         }
     }
 
@@ -181,6 +198,9 @@ impl ChainParams {
                     (parse_hash("00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105"), 0),
                 ],
             },
+            bech32_hrp: "tb".to_string(),
+            pubkey_address_prefix: 111,
+            script_address_prefix: 196,
         }
     }
 
@@ -203,7 +223,56 @@ impl ChainParams {
             no_retargeting: true,
             enforce_bip94: false,
             deployments: Deployments::all_active(),
+            bech32_hrp: "bcrt".to_string(),
+            pubkey_address_prefix: 111,
+            script_address_prefix: 196,
         }
+    }
+
+    /// Parameters for a custom chain described by `spec`, together with its
+    /// mined genesis block. `genesis_hash` is the hash of the returned block.
+    ///
+    /// `chain_type` is set to [`ChainType::Regtest`] because there is no custom
+    /// variant; read behaviour from the individual fields, not from
+    /// `chain_type`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the spec's genesis target is above its `pow_limit`, or does
+    /// not decode (see [`mine_genesis`]).
+    pub fn custom(spec: &CustomChainSpec) -> (Self, Block) {
+        let mut block = create_genesis_block(
+            &spec.genesis_timestamp,
+            spec.genesis_output_script.clone(),
+            spec.genesis_time,
+            0,
+            spec.genesis_bits,
+            GENESIS_VERSION,
+            spec.genesis_reward,
+        );
+        mine_genesis(&mut block, spec.pow_limit);
+
+        let params = Self {
+            chain_type: ChainType::Regtest,
+            data_dir: spec.name.clone(),
+            magic: spec.magic,
+            default_port: spec.default_port,
+            rpc_port: spec.rpc_port,
+            genesis_hash: block.block_hash(),
+            genesis_bits: block.header.bits,
+            pow_limit: spec.pow_limit,
+            halving_interval: spec.halving_interval,
+            target_spacing: spec.target_spacing,
+            target_timespan: spec.target_timespan,
+            allow_min_difficulty_blocks: spec.allow_min_difficulty_blocks,
+            no_retargeting: spec.no_retargeting,
+            enforce_bip94: false,
+            deployments: Deployments::all_active(),
+            bech32_hrp: spec.bech32_hrp.clone(),
+            pubkey_address_prefix: spec.pubkey_address_prefix,
+            script_address_prefix: spec.script_address_prefix,
+        };
+        (params, block)
     }
 
     /// Parameters for the requested chain.
@@ -238,6 +307,82 @@ impl Default for ChainParams {
     }
 }
 
+/// Everything needed to define a new chain: network identity, genesis block
+/// inputs and consensus parameters. Pass it to [`ChainParams::custom`].
+///
+/// The [`Default`] values are placeholders for a new coin; change the magic,
+/// ports, genesis message and address prefixes before launch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomChainSpec {
+    /// Name, used as the data directory.
+    pub name: String,
+    /// `pchMessageStart`.
+    pub magic: [u8; 4],
+    /// Default peer-to-peer port.
+    pub default_port: u16,
+    /// RPC port.
+    pub rpc_port: u16,
+    /// Message embedded in the genesis coinbase.
+    pub genesis_timestamp: String,
+    /// `scriptPubKey` of the genesis coinbase output.
+    pub genesis_output_script: ScriptBuf,
+    /// Genesis header `nTime`. May be bumped while mining.
+    pub genesis_time: u32,
+    /// Genesis header `nBits`; also the easiest allowed target when it equals
+    /// `pow_limit`.
+    pub genesis_bits: u32,
+    /// Genesis coinbase value, in satoshis.
+    pub genesis_reward: i64,
+    /// `nSubsidyHalvingInterval`.
+    pub halving_interval: u32,
+    /// `nPowTargetSpacing`, in seconds.
+    pub target_spacing: i64,
+    /// `nPowTargetTimespan`, in seconds.
+    pub target_timespan: i64,
+    /// `powLimit`, as a 256-bit target.
+    pub pow_limit: U256,
+    /// `fPowAllowMinDifficultyBlocks`.
+    pub allow_min_difficulty_blocks: bool,
+    /// `fPowNoRetargeting`.
+    pub no_retargeting: bool,
+    /// `bech32_hrp`.
+    pub bech32_hrp: String,
+    /// `base58Prefixes[PUBKEY_ADDRESS]`.
+    pub pubkey_address_prefix: u8,
+    /// `base58Prefixes[SCRIPT_ADDRESS]`.
+    pub script_address_prefix: u8,
+}
+
+impl Default for CustomChainSpec {
+    fn default() -> Self {
+        // 0x1f00ffff: easy enough that mining the genesis takes about 2^16
+        // hashes, and a 2.5 minute target spacing.
+        let genesis_bits = 0x1f00_ffff;
+        Self {
+            name: "customnet".to_string(),
+            magic: [0x5f, 0x4c, 0x7e, 0xa1],
+            default_port: 18555,
+            rpc_port: 18556,
+            genesis_timestamp: "btc-rust custom chain genesis".to_string(),
+            // Provably unspendable placeholder.
+            genesis_output_script: ScriptBuf::from_bytes(vec![OP_RETURN]),
+            // 2026-01-01T00:00:00Z.
+            genesis_time: 1_767_225_600,
+            genesis_bits,
+            genesis_reward: 50 * COIN,
+            halving_interval: 210_000,
+            target_spacing: 150,
+            target_timespan: 14 * 24 * 60 * 60,
+            pow_limit: decode_compact(genesis_bits).expect("hard-coded bits are valid"),
+            allow_min_difficulty_blocks: false,
+            no_retargeting: false,
+            bech32_hrp: "cx".to_string(),
+            pubkey_address_prefix: 65,
+            script_address_prefix: 10,
+        }
+    }
+}
+
 /// Parse a display-order (big-endian) block hash.
 fn parse_hash(hex: &str) -> BlockHash {
     hex.parse().expect("hard-coded genesis hash is valid hex")
@@ -257,6 +402,7 @@ fn parse_u256_be(hex: &str) -> U256 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin_hashes::Hash;
 
     #[test]
     fn chain_ports_and_magic() {
@@ -275,5 +421,82 @@ mod tests {
         assert_eq!(ChainType::for_chain_name("main"), Some(ChainType::Main));
         assert_eq!(mainnet.difficulty_adjustment_interval(), 2016);
         assert_eq!(regtest.difficulty_adjustment_interval(), 144);
+    }
+
+    #[test]
+    fn address_prefixes() {
+        let mainnet = ChainParams::mainnet();
+        assert_eq!(
+            (
+                mainnet.bech32_hrp.as_str(),
+                mainnet.pubkey_address_prefix,
+                mainnet.script_address_prefix
+            ),
+            ("bc", 0, 5)
+        );
+        let testnet = ChainParams::testnet();
+        assert_eq!(
+            (
+                testnet.bech32_hrp.as_str(),
+                testnet.pubkey_address_prefix,
+                testnet.script_address_prefix
+            ),
+            ("tb", 111, 196)
+        );
+        let regtest = ChainParams::regtest();
+        assert_eq!(
+            (
+                regtest.bech32_hrp.as_str(),
+                regtest.pubkey_address_prefix,
+                regtest.script_address_prefix
+            ),
+            ("bcrt", 111, 196)
+        );
+    }
+
+    #[test]
+    fn custom_params_match_returned_genesis() {
+        let spec = CustomChainSpec::default();
+        let (params, block) = ChainParams::custom(&spec);
+
+        assert_eq!(params.genesis_hash, block.block_hash());
+        assert_eq!(params.genesis_bits, block.header.bits);
+        assert_eq!(params.data_dir, spec.name);
+        assert_eq!(params.magic, spec.magic);
+        assert_eq!(
+            (params.default_port, params.rpc_port),
+            (spec.default_port, spec.rpc_port)
+        );
+        assert_eq!(params.pow_limit, spec.pow_limit);
+        assert_eq!(params.pow_limit_bits(), 0x1f00_ffff);
+        assert_eq!(params.halving_interval, spec.halving_interval);
+        assert_eq!(params.target_spacing, 150);
+        assert_eq!(params.difficulty_adjustment_interval(), 8064);
+        assert_eq!(params.bech32_hrp, spec.bech32_hrp);
+        assert_eq!(params.pubkey_address_prefix, spec.pubkey_address_prefix);
+        assert_eq!(params.script_address_prefix, spec.script_address_prefix);
+
+        // The genesis hash must satisfy the target it was mined against.
+        let target = decode_compact(block.header.bits).unwrap();
+        assert!(U256::from_little_endian(&block.block_hash().to_byte_array()) <= target);
+        assert_eq!(block.txdata[0].vout[0].value, spec.genesis_reward);
+    }
+
+    #[test]
+    fn custom_genesis_with_easy_bits_mines_quickly() {
+        let regtest_limit = decode_compact(0x207f_ffff).unwrap();
+        let spec = CustomChainSpec {
+            genesis_bits: 0x207f_ffff,
+            pow_limit: regtest_limit,
+            ..CustomChainSpec::default()
+        };
+        let (params, block) = ChainParams::custom(&spec);
+
+        assert_eq!(params.genesis_bits, 0x207f_ffff);
+        assert_eq!(params.genesis_hash, block.block_hash());
+        assert!(
+            U256::from_little_endian(&block.block_hash().to_byte_array())
+                <= decode_compact(0x207f_ffff).unwrap()
+        );
     }
 }

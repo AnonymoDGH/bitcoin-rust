@@ -5,6 +5,7 @@
 //!
 //! - [`params`] <- `kernel/chainparams.cpp`, `chainparamsbase.cpp`,
 //!   `consensus/params.h`
+//! - [`genesis`] <- `CreateGenesisBlock()` in `kernel/chainparams.cpp`
 //! - [`compact`] <- `arith_uint256.{h,cpp}` (`SetCompact` / `GetCompact`)
 //! - [`pow`] <- `pow.cpp`, `chain.cpp` (`GetBitsProof`)
 //! - [`subsidy`] <- `validation.cpp` (`GetBlockSubsidy`)
@@ -13,12 +14,17 @@
 //! wrapping 256-bit semantics as `arith_uint256`.
 
 pub mod compact;
+pub mod genesis;
 pub mod params;
 pub mod pow;
 pub mod subsidy;
 
 pub use compact::{decode_compact, encode_compact, CompactError};
-pub use params::{ChainParams, ChainType, Deployments};
+pub use genesis::{
+    create_genesis_block, mainnet_genesis_block, mine_genesis, regtest_genesis_block,
+    testnet_genesis_block,
+};
+pub use params::{ChainParams, ChainType, CustomChainSpec, Deployments};
 pub use pow::{
     calculate_next_work_required, chain_work, next_work_required, work_from_bits, RetargetInput,
 };
