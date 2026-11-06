@@ -1,0 +1,10 @@
+[package]
+name = "btc-node"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+btc-primitives = { path = "../primitives" }
+btc-consensus = { path = "../consensus" }
+serde = { workspace = true }
+thiserror = { workspace = true }
