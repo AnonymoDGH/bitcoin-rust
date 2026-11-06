@@ -12,6 +12,7 @@ use btc_chain::IndexId;
 use btc_consensus::{ChainParams, ChainType};
 use btc_primitives::{Block, BlockHash, BlockHeader, OutPoint, ScriptBuf, Tx, TxOut, Txid};
 use btc_rpc::{BlockchainInfo, MempoolInfo, RpcBackend};
+use btc_wallet::address::AddressParams;
 use tokio::sync::Notify;
 
 use crate::node::{Node, SharedNode};
@@ -152,6 +153,14 @@ impl RpcBackend for NodeRpc {
             ChainType::Main => Network::Bitcoin,
             ChainType::Testnet => Network::Testnet,
             ChainType::Regtest => Network::Regtest,
+        })
+    }
+
+    fn address_params(&self) -> AddressParams {
+        self.with_node(|n| AddressParams {
+            bech32_hrp: n.params.bech32_hrp.clone(),
+            pubkey_prefix: n.params.pubkey_address_prefix,
+            script_prefix: n.params.script_address_prefix,
         })
     }
 
