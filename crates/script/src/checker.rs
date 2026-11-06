@@ -196,7 +196,7 @@ impl SignatureChecker for TransactionSignatureChecker<'_> {
 mod tests {
     use super::*;
     use btc_primitives::TxIn;
-    use bitcoin::{OutPoint, ScriptBuf, Witness};
+    use bitcoin::{OutPoint, ScriptBuf, Sequence, Witness};
 
     fn dummy_tx(version: u32, sequence: u32, lock_time: u32) -> Tx {
         let txin = TxIn {

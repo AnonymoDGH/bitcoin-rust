@@ -259,7 +259,7 @@ pub fn find_and_delete(script: &mut Vec<u8>, needle: &[u8]) -> usize {
 mod tests {
     use super::*;
     use btc_primitives::{TxIn, TxOut};
-    use bitcoin::{OutPoint, ScriptBuf, Sequence};
+    use bitcoin::{OutPoint, ScriptBuf};
 
     fn dummy_tx() -> Tx {
         let txin = TxIn {
