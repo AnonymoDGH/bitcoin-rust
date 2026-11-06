@@ -62,6 +62,9 @@ pub struct NodeConfig {
     pub generate: bool,
     /// Address or script hex that mined blocks pay to (`-genaddress=`).
     pub gen_address: Option<String>,
+    /// Seconds between `-gen` blocks (`-blockinterval=`). Defaults to the
+    /// chain's `target_spacing` (600 s).
+    pub block_interval: Option<u64>,
     /// Print an example chain spec and exit (`-printchainspec`).
     pub print_chainspec: bool,
 }
@@ -119,6 +122,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
     let mut disable_wallet = false;
     let mut generate = false;
     let mut gen_address: Option<String> = None;
+    let mut block_interval: Option<u64> = None;
     let mut print_chainspec = false;
 
     for arg in args {
@@ -158,6 +162,16 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
             "disablewallet" => disable_wallet = parse_bool("disablewallet", value)?,
             "gen" => generate = parse_bool("gen", value)?,
             "genaddress" => gen_address = Some(required("genaddress", value)?.to_owned()),
+            "blockinterval" => {
+                let secs = parse_value::<u64>("blockinterval", value)?;
+                if secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        name: "blockinterval",
+                        value: "0".to_owned(),
+                    });
+                }
+                block_interval = Some(secs);
+            }
             "printchainspec" => print_chainspec = parse_bool("printchainspec", value)?,
             _ => return Err(ConfigError::UnknownOption(arg.to_string())),
         }
@@ -248,6 +262,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
         disable_wallet,
         generate,
         gen_address,
+        block_interval,
         print_chainspec,
     })
 }
@@ -457,6 +472,7 @@ mod tests {
         let config = parse(&["-gen", "-genaddress=51"]).unwrap();
         assert!(config.generate);
         assert_eq!(config.gen_address.as_deref(), Some("51"));
+        assert_eq!(config.block_interval, None);
 
         assert_eq!(
             parse(&["-gen"]),
@@ -534,6 +550,19 @@ mod tests {
     fn printchainspec_flag() {
         assert!(parse(&["-printchainspec"]).unwrap().print_chainspec);
         assert!(!parse(&[]).unwrap().print_chainspec);
+    }
+
+    #[test]
+    fn block_interval_controls_automining_spacing() {
+        let config = parse(&["-gen", "-genaddress=51", "-blockinterval=2"]).unwrap();
+        assert_eq!(config.block_interval, Some(2));
+        assert_eq!(
+            parse(&["-blockinterval=0"]),
+            Err(ConfigError::InvalidValue {
+                name: "blockinterval",
+                value: "0".to_owned()
+            })
+        );
     }
 
     #[test]
