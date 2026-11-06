@@ -21,6 +21,11 @@ pub trait BlockStore: Send {
     fn get_block(&self, hash: &BlockHash) -> Option<Block>;
     fn put_undo(&mut self, hash: &BlockHash, undo: &BlockUndo);
     fn get_undo(&self, hash: &BlockHash) -> Option<BlockUndo>;
+    /// Every stored block as (hash, prev hash, has undo), any order. Used to
+    /// rebuild the block index on startup (`LoadBlockIndex`).
+    fn known_blocks(&self) -> Vec<(BlockHash, BlockHash, bool)> {
+        Vec::new()
+    }
 }
 
 #[derive(Default)]
@@ -41,6 +46,12 @@ impl BlockStore for MemBlockStore {
     }
     fn get_undo(&self, hash: &BlockHash) -> Option<BlockUndo> {
         self.undos.get(hash).cloned()
+    }
+    fn known_blocks(&self) -> Vec<(BlockHash, BlockHash, bool)> {
+        self.blocks
+            .iter()
+            .map(|(h, b)| (*h, b.header.prev_blockhash, self.undos.contains_key(h)))
+            .collect()
     }
 }
 
@@ -93,7 +104,7 @@ impl Chainstate {
 
         let mut chain = ActiveChain::new();
         chain.set_tip(&tree, Some(id));
-        Ok(Self {
+        let mut state = Self {
             params,
             tree,
             chain,
@@ -103,7 +114,49 @@ impl Chainstate {
             best_header: id,
             events: Vec::new(),
             invalid_reasons: HashMap::new(),
-        })
+        };
+        state.load_block_index()?;
+        Ok(state)
+    }
+
+    /// `LoadBlockIndex` + `LoadChainTip`: re-index stored blocks, restore the
+    /// tip from the coins view's best block, then connect anything beyond it.
+    fn load_block_index(&mut self) -> Result<(), ValidationError> {
+        let known = self.store.known_blocks();
+        if known.len() <= 1 {
+            return Ok(());
+        }
+        let mut children: HashMap<BlockHash, Vec<(BlockHash, bool)>> = HashMap::new();
+        for (hash, prev, has_undo) in known {
+            children.entry(prev).or_default().push((hash, has_undo));
+        }
+        let mut queue = vec![self.params.genesis_hash];
+        while let Some(parent) = queue.pop() {
+            for (hash, has_undo) in children.remove(&parent).unwrap_or_default() {
+                let Some(block) = self.store.get_block(&hash) else { continue };
+                let Ok(id) = self.tree.insert_header(block.header) else { continue };
+                let entry = self.tree.get_mut(id);
+                entry.status.0 |= BlockStatus::HAVE_DATA;
+                entry.status.raise_validity(BlockStatus::VALID_TRANSACTIONS);
+                if has_undo {
+                    entry.status.0 |= BlockStatus::HAVE_UNDO;
+                }
+                entry.n_tx = block.txdata.len() as u32;
+                if self.tree.get(id).chain_work > self.tree.get(self.best_header).chain_work {
+                    self.best_header = id;
+                }
+                queue.push(hash);
+            }
+        }
+        if let Some(tip) = self.coins.best_block().and_then(|h| self.tree.lookup(&h)) {
+            self.chain.set_tip(&self.tree, Some(tip));
+            let mut cursor = Some(tip);
+            while let Some(id) = cursor {
+                self.tree.get_mut(id).status.raise_validity(BlockStatus::VALID_SCRIPTS);
+                cursor = self.tree.get(id).prev;
+            }
+        }
+        self.activate_best_chain()
     }
     pub fn tip(&self) -> IndexId {
         self.chain.tip().expect("the active chain always holds genesis")
@@ -271,11 +324,12 @@ impl Chainstate {
         let summary = {
             let mut cache = CoinsViewCache::new(&mut *self.coins);
             let summary = connect_block(&block, &self.tree, id, &mut cache, &self.params, self.connect_opts)?;
-            cache.flush();
+            // Undo must be on disk before the UTXO set points at this block.
+            self.store.put_undo(&hash, &summary.undo);
+            cache.flush_with_best(hash);
             summary
         };
 
-        self.store.put_undo(&hash, &summary.undo);
         let entry = self.tree.get_mut(id);
         entry.status.raise_validity(BlockStatus::VALID_SCRIPTS);
         entry.status.0 |= BlockStatus::HAVE_UNDO;
@@ -302,7 +356,8 @@ impl Chainstate {
             if disconnect_block(&block, &undo, height, &mut cache) != DisconnectResult::Ok {
                 return Err(ValidationError::BadUndo);
             }
-            cache.flush();
+            let prev_hash = prev.map(|p| self.tree.get(p).hash).unwrap_or(hash);
+            cache.flush_with_best(prev_hash);
         }
 
         self.chain.set_tip(&self.tree, prev);

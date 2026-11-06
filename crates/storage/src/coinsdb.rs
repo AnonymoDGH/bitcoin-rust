@@ -103,6 +103,15 @@ impl CoinsDb {
         &mut self,
         changes: Vec<(OutPoint, Option<Coin>)>,
     ) -> Result<(), StorageError> {
+        self.try_batch_write_best(changes, None)
+    }
+
+    /// `try_batch_write` plus an optional best-block record in the same batch.
+    pub fn try_batch_write_best(
+        &mut self,
+        changes: Vec<(OutPoint, Option<Coin>)>,
+        best: Option<BlockHash>,
+    ) -> Result<(), StorageError> {
         let mut buf = Vec::new();
         for (outpoint, coin) in &changes {
             match coin {
@@ -110,8 +119,15 @@ impl CoinsDb {
                 None => write_erase(&mut buf, outpoint),
             }
         }
+        if let Some(hash) = best {
+            buf.push(OP_BEST_BLOCK);
+            buf.extend_from_slice(&hash.to_byte_array());
+        }
         buf.push(OP_COMMIT);
         self.append(&buf)?;
+        if best.is_some() {
+            self.best_block = best;
+        }
         for (outpoint, coin) in changes {
             match coin {
                 Some(coin) => {
@@ -189,6 +205,15 @@ impl CoinsViewWrite for CoinsDb {
     fn batch_write(&mut self, changes: Vec<(OutPoint, Option<Coin>)>) {
         self.try_batch_write(changes)
             .unwrap_or_else(|err| panic!("coins database write failed: {err}"));
+    }
+
+    fn batch_write_best(&mut self, changes: Vec<(OutPoint, Option<Coin>)>, best: BlockHash) {
+        self.try_batch_write_best(changes, Some(best))
+            .unwrap_or_else(|err| panic!("coins database write failed: {err}"));
+    }
+
+    fn best_block(&self) -> Option<BlockHash> {
+        self.best_block
     }
 }
 

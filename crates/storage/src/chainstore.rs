@@ -150,6 +150,13 @@ impl BlockStore for DiskBlockStore {
     fn get_undo(&self, hash: &BlockHash) -> Option<BlockUndo> {
         self.try_get_undo(hash).ok().flatten()
     }
+
+    fn known_blocks(&self) -> Vec<(BlockHash, BlockHash, bool)> {
+        self.entries
+            .iter()
+            .map(|(hash, e)| (*hash, e.prev, e.undo.is_some()))
+            .collect()
+    }
 }
 
 /// Rebuilds the index from disk. A trailing partial record (torn write) is cut off.

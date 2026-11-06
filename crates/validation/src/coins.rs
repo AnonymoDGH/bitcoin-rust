@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use bitcoin::{OutPoint, Script};
+use bitcoin::{BlockHash, OutPoint, Script};
 use btc_primitives::TxOut;
 
 /// Core `MAX_SCRIPT_SIZE`. Larger scriptPubKeys are unspendable.
@@ -36,6 +36,18 @@ pub trait CoinsViewWrite: CoinsView {
     /// Applies changes in order. `Some(coin)` inserts or replaces the entry,
     /// `None` removes it (the coin was spent).
     fn batch_write(&mut self, changes: Vec<(OutPoint, Option<Coin>)>);
+
+    /// Same as `batch_write`, also recording `best` (`hashBestBlock`) in the
+    /// same atomic batch. The default ignores `best`.
+    fn batch_write_best(&mut self, changes: Vec<(OutPoint, Option<Coin>)>, best: BlockHash) {
+        let _ = best;
+        self.batch_write(changes);
+    }
+
+    /// Block whose state this view reflects (`GetBestBlock`), if persisted.
+    fn best_block(&self) -> Option<BlockHash> {
+        None
+    }
 }
 
 /// Errors returned by cache mutations.
@@ -65,6 +77,7 @@ pub fn is_unspendable(script_pubkey: &Script) -> bool {
 #[derive(Clone, Debug, Default)]
 pub struct CoinsViewMemory {
     coins: HashMap<OutPoint, Coin>,
+    best: Option<BlockHash>,
 }
 
 impl CoinsViewMemory {
@@ -104,6 +117,15 @@ impl CoinsViewWrite for CoinsViewMemory {
                 }
             }
         }
+    }
+
+    fn batch_write_best(&mut self, changes: Vec<(OutPoint, Option<Coin>)>, best: BlockHash) {
+        self.batch_write(changes);
+        self.best = Some(best);
+    }
+
+    fn best_block(&self) -> Option<BlockHash> {
+        self.best
     }
 }
 
@@ -216,6 +238,16 @@ impl<'a> CoinsViewCache<'a> {
             .map(|(outpoint, entry)| (outpoint, entry.coin))
             .collect();
         self.base.batch_write(changes);
+    }
+
+    /// `Flush` that also moves the base's best block to `best`, atomically.
+    pub fn flush_with_best(&mut self, best: BlockHash) {
+        let changes: Vec<(OutPoint, Option<Coin>)> = self
+            .entries
+            .drain()
+            .map(|(outpoint, entry)| (outpoint, entry.coin))
+            .collect();
+        self.base.batch_write_best(changes, best);
     }
 }
 

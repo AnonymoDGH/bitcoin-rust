@@ -207,6 +207,7 @@ dependencies = [
  "bitcoin",
  "bitcoin_hashes",
  "btc-chain",
+ "btc-consensus",
  "btc-primitives",
  "btc-validation",
  "tempfile",

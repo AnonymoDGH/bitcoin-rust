@@ -12,4 +12,5 @@ bitcoin_hashes = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+btc-consensus = { path = "../consensus" }
 tempfile = "3"
