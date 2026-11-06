@@ -1,0 +1,13 @@
+[package]
+name = "btc-script"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+btc-primitives = { path = "../primitives" }
+bitcoin = { workspace = true }
+bitcoin_hashes = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"
