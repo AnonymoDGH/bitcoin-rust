@@ -8,3 +8,4 @@ pub mod block_verify;
 pub mod policy;
 pub mod mempool;
 pub mod undo;
+pub mod fees;
