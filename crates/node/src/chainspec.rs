@@ -47,6 +47,7 @@ struct SpecFile {
     bech32_hrp: Option<String>,
     pubkey_address_prefix: Option<u8>,
     script_address_prefix: Option<u8>,
+    seeds: Option<Vec<String>>,
 }
 
 /// `genesis_bits` as either a JSON number or a hex string (`"1f00ffff"`).
@@ -133,6 +134,12 @@ pub fn parse_chain_spec(json: &str) -> Result<CustomChainSpec, ChainSpecError> {
     if let Some(prefix) = file.script_address_prefix {
         spec.script_address_prefix = prefix;
     }
+    if let Some(seeds) = file.seeds {
+        if seeds.iter().any(|seed| seed.is_empty() || seed.contains(char::is_whitespace)) {
+            return Err(field_err("seeds", "entries must be host names or host:port"));
+        }
+        spec.seeds = seeds;
+    }
 
     validate(&spec)?;
     Ok(spec)
@@ -160,6 +167,7 @@ pub fn example_spec_json() -> String {
         "bech32_hrp": spec.bech32_hrp,
         "pubkey_address_prefix": spec.pubkey_address_prefix,
         "script_address_prefix": spec.script_address_prefix,
+        "seeds": spec.seeds,
     });
     serde_json::to_string_pretty(&value).expect("a JSON value always serializes")
 }
@@ -302,6 +310,20 @@ mod tests {
                 field: "target_spacing",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn parses_seed_list() {
+        let spec = parse_chain_spec(r#"{"seeds": ["seed.example.org", "10.1.2.3:18555"]}"#).unwrap();
+        assert_eq!(spec.seeds, vec!["seed.example.org", "10.1.2.3:18555"]);
+        assert!(matches!(
+            parse_chain_spec(r#"{"seeds": [""]}"#),
+            Err(ChainSpecError::Field { field: "seeds", .. })
+        ));
+        assert!(matches!(
+            parse_chain_spec(r#"{"seeds": ["bad host"]}"#),
+            Err(ChainSpecError::Field { field: "seeds", .. })
         ));
     }
 

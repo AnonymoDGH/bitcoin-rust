@@ -23,6 +23,9 @@ use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tokio::time::MissedTickBehavior;
 
+/// Automatic full-relay outbound connections.
+const MAX_OUTBOUND_PEERS: usize = 8;
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let config = match parse_args(std::env::args().skip(1)) {
@@ -110,8 +113,19 @@ async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
             .listen
             .then(|| SocketAddr::from(([0, 0, 0, 0], config.p2p_port))),
         connect: config.connect.clone(),
-        max_outbound: 8,
+        max_outbound: MAX_OUTBOUND_PEERS.min(config.max_connections),
+        max_inbound: config.max_connections.saturating_sub(MAX_OUTBOUND_PEERS),
         user_agent: format!("/btc-rust:{}/", env!("CARGO_PKG_VERSION")),
+        add_nodes: config.add_nodes.clone(),
+        seed_nodes: config.seed_nodes.clone(),
+        dns_seed: config.dns_seed,
+        advertise: config
+            .external_ip
+            .map(|ip| SocketAddr::new(ip, config.p2p_port)),
+        datadir: Some(config.datadir.clone()),
+        // A regtest network runs on one machine, so loopback peers are normal there.
+        accept_local: config.chain == ChainType::Regtest,
+        ..P2pConfig::default()
     };
     tokio::spawn(run_p2p(Arc::clone(&node), p2p_config, Arc::clone(&shutdown)));
 

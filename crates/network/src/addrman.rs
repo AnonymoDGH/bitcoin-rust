@@ -6,13 +6,17 @@
 //! - No asmap: netgroups are IPv4 /16 and IPv6 /32, which is Core's default.
 //! - No test-before-evict: a tried-table collision in `mark_good` leaves the
 //!   address in the new table instead of queuing a feeler connection.
-//! - No time penalty, serialization, network filtering, or GetAddr.
+//! - No time penalty and no network filtering. The file format is our own
+//!   (see `save`), not Core's peers.dat.
 //! - Not thread-safe; the owner wraps it in a Mutex.
 
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
+use std::fs::File;
 use std::hash::{BuildHasher, Hasher};
-use std::net::IpAddr;
+use std::io::{self, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Total number of buckets for tried addresses.
@@ -32,6 +36,11 @@ const ADDRMAN_HORIZON_SECS: i64 = 30 * 24 * 60 * 60;
 const ADDRMAN_RETRIES: u32 = 3;
 const ADDRMAN_MAX_FAILURES: u32 = 10;
 const ADDRMAN_MIN_FAIL_SECS: i64 = 7 * 24 * 60 * 60;
+
+const PEERS_MAGIC: &[u8; 8] = b"BTCPEERS";
+const PEERS_VERSION: u32 = 1;
+/// Upper bound on entries in a file, so a corrupt count cannot allocate without limit.
+const PEERS_MAX_ENTRIES: u32 = 1 << 20;
 
 /// Network address record. `time` is the last-seen unix time in seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -74,6 +83,8 @@ pub struct AddrMan {
     n_new: usize,
     /// Unique addresses currently in the tried table.
     n_tried: usize,
+    /// Accept loopback and private addresses (regtest and tests only).
+    accept_local: bool,
 }
 
 impl Default for AddrMan {
@@ -100,12 +111,211 @@ impl AddrMan {
             tried_table: vec![None; ADDRMAN_TRIED_BUCKET_COUNT * ADDRMAN_BUCKET_SIZE],
             n_new: 0,
             n_tried: 0,
+            accept_local: false,
         }
+    }
+
+    /// Lets `add` keep loopback and private addresses. Off by default, since
+    /// Core never stores them. Used on regtest and in tests, where every peer is local.
+    pub fn set_accept_local(&mut self, accept: bool) {
+        self.accept_local = accept;
+    }
+
+    /// Whether an address with this IP may be stored: Core's IsRoutable, or only
+    /// unspecified and multicast rejected when local addresses are accepted.
+    pub fn accepts_ip(&self, ip: IpAddr) -> bool {
+        if self.accept_local {
+            !ip.is_unspecified() && !ip.is_multicast()
+        } else {
+            is_routable(ip)
+        }
+    }
+
+    /// Whether `addr` (ip and port) is known, in either table.
+    pub fn contains(&self, addr: &NetAddr) -> bool {
+        self.ids.contains_key(&addr_key(addr))
+    }
+
+    /// Whether `addr` is in the tried table.
+    pub fn is_tried(&self, addr: &NetAddr) -> bool {
+        self.ids
+            .get(&addr_key(addr))
+            .is_some_and(|id| self.entries[id].in_tried)
     }
 
     /// Number of unique addresses in either table.
     pub fn size(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Random sample for a `getaddr` reply: at most `max` addresses, and at most
+    /// `max_pct` percent of the table. Terrible entries are skipped.
+    pub fn get_addresses(&mut self, max: usize, max_pct: usize) -> Vec<NetAddr> {
+        let now = now_secs() as i64;
+        let mut all: Vec<NetAddr> = self
+            .entries
+            .values()
+            .filter(|entry| !is_terrible(entry, now))
+            .map(|entry| entry.addr)
+            .collect();
+        let n = (all.len() * max_pct / 100).min(max);
+        for i in 0..n {
+            let j = i + self.rng.below((all.len() - i) as u64) as usize;
+            all.swap(i, j);
+        }
+        all.truncate(n);
+        all
+    }
+
+    /// Writes the table to `path` through a temporary file, so a crash leaves
+    /// either the old file or the new one.
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        let bytes = self.encode();
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".new");
+        let tmp = PathBuf::from(tmp);
+        {
+            let mut file = File::create(&tmp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Reads a table written by `save`. The result has `accept_local` off.
+    pub fn load(path: &Path) -> io::Result<AddrMan> {
+        Self::decode(&std::fs::read(path)?)
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(PEERS_MAGIC);
+        out.extend_from_slice(&PEERS_VERSION.to_le_bytes());
+        out.extend_from_slice(&self.secret.to_le_bytes());
+        let mut entries: Vec<&Entry> = self.entries.values().collect();
+        entries.sort_by_key(|entry| addr_key(&entry.addr));
+        out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for entry in entries {
+            match entry.addr.ip {
+                IpAddr::V4(ip) => {
+                    out.push(4);
+                    out.extend_from_slice(&ip.octets());
+                }
+                IpAddr::V6(ip) => {
+                    out.push(6);
+                    out.extend_from_slice(&ip.octets());
+                }
+            }
+            out.extend_from_slice(&entry.addr.port.to_le_bytes());
+            out.extend_from_slice(&entry.addr.services.to_le_bytes());
+            out.extend_from_slice(&entry.addr.time.to_le_bytes());
+            out.extend_from_slice(&entry.attempts.to_le_bytes());
+            out.extend_from_slice(&entry.last_try.to_le_bytes());
+            out.extend_from_slice(&entry.last_success.to_le_bytes());
+            out.push(u8::from(entry.in_tried));
+            out.extend_from_slice(&(entry.new_slots.len() as u32).to_le_bytes());
+            for slot in &entry.new_slots {
+                out.extend_from_slice(&(*slot as u32).to_le_bytes());
+            }
+        }
+        let checksum = keyed_hash(self.secret, &[out.as_slice()]);
+        out.extend_from_slice(&checksum.to_le_bytes());
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> io::Result<AddrMan> {
+        let bad = |why: &str| io::Error::new(io::ErrorKind::InvalidData, format!("peers file: {why}"));
+        let (body, trailer) = bytes
+            .len()
+            .checked_sub(8)
+            .map(|split| bytes.split_at(split))
+            .ok_or_else(|| bad("truncated"))?;
+        let mut reader = Reader { buf: body, pos: 0 };
+        if reader.take(PEERS_MAGIC.len())? != PEERS_MAGIC {
+            return Err(bad("bad magic"));
+        }
+        if reader.u32()? != PEERS_VERSION {
+            return Err(bad("unsupported version"));
+        }
+        let secret = reader.u64()?;
+        if keyed_hash(secret, &[body]).to_le_bytes().as_slice() != trailer {
+            return Err(bad("checksum mismatch"));
+        }
+
+        let count = reader.u32()?;
+        if count > PEERS_MAX_ENTRIES {
+            return Err(bad("too many entries"));
+        }
+        let mut am = AddrMan::new_seeded(secret, random_u64());
+        for _ in 0..count {
+            let ip = match reader.u8()? {
+                4 => IpAddr::V4(Ipv4Addr::from(reader.array::<4>()?)),
+                6 => IpAddr::V6(Ipv6Addr::from(reader.array::<16>()?)),
+                _ => return Err(bad("bad address family")),
+            };
+            let port = reader.u16()?;
+            let services = reader.u64()?;
+            let time = reader.u32()?;
+            let attempts = reader.u32()?;
+            let last_try = reader.u32()?;
+            let last_success = reader.u32()?;
+            let in_tried = match reader.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(bad("bad table flag")),
+            };
+            let n_slots = reader.u32()?;
+            if n_slots > ADDRMAN_NEW_BUCKETS_PER_ADDRESS {
+                return Err(bad("too many new-table slots"));
+            }
+            let slots: Vec<usize> = (0..n_slots)
+                .map(|_| reader.u32().map(|slot| slot as usize))
+                .collect::<io::Result<_>>()?;
+            if in_tried == !slots.is_empty() {
+                return Err(bad("entry is in both tables or in neither"));
+            }
+
+            let addr = NetAddr::new(ip, port, services, time);
+            let key = addr_key(&addr);
+            if am.ids.contains_key(&key) {
+                return Err(bad("duplicate address"));
+            }
+            let id = am.next_id;
+            am.next_id += 1;
+            if in_tried {
+                let bucket = tried_bucket(secret, &addr);
+                let idx = bucket * ADDRMAN_BUCKET_SIZE + bucket_position(secret, false, bucket, &addr);
+                if am.tried_table[idx].is_some() {
+                    return Err(bad("tried-table slot collision"));
+                }
+                am.tried_table[idx] = Some(id);
+                am.n_tried += 1;
+            } else {
+                for &slot in &slots {
+                    if slot >= am.new_table.len() || am.new_table[slot].is_some() {
+                        return Err(bad("bad new-table slot"));
+                    }
+                    am.new_table[slot] = Some(id);
+                }
+                am.n_new += 1;
+            }
+            am.ids.insert(key, id);
+            am.entries.insert(
+                id,
+                Entry {
+                    addr,
+                    attempts,
+                    last_try,
+                    last_success,
+                    in_tried,
+                    new_slots: slots,
+                },
+            );
+        }
+        if reader.pos != body.len() {
+            return Err(bad("trailing bytes"));
+        }
+        Ok(am)
     }
 
     /// Number of unique addresses in the new table.
@@ -121,7 +331,7 @@ impl AddrMan {
     /// Adds an address learned from `source` to the new table.
     /// Returns true if it was placed in a new bucket, including an extra bucket for a known address.
     pub fn add(&mut self, addr: NetAddr, source: NetAddr) -> bool {
-        if !is_routable(addr.ip) {
+        if !self.accepts_ip(addr.ip) {
             return false;
         }
         let now = now_secs() as i64;
@@ -374,6 +584,12 @@ fn group(ip: IpAddr) -> [u8; 5] {
     }
 }
 
+/// Netgroup key for an IP address, as `group` computes it. Two addresses with the
+/// same key share a netgroup, and Core avoids more than one outbound peer per group.
+pub fn netgroup(ip: IpAddr) -> [u8; 5] {
+    group(ip)
+}
+
 /// Subset of Core's CNetAddr::IsRoutable(). Rejects unspecified, loopback, multicast,
 /// private, link-local, CGNAT, and documentation ranges.
 fn is_routable(ip: IpAddr) -> bool {
@@ -553,6 +769,47 @@ fn random_u64() -> u64 {
     RandomState::new().build_hasher().finish()
 }
 
+/// Bounds-checked little-endian reader for `AddrMan::decode`.
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> io::Result<&'a [u8]> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&end| end <= self.buf.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "peers file: truncated"))?;
+        let bytes = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(bytes)
+    }
+
+    fn array<const N: usize>(&mut self) -> io::Result<[u8; N]> {
+        let mut out = [0u8; N];
+        out.copy_from_slice(self.take(N)?);
+        Ok(out)
+    }
+
+    fn u8(&mut self) -> io::Result<u8> {
+        Ok(self.array::<1>()?[0])
+    }
+
+    fn u16(&mut self) -> io::Result<u16> {
+        Ok(u16::from_le_bytes(self.array()?))
+    }
+
+    fn u32(&mut self) -> io::Result<u32> {
+        Ok(u32::from_le_bytes(self.array()?))
+    }
+
+    fn u64(&mut self) -> io::Result<u64> {
+        Ok(u64::from_le_bytes(self.array()?))
+    }
+}
+
 /// xorshift64* generator for table randomization. Not a source of secret keys.
 #[derive(Debug, Clone)]
 struct XorShift64 {
@@ -677,5 +934,85 @@ mod tests {
         for got in seq1 {
             assert!(known.contains(&got.expect("table is non-empty")));
         }
+    }
+
+    fn temp_file(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("addrman-{}-{name}.dat", std::process::id()))
+    }
+
+    fn populated() -> AddrMan {
+        let mut am = AddrMan::new_seeded(0x5eed, 11);
+        for i in 0..60u8 {
+            let source = fresh(v4(51, i % 3, 0, 1));
+            am.add(fresh(v4(34, i, 2, 3)), source);
+        }
+        let good: Vec<NetAddr> = (0..60u8)
+            .step_by(7)
+            .map(|i| fresh(v4(34, i, 2, 3)))
+            .filter(|a| am.contains(a))
+            .collect();
+        for addr in &good {
+            am.attempt(addr, true);
+            am.mark_good(addr);
+        }
+        am
+    }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let am = populated();
+        assert!(am.tried_size() > 0 && am.new_size() > 0);
+        let path = temp_file("roundtrip");
+        am.save(&path).unwrap();
+        assert!(!path.with_extension("dat.new").exists());
+
+        let loaded = AddrMan::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(loaded.size(), am.size());
+        assert_eq!(loaded.new_size(), am.new_size());
+        assert_eq!(loaded.tried_size(), am.tried_size());
+        assert_eq!(loaded.encode(), am.encode(), "a reloaded table encodes identically");
+        for entry in am.entries.values() {
+            assert!(loaded.contains(&entry.addr));
+            assert_eq!(loaded.is_tried(&entry.addr), entry.in_tried);
+        }
+    }
+
+    #[test]
+    fn load_rejects_corrupt_and_truncated_files() {
+        let am = populated();
+        let mut bytes = am.encode();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0x01;
+        assert_eq!(
+            AddrMan::decode(&bytes).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let bytes = am.encode();
+        assert!(AddrMan::decode(&bytes[..bytes.len() - 3]).is_err());
+        assert!(AddrMan::load(&temp_file("missing")).is_err());
+    }
+
+    #[test]
+    fn get_addresses_is_capped_by_count_and_percent() {
+        let mut am = populated();
+        let size = am.size();
+        assert_eq!(am.get_addresses(1000, 23).len(), size * 23 / 100);
+        assert_eq!(am.get_addresses(3, 100).len(), 3usize.min(size));
+        let sample = am.get_addresses(1000, 100);
+        assert_eq!(sample.len(), size);
+        let unique: std::collections::HashSet<_> = sample.iter().map(addr_key).collect();
+        assert_eq!(unique.len(), size);
+    }
+
+    #[test]
+    fn local_addresses_are_kept_only_when_enabled() {
+        let src = fresh(v4(51, 0, 0, 1));
+        let local = NetAddr::new(v4(127, 0, 0, 1), 18444, 1, now_secs());
+        let mut am = AddrMan::new_seeded(3, 3);
+        assert!(!am.add(local, src));
+        am.set_accept_local(true);
+        assert!(am.add(local, src));
+        assert!(am.contains(&local));
     }
 }
