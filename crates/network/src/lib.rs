@@ -5,3 +5,5 @@
 pub mod message;
 pub mod peer;
 pub mod addrman;
+
+pub mod sync;

@@ -4,19 +4,24 @@
 //! for boolean flags. Core also accepts `--name`, which is accepted here too.
 
 use std::env;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::str::FromStr;
 
-use btc_consensus::{ChainParams, ChainType};
+use btc_consensus::{ChainParams, ChainType, CustomChainSpec};
 use thiserror::Error;
+
+use crate::chainspec::load_chain_spec;
 
 /// Resolved startup configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeConfig {
-    /// Selected network (`-chain=`).
+    /// Selected network (`-chain=`). A custom coin (`-chainspec`) uses
+    /// `Regtest`, the chain type `ChainParams::custom` produces.
     pub chain: ChainType,
     /// Network-specific data directory: the base `-datadir` (or the platform
-    /// default) plus the chain subdirectory (`testnet3`, `regtest`), matching
-    /// `ArgsManager::GetDataDirNet()`.
+    /// default) plus the chain subdirectory (`testnet3`, `regtest`, or the
+    /// coin's name), matching `ArgsManager::GetDataDirNet()`.
     pub datadir: PathBuf,
     /// Peer-to-peer port (`-port=`), defaulting to the chain's `nDefaultPort`.
     pub p2p_port: u16,
@@ -26,6 +31,22 @@ pub struct NodeConfig {
     pub listen: bool,
     /// Run in the background (`-daemon`, default off).
     pub daemon: bool,
+    /// Custom coin loaded from `-chainspec=<path>`, replacing `chain`.
+    pub custom_chain: Option<CustomChainSpec>,
+    /// `-rpcuser`. Cookie authentication is used when unset.
+    pub rpc_user: Option<String>,
+    /// `-rpcpassword`, required with `-rpcuser`.
+    pub rpc_password: Option<String>,
+    /// Address the RPC server binds to (`-rpcbind=`, default 127.0.0.1).
+    pub rpc_bind: IpAddr,
+    /// Peers from `-connect=<ip:port>`, repeatable.
+    pub connect: Vec<SocketAddr>,
+    /// Mine blocks in the background (`-gen`).
+    pub generate: bool,
+    /// Address or script hex that mined blocks pay to (`-genaddress=`).
+    pub gen_address: Option<String>,
+    /// Print an example chain spec and exit (`-printchainspec`).
+    pub print_chainspec: bool,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -42,11 +63,24 @@ pub enum ConfigError {
     UnsupportedChain(String),
     #[error("cannot determine a default data directory (APPDATA and HOME are unset); pass -datadir=<dir>")]
     NoDefaultDatadir,
+    #[error("cannot load -chainspec: {0}")]
+    ChainSpec(String),
+    #[error("-{first} cannot be combined with -{second}")]
+    Conflict {
+        first: &'static str,
+        second: &'static str,
+    },
+    #[error("-{option} requires -{requires}")]
+    Requires {
+        option: &'static str,
+        requires: &'static str,
+    },
 }
 
 /// Parse command-line arguments (without the program name) into a [`NodeConfig`].
 ///
-/// Options may appear in any order. Repeated options take the last value.
+/// Options may appear in any order. Repeated options take the last value,
+/// except `-connect`, which accumulates.
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig, ConfigError> {
     let mut chain: Option<ChainType> = None;
     let mut datadir: Option<PathBuf> = None;
@@ -54,6 +88,14 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
     let mut rpc_port: Option<u16> = None;
     let mut listen = true;
     let mut daemon = false;
+    let mut chainspec: Option<PathBuf> = None;
+    let mut rpc_user: Option<String> = None;
+    let mut rpc_password: Option<String> = None;
+    let mut rpc_bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let mut connect = Vec::new();
+    let mut generate = false;
+    let mut gen_address: Option<String> = None;
+    let mut print_chainspec = false;
 
     for arg in args {
         let body = match arg.strip_prefix("--").or_else(|| arg.strip_prefix('-')) {
@@ -78,32 +120,97 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
             "rpcport" => rpc_port = Some(parse_port("rpcport", value)?),
             "listen" => listen = parse_bool("listen", value)?,
             "daemon" => daemon = parse_bool("daemon", value)?,
+            "chainspec" => chainspec = Some(PathBuf::from(required("chainspec", value)?)),
+            "rpcuser" => rpc_user = Some(required("rpcuser", value)?.to_owned()),
+            "rpcpassword" => rpc_password = Some(required("rpcpassword", value)?.to_owned()),
+            "rpcbind" => rpc_bind = parse_value("rpcbind", value)?,
+            "connect" => connect.push(parse_value("connect", value)?),
+            "gen" => generate = parse_bool("gen", value)?,
+            "genaddress" => gen_address = Some(required("genaddress", value)?.to_owned()),
+            "printchainspec" => print_chainspec = parse_bool("printchainspec", value)?,
             _ => return Err(ConfigError::UnknownOption(arg.to_string())),
         }
     }
 
+    if chainspec.is_some() && chain.is_some() {
+        return Err(ConfigError::Conflict {
+            first: "chainspec",
+            second: "chain",
+        });
+    }
+    match (&rpc_user, &rpc_password) {
+        (Some(_), None) => {
+            return Err(ConfigError::Requires {
+                option: "rpcuser",
+                requires: "rpcpassword",
+            })
+        }
+        (None, Some(_)) => {
+            return Err(ConfigError::Requires {
+                option: "rpcpassword",
+                requires: "rpcuser",
+            })
+        }
+        _ => {}
+    }
+    if generate && gen_address.is_none() {
+        return Err(ConfigError::Requires {
+            option: "gen",
+            requires: "genaddress",
+        });
+    }
+    if gen_address.is_some() && !generate {
+        return Err(ConfigError::Requires {
+            option: "genaddress",
+            requires: "gen",
+        });
+    }
+
     // Defaults depend on the chain, and -chain may come after -port, so
     // resolve them only once every argument has been read.
-    let chain = chain.unwrap_or(ChainType::Main);
-    let params = ChainParams::for_chain(chain);
+    let custom_chain = match chainspec {
+        Some(path) => {
+            Some(load_chain_spec(&path).map_err(|err| ConfigError::ChainSpec(err.to_string()))?)
+        }
+        None => None,
+    };
+    let chain = match custom_chain {
+        Some(_) => ChainType::Regtest,
+        None => chain.unwrap_or(ChainType::Main),
+    };
+    let (default_p2p_port, default_rpc_port, subdir) = match &custom_chain {
+        Some(spec) => (spec.default_port, spec.rpc_port, spec.name.clone()),
+        None => {
+            let params = ChainParams::for_chain(chain);
+            (params.default_port, params.rpc_port, params.data_dir)
+        }
+    };
     let base = match datadir {
         Some(dir) => dir,
         None => default_datadir()?,
     };
-    // Mainnet has an empty data_dir subdirectory, so its path is used as-is.
-    let datadir = if params.data_dir.is_empty() {
+    // Mainnet has an empty subdirectory, so its path is used as-is.
+    let datadir = if subdir.is_empty() {
         base
     } else {
-        base.join(&params.data_dir)
+        base.join(subdir)
     };
 
     Ok(NodeConfig {
         chain,
         datadir,
-        p2p_port: p2p_port.unwrap_or(params.default_port),
-        rpc_port: rpc_port.unwrap_or(params.rpc_port),
+        p2p_port: p2p_port.unwrap_or(default_p2p_port),
+        rpc_port: rpc_port.unwrap_or(default_rpc_port),
         listen,
         daemon,
+        custom_chain,
+        rpc_user,
+        rpc_password,
+        rpc_bind,
+        connect,
+        generate,
+        gen_address,
+        print_chainspec,
     })
 }
 
@@ -133,6 +240,15 @@ fn required<'a>(name: &'static str, value: Option<&'a str>) -> Result<&'a str, C
         Some(value) => Ok(value),
         None => Err(ConfigError::MissingValue { name }),
     }
+}
+
+/// Parse a required value with `FromStr`.
+fn parse_value<T: FromStr>(name: &'static str, value: Option<&str>) -> Result<T, ConfigError> {
+    let value = required(name, value)?;
+    value.parse().map_err(|_| ConfigError::InvalidValue {
+        name,
+        value: value.to_string(),
+    })
 }
 
 /// Parse a TCP port. Port 0 is rejected because the node must advertise a
@@ -254,5 +370,123 @@ mod tests {
             parse(&["-rpcport"]),
             Err(ConfigError::MissingValue { name: "rpcport" })
         ));
+    }
+
+    #[test]
+    fn rpc_and_connect_options() {
+        let config = parse(&[]).unwrap();
+        assert_eq!(config.rpc_user, None);
+        assert_eq!(config.rpc_bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert!(config.connect.is_empty());
+
+        let config = parse(&[
+            "-rpcuser=alice",
+            "-rpcpassword=secret",
+            "-rpcbind=0.0.0.0",
+            "-connect=10.0.0.1:8333",
+            "-connect=10.0.0.2:8333",
+        ])
+        .unwrap();
+        assert_eq!(config.rpc_user.as_deref(), Some("alice"));
+        assert_eq!(config.rpc_password.as_deref(), Some("secret"));
+        assert_eq!(config.rpc_bind, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(
+            config.connect,
+            vec![
+                "10.0.0.1:8333".parse::<SocketAddr>().unwrap(),
+                "10.0.0.2:8333".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+
+        assert!(matches!(
+            parse(&["-connect=10.0.0.1"]),
+            Err(ConfigError::InvalidValue {
+                name: "connect",
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&["-rpcbind=not-an-ip"]),
+            Err(ConfigError::InvalidValue {
+                name: "rpcbind",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn mining_and_auth_pairs_are_required_together() {
+        let config = parse(&["-gen", "-genaddress=51"]).unwrap();
+        assert!(config.generate);
+        assert_eq!(config.gen_address.as_deref(), Some("51"));
+
+        assert_eq!(
+            parse(&["-gen"]),
+            Err(ConfigError::Requires {
+                option: "gen",
+                requires: "genaddress"
+            })
+        );
+        assert_eq!(
+            parse(&["-genaddress=51"]),
+            Err(ConfigError::Requires {
+                option: "genaddress",
+                requires: "gen"
+            })
+        );
+        assert_eq!(
+            parse(&["-rpcuser=alice"]),
+            Err(ConfigError::Requires {
+                option: "rpcuser",
+                requires: "rpcpassword"
+            })
+        );
+        assert_eq!(
+            parse(&["-rpcpassword=x"]),
+            Err(ConfigError::Requires {
+                option: "rpcpassword",
+                requires: "rpcuser"
+            })
+        );
+    }
+
+    #[test]
+    fn printchainspec_flag() {
+        assert!(parse(&["-printchainspec"]).unwrap().print_chainspec);
+        assert!(!parse(&[]).unwrap().print_chainspec);
+    }
+
+    #[test]
+    fn chainspec_sets_datadir_subdir_and_ports() {
+        let path = env::temp_dir().join(format!("btc-node-config-{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"{"name": "mycoin", "default_port": 19777, "rpc_port": 19778}"#,
+        )
+        .unwrap();
+        let chainspec_arg = format!("-chainspec={}", path.display());
+
+        let config = parse(&[&chainspec_arg]).unwrap();
+        let spec = config.custom_chain.as_ref().expect("custom chain loaded");
+        assert_eq!(spec.name, "mycoin");
+        assert_eq!(config.chain, ChainType::Regtest);
+        assert_eq!(config.datadir, test_datadir().join("mycoin"));
+        assert_eq!((config.p2p_port, config.rpc_port), (19777, 19778));
+
+        let config = parse(&[&chainspec_arg, "-port=19000"]).unwrap();
+        assert_eq!(config.p2p_port, 19000);
+
+        assert_eq!(
+            parse(&[&chainspec_arg, "-chain=regtest"]),
+            Err(ConfigError::Conflict {
+                first: "chainspec",
+                second: "chain"
+            })
+        );
+        assert!(matches!(
+            parse(&["-chainspec=/nonexistent/btc-node-spec.json"]),
+            Err(ConfigError::ChainSpec(_))
+        ));
+        std::fs::remove_file(path).unwrap();
     }
 }

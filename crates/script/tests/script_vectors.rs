@@ -410,11 +410,8 @@ fn spending_transaction(tx_credit: &Tx, script_sig: &[u8], witness: &[Vec<u8>]) 
 
 #[test]
 fn script_tests() {
-    let raw = std::fs::read_to_string(
-        r"D:\bitcoin-core-reference\src\test\data\script_tests.json",
-    )
-    .expect("read script_tests.json");
-    let vectors = parse_vectors(&raw);
+    let raw = include_str!("data/script_tests.json");
+    let vectors = parse_vectors(raw);
 
     let mut total = 0usize;
     let mut passed = 0usize;

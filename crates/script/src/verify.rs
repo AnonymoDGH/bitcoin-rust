@@ -15,27 +15,20 @@ const ANNEX_TAG: u8 = 0x50;
 const TAPROOT_LEAF_TAPSCRIPT: u8 = 0xc0;
 const WITNESS_MAX_PROGRAM_SIZE: usize = 40;
 
-/// Port of IsWitnessProgram: first opcode is OP_0..OP_16, then exactly one data push of 2..40 bytes.
+/// Port of IsWitnessProgram: OP_0..OP_16 then one direct push of 2..40 bytes.
 pub fn is_witness_program(script: &[u8]) -> Option<(u8, Vec<u8>)> {
-    let mut pc = 0usize;
-    let (op, _d) = get_op(script, &mut pc)?;
-    let version = match op {
+    if !(4..=WITNESS_MAX_PROGRAM_SIZE + 2).contains(&script.len()) {
+        return None;
+    }
+    let version = match script[0] {
         OP_0 => 0u8,
-        OP_1..=OP_16 => op - 0x50,
+        op @ OP_1..=OP_16 => op - 0x50,
         _ => return None,
     };
-    let (op2, program) = get_op(script, &mut pc)?;
-    if pc != script.len() {
+    if script[1] as usize + 2 != script.len() {
         return None;
     }
-    // The program must be a single push of 2..40 bytes.
-    if op2 > OP_PUSHDATA4 {
-        return None;
-    }
-    if !(2..=WITNESS_MAX_PROGRAM_SIZE).contains(&program.len()) {
-        return None;
-    }
-    Some((version, program))
+    Some((version, script[2..].to_vec()))
 }
 
 /// Port of IsPayToScriptHash: OP_HASH160 <push 20> OP_EQUAL.
@@ -382,4 +375,21 @@ pub fn verify_script(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod witness_program_tests {
+    use super::is_witness_program;
+
+    #[test]
+    fn direct_push_only() {
+        let mut p2wpkh = vec![0x00, 0x14];
+        p2wpkh.extend([7u8; 20]);
+        assert_eq!(is_witness_program(&p2wpkh), Some((0, vec![7u8; 20])));
+        let mut pushdata1 = vec![0x00, 0x4c, 0x14];
+        pushdata1.extend([7u8; 20]);
+        assert_eq!(is_witness_program(&pushdata1), None);
+        assert_eq!(is_witness_program(&[0x51, 0x02, 0x4e, 0x73]), Some((1, vec![0x4e, 0x73])));
+        assert_eq!(is_witness_program(&[0x51, 0x01, 0x4e]), None);
+    }
 }

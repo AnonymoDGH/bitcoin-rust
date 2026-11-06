@@ -1,7 +1,7 @@
 # bitcoin-rust
 
 Rust translation of **Bitcoin Core** (`github.com/bitcoin/bitcoin`, reference at commit `6996cf7`),
-organized as a workspace of 7 crates that mirror `src/`:
+organized as a workspace of 10 crates that mirror `src/`:
 
 | Crate | Role |
 |---|---|
@@ -9,9 +9,12 @@ organized as a workspace of 7 crates that mirror `src/`:
 | `btc-consensus` | Chain params, block-PoW, halving subsidies, compact-target math |
 | `btc-validation` | UTXO set, `CheckTransaction` / `CheckTxInputs`, block-merkle checks, `Policy`, mempool |
 | `btc-network` | P2P message framing (magic/checksum), async peer handshake, `AddrMan` |
-| `btc-wallet` | Addresses (Base58Check + bech32/bech32m), coin selection (BnB / knapsack) |
-| `btc-node` | `bitcoind` argument/config resolution ported from `args.cpp` |
-| `btc-script` | **Script interpreter**: errors, flags, opcodes, script numbers, execution context, full opcode dispatch — all Bitcoin Core `script_tests.json` vectors pass |
+| `btc-wallet` | Addresses, keys/WIF, signing (P2PKH/P2WPKH/P2SH-P2WPKH/P2TR), coin selection, tx builder |
+| `btc-node` | Daemon: config, node core, RPC backend, P2P manager, custom-coin chain spec |
+| `btc-script` | **Script interpreter**: full opcode dispatch, legacy/BIP143/BIP341 sighash — all Bitcoin Core `script_tests.json` vectors pass |
+| `btc-chain` | Block index + skip list, contextual checks, `ConnectBlock`/`DisconnectBlock`, reorgs, `AcceptToMemoryPool`, block assembler/miner |
+| `btc-storage` | `blk*.dat`/`rev*.dat` flat files, Core coin compression, crash-safe UTXO db |
+| `btc-rpc` | JSON-RPC HTTP server (cookie/basic auth), Core error codes |
 
 ## Status
 
@@ -19,6 +22,25 @@ organized as a workspace of 7 crates that mirror `src/`:
 - Phase 2 — `btc-validation`, `btc-network`, `btc-wallet`, `btc-node`: UTXO set, tx/block checks, P2P framing and handshake, addresses, coin selection, config resolution. All compile, 45+ tests pass.
 - Phase 3 — `btc-script`: full `EvalScript` dispatch ported from `interpreter.cpp`.
   **1280/1280 vectors of Core's `script_tests.json` pass** (`cargo test --test script_vectors`).
+
+- Phase 4 — chainstate: block index, contextual checks, ConnectBlock/DisconnectBlock with undo,
+  reorgs and invalidation, mempool acceptance, fee estimator, miner, headers-first sync, disk storage.
+- Phase 5 — node: `btc-node` runs a full node with RPC, P2P sync and on-disk chain; custom coins via JSON spec.
+  316 workspace tests pass.
+
+## Run your own coin
+
+```bash
+cargo build --release -p btc-node
+./target/release/btc-node -printchainspec > mycoin.json   # edit name, magic, ports, reward, spacing…
+./target/release/btc-node -chainspec=mycoin.json -datadir=./node1 -rpcuser=u -rpcpassword=p
+./target/release/btc-node -chainspec=mycoin.json -datadir=./node2 -port=19002 -rpcport=19102 \
+  -rpcuser=u -rpcpassword=p -connect=127.0.0.1:18555
+curl -u u:p -d '{"method":"generatetoaddress","params":[10,"<address>"]}' http://127.0.0.1:18556/
+```
+
+Pending: wallet RPCs, custom-HRP address decoding in RPC, addr relay, compact blocks, per-candidate
+best-chain index (activation scans all headers), header-only index on disk (startup reads every block).
 
 Reference clone: `bitcoin-core-reference/` (excluded; use `git clone --depth 1 https://github.com/bitcoin/bitcoin.git`).
 

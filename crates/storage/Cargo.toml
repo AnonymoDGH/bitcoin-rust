@@ -1,0 +1,16 @@
+[package]
+name = "btc-storage"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+btc-primitives = { path = "../primitives" }
+btc-validation = { path = "../validation" }
+btc-chain = { path = "../chain" }
+bitcoin = { workspace = true }
+bitcoin_hashes = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+btc-consensus = { path = "../consensus" }
+tempfile = "3"
