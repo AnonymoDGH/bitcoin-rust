@@ -13,6 +13,9 @@ use thiserror::Error;
 
 use crate::chainspec::load_chain_spec;
 
+/// Core's default `-maxconnections`.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 125;
+
 /// Resolved startup configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeConfig {
@@ -41,6 +44,20 @@ pub struct NodeConfig {
     pub rpc_bind: IpAddr,
     /// Peers from `-connect=<ip:port>`, repeatable.
     pub connect: Vec<SocketAddr>,
+    /// Peers from `-addnode=<ip:port>`, repeatable. Kept connected alongside automatic outbound peers.
+    pub add_nodes: Vec<SocketAddr>,
+    /// Peers from `-seednode=<ip:port>`, repeatable. Asked for addresses once, then disconnected.
+    pub seed_nodes: Vec<SocketAddr>,
+    /// Resolve the chain's DNS seeds while the address table is empty (`-dnsseed=0|1`, default on).
+    pub dns_seed: bool,
+    /// Address to advertise to peers (`-externalip=<ip>`), with the p2p port.
+    pub external_ip: Option<IpAddr>,
+    /// Connection limit (`-maxconnections=<n>`, default 125). Eight of these are outbound.
+    pub max_connections: usize,
+    /// Wallet file name inside the datadir (`-wallet=<name>`, default `wallet.json`).
+    pub wallet: String,
+    /// Run without a wallet (`-disablewallet`).
+    pub disable_wallet: bool,
     /// Mine blocks in the background (`-gen`).
     pub generate: bool,
     /// Address or script hex that mined blocks pay to (`-genaddress=`).
@@ -93,6 +110,13 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
     let mut rpc_password: Option<String> = None;
     let mut rpc_bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let mut connect = Vec::new();
+    let mut add_nodes = Vec::new();
+    let mut seed_nodes = Vec::new();
+    let mut dns_seed = true;
+    let mut external_ip: Option<IpAddr> = None;
+    let mut max_connections = DEFAULT_MAX_CONNECTIONS;
+    let mut wallet = "wallet.json".to_owned();
+    let mut disable_wallet = false;
     let mut generate = false;
     let mut gen_address: Option<String> = None;
     let mut print_chainspec = false;
@@ -125,6 +149,13 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
             "rpcpassword" => rpc_password = Some(required("rpcpassword", value)?.to_owned()),
             "rpcbind" => rpc_bind = parse_value("rpcbind", value)?,
             "connect" => connect.push(parse_value("connect", value)?),
+            "addnode" => add_nodes.push(parse_value("addnode", value)?),
+            "seednode" => seed_nodes.push(parse_value("seednode", value)?),
+            "dnsseed" => dns_seed = parse_bool("dnsseed", value)?,
+            "externalip" => external_ip = Some(parse_value("externalip", value)?),
+            "maxconnections" => max_connections = parse_value("maxconnections", value)?,
+            "wallet" => wallet = required("wallet", value)?.to_owned(),
+            "disablewallet" => disable_wallet = parse_bool("disablewallet", value)?,
             "gen" => generate = parse_bool("gen", value)?,
             "genaddress" => gen_address = Some(required("genaddress", value)?.to_owned()),
             "printchainspec" => print_chainspec = parse_bool("printchainspec", value)?,
@@ -208,6 +239,13 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
         rpc_password,
         rpc_bind,
         connect,
+        add_nodes,
+        seed_nodes,
+        dns_seed,
+        external_ip,
+        max_connections,
+        wallet,
+        disable_wallet,
         generate,
         gen_address,
         print_chainspec,
@@ -448,6 +486,48 @@ mod tests {
                 requires: "rpcuser"
             })
         );
+    }
+
+    #[test]
+    fn p2p_peer_flags() {
+        let config = parse(&[]).unwrap();
+        assert!(config.add_nodes.is_empty() && config.seed_nodes.is_empty());
+        assert!(config.dns_seed);
+        assert_eq!(config.external_ip, None);
+        assert_eq!(config.max_connections, 125);
+
+        let config = parse(&[
+            "-seednode=10.0.0.1:8333",
+            "-seednode=10.0.0.2:8333",
+            "-addnode=10.0.0.3:8333",
+            "-dnsseed=0",
+            "-externalip=203.0.113.7",
+            "-maxconnections=40",
+        ])
+        .unwrap();
+        assert_eq!(config.seed_nodes.len(), 2);
+        assert_eq!(config.add_nodes, vec!["10.0.0.3:8333".parse::<SocketAddr>().unwrap()]);
+        assert!(!config.dns_seed);
+        assert_eq!(config.external_ip, Some("203.0.113.7".parse().unwrap()));
+        assert_eq!(config.max_connections, 40);
+
+        assert!(parse(&["-maxconnections=0"]).unwrap().max_connections == 0);
+        assert!(matches!(
+            parse(&["-maxconnections=many"]),
+            Err(ConfigError::InvalidValue { name: "maxconnections", .. })
+        ));
+        assert!(matches!(
+            parse(&["-externalip=not-an-ip"]),
+            Err(ConfigError::InvalidValue { name: "externalip", .. })
+        ));
+        assert!(matches!(
+            parse(&["-dnsseed=2"]),
+            Err(ConfigError::InvalidValue { name: "dnsseed", .. })
+        ));
+        assert!(matches!(
+            parse(&["-seednode=10.0.0.1"]),
+            Err(ConfigError::InvalidValue { name: "seednode", .. })
+        ));
     }
 
     #[test]

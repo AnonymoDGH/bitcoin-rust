@@ -5,8 +5,11 @@ use std::sync::Mutex;
 use bitcoin::{Network, OutPoint, TxMerkleNode, WPubkeyHash};
 use bitcoin_hashes::Hash;
 use btc_primitives::{Block, BlockHash, BlockHeader, ScriptBuf, Tx, TxIn, TxOut, Txid};
-use btc_rpc::{BlockchainInfo, MempoolInfo, RpcBackend};
-use btc_wallet::address::{encode_address, Network as WalletNetwork};
+use btc_rpc::{BlockchainInfo, MempoolInfo, RpcBackend, WalletRpc};
+use btc_wallet::address::{encode_address, AddressParams, Network as WalletNetwork};
+
+pub mod wallet;
+pub use wallet::MockWallet;
 
 /// In-memory node state. `blocks[h]` is the active chain at height `h`.
 pub struct Chain {
@@ -22,6 +25,8 @@ pub struct Chain {
 
 pub struct MockBackend {
     chain: Mutex<Chain>,
+    wallet: Option<MockWallet>,
+    params: Option<AddressParams>,
 }
 
 impl MockBackend {
@@ -66,7 +71,19 @@ impl MockBackend {
                 reject_tx: None,
                 reject_block: None,
             }),
+            wallet: None,
+            params: None,
         }
+    }
+
+    pub fn with_wallet(mut self, wallet: MockWallet) -> Self {
+        self.wallet = Some(wallet);
+        self
+    }
+
+    pub fn with_address_params(mut self, params: AddressParams) -> Self {
+        self.params = Some(params);
+        self
     }
 
     pub fn with<R>(&self, f: impl FnOnce(&mut Chain) -> R) -> R {
@@ -194,6 +211,16 @@ impl RpcBackend for MockBackend {
         Network::Regtest
     }
 
+    fn address_params(&self) -> AddressParams {
+        self.params
+            .clone()
+            .unwrap_or_else(|| AddressParams::from(WalletNetwork::Regtest))
+    }
+
+    fn wallet(&self) -> Option<&dyn WalletRpc> {
+        self.wallet.as_ref().map(|wallet| wallet as &dyn WalletRpc)
+    }
+
     fn stop(&self) {
         self.with(|c| c.stopped = true);
     }
@@ -201,6 +228,15 @@ impl RpcBackend for MockBackend {
 
 pub fn p2wpkh_script(seed: u8) -> ScriptBuf {
     ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([seed; 20]))
+}
+
+/// Address prefixes of a made-up coin: bech32 HRP `cx`, base58 prefixes 65 and 10.
+pub fn cx_params() -> AddressParams {
+    AddressParams {
+        bech32_hrp: "cx".into(),
+        pubkey_prefix: 65,
+        script_prefix: 10,
+    }
 }
 
 pub fn regtest_address(script: &ScriptBuf) -> String {

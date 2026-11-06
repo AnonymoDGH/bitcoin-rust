@@ -20,6 +20,18 @@ pub const RPC_INVALID_PARAMETER: i32 = -8;
 pub const RPC_DESERIALIZATION_ERROR: i32 = -22;
 /// Transaction rejected by network rules.
 pub const RPC_VERIFY_REJECTED: i32 = -26;
+/// Deprecated or unsupported argument.
+pub const RPC_METHOD_DEPRECATED: i32 = -32;
+/// Generic wallet error.
+pub const RPC_WALLET_ERROR: i32 = -4;
+/// Not enough funds for the payment.
+pub const RPC_WALLET_INSUFFICIENT_FUNDS: i32 = -6;
+/// The wallet is encrypted and locked.
+pub const RPC_WALLET_UNLOCK_NEEDED: i32 = -13;
+/// The wallet passphrase is wrong.
+pub const RPC_WALLET_PASSPHRASE_INCORRECT: i32 = -14;
+/// The wallet is in the wrong encryption state for the call.
+pub const RPC_WALLET_WRONG_ENC_STATE: i32 = -15;
 
 /// An error reported to the JSON-RPC client as `{"code", "message"}`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

@@ -13,15 +13,19 @@ use btc_consensus::{
 use btc_node::chainspec::example_spec_json;
 use btc_node::config::{parse_args, NodeConfig};
 use btc_node::node::{Node, SharedNode};
+use btc_wallet::Wallet;
 use btc_node::p2p::{run_p2p, P2pConfig};
 use btc_node::rpc_backend::NodeRpc;
 use btc_primitives::{Block, ScriptBuf};
 use btc_rpc::{serve_listener, write_cookie};
 use btc_storage::{CoinsDb, DiskBlockStore};
-use btc_wallet::address::{decode_address, Network as WalletNetwork};
+use btc_wallet::address::{decode_address_with, AddressParams};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tokio::time::MissedTickBehavior;
+
+/// Automatic full-relay outbound connections.
+const MAX_OUTBOUND_PEERS: usize = 8;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -51,11 +55,6 @@ async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
         eprintln!("warning: -daemon is parsed but not implemented yet; running in the foreground");
     }
 
-    let mining_script = config
-        .gen_address
-        .as_deref()
-        .map(|address| resolve_script(address, wallet_network(config.chain)))
-        .transpose()?;
 
     let (params, genesis) = match &config.custom_chain {
         Some(spec) => {
@@ -75,9 +74,17 @@ async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(&config.datadir)?;
     let coins = CoinsDb::open(config.datadir.join("chainstate"))?;
     let store = DiskBlockStore::open(config.datadir.join("blocks"), params.magic)?;
-    let node: SharedNode = Node::new(params.clone(), genesis, Box::new(coins), Box::new(store))
-    .map_err(|err| format!("genesis rejected: {}", err.reject_reason()))?
-    .shared();
+    let node = Node::new(params.clone(), genesis, Box::new(coins), Box::new(store))
+    .map_err(|err| format!("genesis rejected: {}", err.reject_reason()))?;
+    let mut node = node;
+    if !config.disable_wallet {
+        let path = config.datadir.join(&config.wallet);
+        let wallet = if path.exists() { Wallet::open(&path) } else { Wallet::create(&path) }
+            .map_err(|e| format!("wallet {}: {e}", path.display()))?;
+        node.attach_wallet(wallet).map_err(|e| format!("wallet rescan: {e}"))?;
+        println!("wallet: {}", path.display());
+    }
+    let node: SharedNode = node.shared();
 
     let (user, password, auth_source) = match (&config.rpc_user, &config.rpc_password) {
         (Some(user), Some(password)) => (user.clone(), password.clone(), "-rpcuser".to_owned()),
@@ -110,11 +117,32 @@ async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
             .listen
             .then(|| SocketAddr::from(([0, 0, 0, 0], config.p2p_port))),
         connect: config.connect.clone(),
-        max_outbound: 8,
+        max_outbound: MAX_OUTBOUND_PEERS.min(config.max_connections),
+        max_inbound: config.max_connections.saturating_sub(MAX_OUTBOUND_PEERS),
         user_agent: format!("/btc-rust:{}/", env!("CARGO_PKG_VERSION")),
+        add_nodes: config.add_nodes.clone(),
+        seed_nodes: config.seed_nodes.clone(),
+        dns_seed: config.dns_seed,
+        advertise: config
+            .external_ip
+            .map(|ip| SocketAddr::new(ip, config.p2p_port)),
+        datadir: Some(config.datadir.clone()),
+        // A regtest network runs on one machine, so loopback peers are normal there.
+        accept_local: config.chain == ChainType::Regtest,
+        ..P2pConfig::default()
     };
-    tokio::spawn(run_p2p(Arc::clone(&node), p2p_config, Arc::clone(&shutdown)));
+    let p2p_task = tokio::spawn(run_p2p(Arc::clone(&node), p2p_config, Arc::clone(&shutdown)));
 
+    let address_params = AddressParams {
+        bech32_hrp: params.bech32_hrp.clone(),
+        pubkey_prefix: params.pubkey_address_prefix,
+        script_prefix: params.script_address_prefix,
+    };
+    let mining_script = config
+        .gen_address
+        .as_deref()
+        .map(|address| resolve_script(address, &address_params))
+        .transpose()?;
     if let Some(script) = mining_script {
         let spacing = Duration::from_secs(params.target_spacing.max(1) as u64);
         println!("mining one block every {} s", spacing.as_secs());
@@ -129,7 +157,9 @@ async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
         _ = shutdown.notified() => println!("shutdown requested (rpc stop)"),
         served = &mut rpc_task => return Err(format!("RPC server stopped: {served:?}").into()),
     }
-    // Let an in-flight `stop` reply reach the client before the runtime shuts down.
+    // Stop the P2P layer so it writes peers.dat, then let an in-flight `stop` reply reach the client.
+    shutdown.notify_one();
+    let _ = tokio::time::timeout(Duration::from_secs(5), p2p_task).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     Ok(())
 }
@@ -167,18 +197,11 @@ fn builtin_genesis(chain: ChainType) -> Block {
     }
 }
 
-fn wallet_network(chain: ChainType) -> WalletNetwork {
-    match chain {
-        ChainType::Main => WalletNetwork::Main,
-        ChainType::Testnet => WalletNetwork::Test,
-        ChainType::Regtest => WalletNetwork::Regtest,
-    }
-}
 
 /// `-genaddress` takes an address for the chain, or raw script hex for coins
 /// whose address prefixes are not known to the wallet code.
-fn resolve_script(value: &str, network: WalletNetwork) -> Result<ScriptBuf, String> {
-    if let Ok(script) = decode_address(network, value) {
+fn resolve_script(value: &str, params: &AddressParams) -> Result<ScriptBuf, String> {
+    if let Ok(script) = decode_address_with(params, value) {
         return Ok(script);
     }
     match Vec::<u8>::from_hex(value) {

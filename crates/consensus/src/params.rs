@@ -108,6 +108,8 @@ pub struct ChainParams {
     pub script_address_prefix: u8,
     /// Buried deployment heights and script-flag exceptions.
     pub deployments: Deployments,
+    /// `vSeeds`: DNS seeds or `host:port` bootstrap nodes.
+    pub seeds: Vec<String>,
 }
 
 /// Buried soft-fork activation heights (`Consensus::Params`).
@@ -168,6 +170,18 @@ impl ChainParams {
             bech32_hrp: "bc".to_string(),
             pubkey_address_prefix: 0,
             script_address_prefix: 5,
+            seeds: [
+                "seed.bitcoin.sipa.be",
+                "dnsseed.bluematt.me",
+                "seed.bitcoin.jonasschnelli.ch",
+                "seed.btc.petertodd.net",
+                "seed.bitcoin.sprovoost.nl",
+                "dnsseed.emzy.de",
+                "seed.bitcoin.wiz.biz",
+                "seed.mainnet.achownodes.xyz",
+            ]
+            .map(String::from)
+            .to_vec(),
         }
     }
 
@@ -201,6 +215,14 @@ impl ChainParams {
             bech32_hrp: "tb".to_string(),
             pubkey_address_prefix: 111,
             script_address_prefix: 196,
+            seeds: [
+                "testnet-seed.bitcoin.jonasschnelli.ch",
+                "seed.tbtc.petertodd.net",
+                "seed.testnet.bitcoin.sprovoost.nl",
+                "testnet-seed.bluematt.me",
+            ]
+            .map(String::from)
+            .to_vec(),
         }
     }
 
@@ -226,6 +248,7 @@ impl ChainParams {
             bech32_hrp: "bcrt".to_string(),
             pubkey_address_prefix: 111,
             script_address_prefix: 196,
+            seeds: Vec::new(),
         }
     }
 
@@ -271,6 +294,7 @@ impl ChainParams {
             bech32_hrp: spec.bech32_hrp.clone(),
             pubkey_address_prefix: spec.pubkey_address_prefix,
             script_address_prefix: spec.script_address_prefix,
+            seeds: spec.seeds.clone(),
         };
         (params, block)
     }
@@ -351,6 +375,8 @@ pub struct CustomChainSpec {
     pub pubkey_address_prefix: u8,
     /// `base58Prefixes[SCRIPT_ADDRESS]`.
     pub script_address_prefix: u8,
+    /// `vSeeds`: DNS seeds or `host:port` bootstrap nodes.
+    pub seeds: Vec<String>,
 }
 
 impl Default for CustomChainSpec {
@@ -379,6 +405,7 @@ impl Default for CustomChainSpec {
             bech32_hrp: "cx".to_string(),
             pubkey_address_prefix: 65,
             script_address_prefix: 10,
+            seeds: Vec::new(),
         }
     }
 }

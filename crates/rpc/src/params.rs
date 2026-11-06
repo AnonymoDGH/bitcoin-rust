@@ -124,6 +124,67 @@ impl Args {
             )
         })
     }
+
+    /// A JSON number or string holding a decimal with at most `decimals` fraction
+    /// digits, scaled to an integer. Optional, as `AmountFromValue` in Core.
+    pub(crate) fn scaled(&self, i: usize, decimals: u32) -> RpcResult<Option<i64>> {
+        let Some(value) = self.get(i) else {
+            return Ok(None);
+        };
+        let text = match value {
+            Value::Number(number) => number.to_string(),
+            Value::String(text) => text.clone(),
+            _ => {
+                return Err(RpcError::new(
+                    RPC_TYPE_ERROR,
+                    "Amount is not a number or string",
+                ))
+            }
+        };
+        parse_fixed(&text, decimals)
+            .map(Some)
+            .ok_or_else(|| RpcError::new(RPC_TYPE_ERROR, "Invalid amount"))
+    }
+
+    /// A required BTC amount in satoshis, at most `MAX_MONEY`.
+    pub(crate) fn amount_req(&self, i: usize, name: &str) -> RpcResult<i64> {
+        let sats = self.scaled(i, 8)?.ok_or_else(|| missing(name))?;
+        if sats > MAX_MONEY {
+            return Err(RpcError::new(RPC_TYPE_ERROR, "Amount out of range"));
+        }
+        Ok(sats)
+    }
+}
+
+/// Largest amount in satoshis (`MAX_MONEY`).
+const MAX_MONEY: i64 = 21_000_000 * 100_000_000;
+
+/// Parses a decimal with at most `decimals` fraction digits and returns it scaled by
+/// `10^decimals` (`ParseFixedPoint`). Exponents and signs other than a leading `-`
+/// are rejected.
+fn parse_fixed(text: &str, decimals: u32) -> Option<i64> {
+    let (negative, unsigned) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    if whole.is_empty() && fraction.is_empty() {
+        return None;
+    }
+    let digits_ok = whole
+        .bytes()
+        .chain(fraction.bytes())
+        .all(|byte| byte.is_ascii_digit());
+    let decimals = decimals as usize;
+    if !digits_ok || fraction.len() > decimals {
+        return None;
+    }
+    let padding = std::iter::repeat_n(b'0', decimals - fraction.len());
+    let mut value: i64 = 0;
+    for byte in whole.bytes().chain(fraction.bytes()).chain(padding) {
+        value = value.checked_mul(10)?.checked_add(i64::from(byte - b'0'))?;
+    }
+    Some(if negative { -value } else { value })
 }
 
 fn missing(name: &str) -> RpcError {

@@ -9,7 +9,7 @@ btc-wallet = { path = "../wallet" }
 bitcoin = { workspace = true }
 bitcoin_hashes = { workspace = true }
 serde = { workspace = true }
-serde_json = "1"
+serde_json = { version = "1", features = ["arbitrary_precision"] }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 getrandom = "0.2"

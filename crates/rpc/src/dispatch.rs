@@ -181,8 +181,7 @@ fn rejected(id: Option<Value>, version: Version, code: i32, message: &str) -> Re
 }
 
 fn execute(backend: &dyn RpcBackend, call: &Call) -> RpcResult<Value> {
-    let method = methods::lookup(&call.method)
-        .ok_or_else(|| RpcError::new(RPC_METHOD_NOT_FOUND, "Method not found"))?;
+    let method = methods::lookup(&call.method, backend.wallet().is_some())?;
     let positional = normalize(method.params, &call.params)?;
     methods::call(backend, method.name, &Args::new(positional))
 }

@@ -26,7 +26,8 @@ organized as a workspace of 10 crates that mirror `src/`:
 - Phase 4 — chainstate: block index, contextual checks, ConnectBlock/DisconnectBlock with undo,
   reorgs and invalidation, mempool acceptance, fee estimator, miner, headers-first sync, disk storage.
 - Phase 5 — node: `btc-node` runs a full node with RPC, P2P sync and on-disk chain; custom coins via JSON spec.
-  316 workspace tests pass.
+- Group 1 — wallet + discovery: persistent encrypted wallet (Core CCrypter), wallet RPCs, coin-specific
+  address prefixes, DNS/seed nodes, addr relay, `peers.dat`. 361 workspace tests pass.
 
 ## Run your own coin
 
@@ -36,11 +37,18 @@ cargo build --release -p btc-node
 ./target/release/btc-node -chainspec=mycoin.json -datadir=./node1 -rpcuser=u -rpcpassword=p
 ./target/release/btc-node -chainspec=mycoin.json -datadir=./node2 -port=19002 -rpcport=19102 \
   -rpcuser=u -rpcpassword=p -connect=127.0.0.1:18555
-curl -u u:p -d '{"method":"generatetoaddress","params":[10,"<address>"]}' http://127.0.0.1:18556/
+curl -u u:p -d '{"method":"getnewaddress"}' http://127.0.0.1:18556/
+curl -u u:p -d '{"method":"generatetoaddress","params":[101,"<address>"]}' http://127.0.0.1:18556/
+curl -u u:p -d '{"method":"sendtoaddress","params":["<other address>", 12.5]}' http://127.0.0.1:18556/
 ```
 
-Pending: wallet RPCs, custom-HRP address decoding in RPC, addr relay, compact blocks, per-candidate
-best-chain index (activation scans all headers), header-only index on disk (startup reads every block).
+Wallet RPCs: `getnewaddress`, `getbalance`, `getbalances`, `listunspent`, `sendtoaddress`, `getwalletinfo`,
+`listtransactions`, `dumpprivkey`, `importprivkey`, `encryptwallet`, `walletpassphrase`, `walletlock`,
+`validateaddress`. Flags: `-wallet=<file>`, `-disablewallet`, `-seednode`, `-addnode`, `-dnsseed`,
+`-externalip`, `-maxconnections`. Add `"seeds": ["host:port", ...]` to the chain spec for discovery.
+
+Pending: DoS scoring/banning, mempool ancestor limits + RBF + persistence, UTXO cache (coins db is fully
+in RAM), per-candidate best-chain index, header-only index on disk, compact blocks, BIP324, descriptors/PSBT.
 
 Reference clone: `bitcoin-core-reference/` (excluded; use `git clone --depth 1 https://github.com/bitcoin/bitcoin.git`).
 

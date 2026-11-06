@@ -7,7 +7,7 @@ use bitcoin::consensus::encode::{deserialize, serialize_hex, Decodable};
 use bitcoin::hex::FromHex;
 use bitcoin::OutPoint;
 use btc_primitives::{Block, BlockHash, Tx, Txid};
-use btc_wallet::address::decode_address;
+use btc_wallet::address::decode_address_with;
 use serde_json::{json, Value};
 
 use crate::backend::RpcBackend;
@@ -15,8 +15,9 @@ use crate::error::{
     RpcError, RpcResult, RPC_DESERIALIZATION_ERROR, RPC_INVALID_ADDRESS_OR_KEY,
     RPC_INVALID_PARAMETER, RPC_METHOD_NOT_FOUND, RPC_MISC_ERROR, RPC_VERIFY_REJECTED,
 };
-use crate::json::{amount, block_json, header_fields, script_json, tx_json, wallet_network};
+use crate::json::{amount, block_json, header_fields, script_json, tx_json, validate_address};
 use crate::params::Args;
+use crate::wallet;
 
 /// A registered method: its name and `(parameter name, required)` in positional order.
 pub(crate) struct Method {
@@ -82,6 +83,10 @@ const METHODS: &[Method] = &[
         params: &[("txid", true), ("n", true), ("include_mempool", false)],
     },
     Method {
+        name: "validateaddress",
+        params: &[("address", true)],
+    },
+    Method {
         name: "stop",
         params: &[],
     },
@@ -95,8 +100,99 @@ const METHODS: &[Method] = &[
     },
 ];
 
-pub(crate) fn lookup(name: &str) -> Option<&'static Method> {
-    METHODS.iter().find(|method| method.name == name)
+/// Wallet methods, registered only when the backend has a wallet.
+const WALLET_METHODS: &[Method] = &[
+    Method {
+        name: "getnewaddress",
+        params: &[("label", false), ("address_type", false)],
+    },
+    Method {
+        name: "getbalance",
+        params: &[
+            ("dummy", false),
+            ("minconf", false),
+            ("include_watchonly", false),
+            ("avoid_reuse", false),
+        ],
+    },
+    Method {
+        name: "getbalances",
+        params: &[],
+    },
+    Method {
+        name: "listunspent",
+        params: &[
+            ("minconf", false),
+            ("maxconf", false),
+            ("addresses", false),
+            ("include_unsafe", false),
+            ("query_options", false),
+        ],
+    },
+    Method {
+        name: "sendtoaddress",
+        params: &[
+            ("address", true),
+            ("amount", true),
+            ("comment", false),
+            ("comment_to", false),
+            ("subtractfeefromamount", false),
+            ("replaceable", false),
+            ("conf_target", false),
+            ("estimate_mode", false),
+            ("avoid_reuse", false),
+            ("fee_rate", false),
+            ("verbose", false),
+        ],
+    },
+    Method {
+        name: "getwalletinfo",
+        params: &[],
+    },
+    Method {
+        name: "listtransactions",
+        params: &[
+            ("label", false),
+            ("count", false),
+            ("skip", false),
+            ("include_watchonly", false),
+        ],
+    },
+    Method {
+        name: "dumpprivkey",
+        params: &[("address", true)],
+    },
+    Method {
+        name: "importprivkey",
+        params: &[("privkey", true), ("label", false), ("rescan", false)],
+    },
+    Method {
+        name: "encryptwallet",
+        params: &[("passphrase", true)],
+    },
+    Method {
+        name: "walletpassphrase",
+        params: &[("passphrase", true), ("timeout", true)],
+    },
+    Method {
+        name: "walletlock",
+        params: &[],
+    },
+];
+
+/// Finds a method. Wallet methods are reported as missing when there is no wallet.
+pub(crate) fn lookup(name: &str, wallet_enabled: bool) -> RpcResult<&'static Method> {
+    if let Some(method) = METHODS.iter().find(|method| method.name == name) {
+        return Ok(method);
+    }
+    match WALLET_METHODS.iter().find(|method| method.name == name) {
+        Some(method) if wallet_enabled => Ok(method),
+        Some(_) => Err(RpcError::new(
+            RPC_METHOD_NOT_FOUND,
+            "Method not found (wallet disabled)",
+        )),
+        None => Err(RpcError::new(RPC_METHOD_NOT_FOUND, "Method not found")),
+    }
 }
 
 static START: OnceLock<Instant> = OnceLock::new();
@@ -132,12 +228,11 @@ pub(crate) fn call(backend: &dyn RpcBackend, method: &str, args: &Args) -> RpcRe
             if verbosity == 0 {
                 Ok(json!(serialize_hex(&block)))
             } else {
-                let network = wallet_network(backend.network());
                 Ok(block_json(
                     &block,
                     height,
                     confirmations,
-                    network,
+                    &backend.address_params(),
                     verbosity == 2,
                 ))
             }
@@ -200,7 +295,7 @@ pub(crate) fn call(backend: &dyn RpcBackend, method: &str, args: &Args) -> RpcRe
                 )
             })?;
             if verbose {
-                Ok(tx_json(&tx, wallet_network(backend.network()), true))
+                Ok(tx_json(&tx, &backend.address_params(), true))
             } else {
                 Ok(json!(serialize_hex(&tx)))
             }
@@ -222,8 +317,7 @@ pub(crate) fn call(backend: &dyn RpcBackend, method: &str, args: &Args) -> RpcRe
         "generatetoaddress" => {
             let nblocks = args.u32_req(0, "nblocks")?;
             let address = args.str_req(1, "address")?;
-            let network = wallet_network(backend.network());
-            let script = decode_address(network, address)
+            let script = decode_address_with(&backend.address_params(), address)
                 .map_err(|_| RpcError::new(RPC_INVALID_ADDRESS_OR_KEY, "Error: Invalid address"))?;
             let hashes = backend
                 .generate_to_script(nblocks, script)
@@ -235,35 +329,44 @@ pub(crate) fn call(backend: &dyn RpcBackend, method: &str, args: &Args) -> RpcRe
             let txid: Txid = args.hash_req(0, "txid")?;
             let vout = args.u32_req(1, "n")?;
             let outpoint = OutPoint { txid, vout };
-            let network = wallet_network(backend.network());
+            let params = backend.address_params();
             match backend.get_tx_out(&outpoint) {
                 None => Ok(Value::Null),
                 Some((output, confirmations, coinbase)) => Ok(json!({
                     "bestblock": backend.get_best_block_hash().to_string(),
                     "confirmations": confirmations,
                     "value": amount(output.value),
-                    "scriptPubKey": script_json(&output.script_pubkey, network),
+                    "scriptPubKey": script_json(&output.script_pubkey, &params),
                     "coinbase": coinbase,
                 })),
             }
         }
+        "validateaddress" => Ok(validate_address(
+            &backend.address_params(),
+            args.str_req(0, "address")?,
+        )),
         "stop" => {
             backend.stop();
             Ok(json!("Bitcoin Core stopping"))
         }
         "help" => match args.str(0)? {
             None => {
-                let names: Vec<&str> = METHODS.iter().map(|method| method.name).collect();
+                let wallet_enabled = backend.wallet().is_some();
+                let names: Vec<&str> = METHODS
+                    .iter()
+                    .chain(WALLET_METHODS.iter().filter(|_| wallet_enabled))
+                    .map(|method| method.name)
+                    .collect();
                 Ok(json!(names.join("\n")))
             }
-            Some(name) => lookup(name)
+            Some(name) => lookup(name, backend.wallet().is_some())
                 .map(|method| json!(usage(method)))
-                .ok_or_else(|| {
+                .map_err(|_| {
                     RpcError::new(RPC_MISC_ERROR, format!("help: unknown command: {name}"))
                 }),
         },
         "uptime" => Ok(json!(START.get_or_init(Instant::now).elapsed().as_secs())),
-        _ => Err(RpcError::new(RPC_METHOD_NOT_FOUND, "Method not found")),
+        _ => wallet::call(backend, method, args),
     }
 }
 

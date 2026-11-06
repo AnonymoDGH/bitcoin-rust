@@ -1,49 +1,125 @@
 //! P2P connection manager. Port of the network-facing parts of `src/net.cpp`
-//! and `src/net_processing.cpp`: listeners, outbound dialing, one task per
-//! peer, and one manager task that owns `SyncManager` and applies its actions
-//! to the node. The node lock is held only while a single call runs.
+//! and `src/net_processing.cpp`: listeners, outbound dialing, address discovery
+//! and relay, `peers.dat`, one task per peer, and one manager task that owns
+//! `SyncManager`, the address table and every peer's outbound queue. The node
+//! lock is held only while a single call runs.
 
-use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin::block::{Header, Version};
 use bitcoin::consensus::{deserialize, serialize};
+use bitcoin::p2p::address::{AddrV2Message, Address};
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_blockdata::Inventory;
+use bitcoin::p2p::ServiceFlags;
 use bitcoin::CompactTarget;
 use btc_chain::{BlockStatus, BlockTree, IndexId, ValidationError};
 use btc_consensus::ChainParams;
+use btc_network::addrman::{netgroup, AddrMan, NetAddr};
 use btc_network::message::{decode_payload, MessageHeader, NetworkMessage as Wire, HEADER_SIZE};
-use btc_network::peer::{LocalVersion, Peer};
+use btc_network::peer::{LocalVersion, Peer, CONNECT_TIMEOUT};
 use btc_network::sync::{ChainView, PeerId, SyncAction, SyncManager, MAX_HEADERS_RESULTS};
 use btc_primitives::{Block as PrimBlock, BlockHash, BlockHeader as PrimHeader, Tx as PrimTx, Txid};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{lookup_host, TcpListener, TcpStream};
 use tokio::sync::{mpsc, Notify, Semaphore};
 use tokio::task::JoinSet;
-use tokio::time::{interval, sleep};
+use tokio::time::{interval, sleep, timeout};
 
 use crate::node::{Node, SharedNode};
 
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_INTERVAL: Duration = Duration::from_secs(10);
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+/// Automatic outbound dials give up after this long.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Minimum wait between DNS seed lookups while the address table is empty.
+const SEED_RETRY: Duration = Duration::from_secs(60);
 const PEER_QUEUE: usize = 1024;
 const EVENT_QUEUE: usize = 4096;
 /// `MAX_INV_SZ`.
 const MAX_INV_ITEMS: usize = 50_000;
-/// Core's default `-maxconnections` (125) minus the eight outbound slots.
-const MAX_INBOUND_PEERS: usize = 117;
+/// `MAX_ADDR_TO_SEND`: largest `addr` message accepted or sent.
+const MAX_ADDR_TO_SEND: usize = 1000;
+/// `MAX_PCT_ADDR_TO_SEND`: share of the table in a `getaddr` reply.
+const MAX_PCT_ADDR_TO_SEND: usize = 23;
+/// `MAX_ADDR_RATE_PER_SECOND`: refill rate of the per-peer address token bucket.
+const MAX_ADDR_RATE_PER_SECOND: f64 = 0.1;
+/// Tokens granted when we send `getaddr`, so the reply is accepted in full
+/// (Core's `m_addr_token_bucket += MAX_ADDR_TO_SEND`).
+const GETADDR_TOKEN_GRANT: f64 = 1000.0;
+/// Only messages with at most this many addresses are relayed.
+const ADDR_RELAY_MAX: usize = 10;
+/// Relayed addresses must have been seen within this window.
+const ADDR_FRESH_SECS: u32 = 10 * 60;
+/// Timestamps further in the future than this are rewritten.
+const ADDR_FUTURE_SECS: u32 = 10 * 60;
+/// Timestamps at or below this are treated as unset, as in Core.
+const ADDR_MIN_TIME: u32 = 100_000_000;
+/// Timestamp given to an undated address: five days ago.
+const ADDR_UNDATED_AGE_SECS: u32 = 5 * 24 * 60 * 60;
+/// Fresh addresses are relayed to this many peers.
+const ADDR_RELAY_PEERS: usize = 2;
 
+/// Settings for the P2P layer. `Default` is a node with no listener, no
+/// `-connect` list and no data directory.
 #[derive(Clone, Debug)]
 pub struct P2pConfig {
+    /// Listen address for inbound peers. None disables the listener.
     pub listen: Option<SocketAddr>,
+    /// `-connect`: only these peers are dialed, and automatic outbound is off.
     pub connect: Vec<SocketAddr>,
+    /// Automatic full-relay outbound connections (`-maxconnections`, at most 8).
     pub max_outbound: usize,
+    /// Inbound connection limit (`-maxconnections` minus the outbound slots).
+    pub max_inbound: usize,
     pub user_agent: String,
+    /// `-addnode`: kept connected in addition to automatic outbound peers.
+    pub add_nodes: Vec<SocketAddr>,
+    /// `-seednode`: asked for addresses once, then disconnected.
+    pub seed_nodes: Vec<SocketAddr>,
+    /// `-dnsseed`: resolve `ChainParams::seeds` while the address table is empty.
+    pub dns_seed: bool,
+    /// Address advertised to peers (`-externalip` with the p2p port). Only used while listening.
+    pub advertise: Option<SocketAddr>,
+    /// Directory for `peers.dat`. None keeps the address table in memory only.
+    pub datadir: Option<PathBuf>,
+    /// Keep loopback and private addresses in the table (regtest and tests).
+    pub accept_local: bool,
+    /// Interval between checks for free automatic outbound slots.
+    pub outbound_interval: Duration,
+    /// Interval between `peers.dat` writes.
+    pub dump_interval: Duration,
+    /// How long a `-seednode` connection waits for an `addr` reply before it is dropped.
+    pub seed_timeout: Duration,
+}
+
+impl Default for P2pConfig {
+    fn default() -> Self {
+        Self {
+            listen: None,
+            connect: Vec::new(),
+            max_outbound: 8,
+            max_inbound: 117,
+            user_agent: format!("/btc-rust:{}/", env!("CARGO_PKG_VERSION")),
+            add_nodes: Vec::new(),
+            seed_nodes: Vec::new(),
+            dns_seed: true,
+            advertise: None,
+            datadir: None,
+            accept_local: false,
+            outbound_interval: Duration::from_millis(500),
+            dump_interval: Duration::from_secs(15 * 60),
+            seed_timeout: Duration::from_secs(30),
+        }
+    }
 }
 
 /// Serves the P2P network until `shutdown` is notified.
@@ -52,38 +128,61 @@ pub async fn run_p2p(node: SharedNode, config: P2pConfig, shutdown: Arc<Notify>)
         Some(addr) => Some(TcpListener::bind(addr).await?),
         None => None,
     };
-    run_with_listener(node, listener, config, shutdown).await;
+    let addrman = Arc::new(Mutex::new(load_addrman(&config)));
+    run_with_listener(node, listener, config, addrman, shutdown).await;
     Ok(())
+}
+
+/// Starts from `peers.dat` when present. An unreadable file is reported and
+/// replaced by an empty table, which the next write overwrites.
+fn load_addrman(config: &P2pConfig) -> AddrMan {
+    let mut addrman = match config.datadir.as_deref().map(peers_path) {
+        Some(path) if path.exists() => AddrMan::load(&path).unwrap_or_else(|err| {
+            eprintln!("warning: ignoring unreadable {}: {err}", path.display());
+            AddrMan::new()
+        }),
+        _ => AddrMan::new(),
+    };
+    addrman.set_accept_local(config.accept_local);
+    addrman
+}
+
+fn peers_path(datadir: &Path) -> PathBuf {
+    datadir.join("peers.dat")
 }
 
 async fn run_with_listener(
     node: SharedNode,
     listener: Option<TcpListener>,
     config: P2pConfig,
+    addrman: Arc<Mutex<AddrMan>>,
     shutdown: Arc<Notify>,
 ) {
     let params = lock(&node).params.clone();
-    let magic = params.magic;
     let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE);
     let ctx = Arc::new(Ctx {
         node: node.clone(),
         params,
-        user_agent: config.user_agent,
+        user_agent: config.user_agent.clone(),
         events: events_tx,
         next_id: AtomicU64::new(1),
-        outbound: Arc::new(Semaphore::new(config.max_outbound)),
-        inbound: Arc::new(Semaphore::new(MAX_INBOUND_PEERS)),
+        inbound: Arc::new(Semaphore::new(config.max_inbound)),
+        advertise: config.advertise.filter(|_| listener.is_some()),
     });
 
     let mut tasks = JoinSet::new();
     if let Some(listener) = listener {
         tasks.spawn(accept_loop(listener, ctx.clone()));
     }
-    for addr in config.connect {
-        tasks.spawn(dial_loop(addr, ctx.clone()));
+    for addr in config.connect.iter().chain(&config.add_nodes).copied() {
+        tasks.spawn(dial_loop(addr, ctx.clone(), Link::Fixed));
     }
-    Manager::new(node, magic).run(events_rx, shutdown).await;
-    // Dropping `tasks` aborts the listener and the dialers.
+    for addr in config.seed_nodes.iter().copied() {
+        let ctx = ctx.clone();
+        tasks.spawn(async move { dial_once(addr, &ctx, Link::Seed).await });
+    }
+    Manager::new(node, ctx, config, addrman).run(events_rx, shutdown).await;
+    // Dropping `tasks` aborts the listener and the fixed-peer dialers.
 }
 
 /// Shared handles for connection tasks.
@@ -93,14 +192,28 @@ struct Ctx {
     user_agent: String,
     events: mpsc::Sender<Event>,
     next_id: AtomicU64,
-    outbound: Arc<Semaphore>,
     inbound: Arc<Semaphore>,
+    /// Our address as peers should see it, when listening.
+    advertise: Option<SocketAddr>,
 }
 
 impl Ctx {
     fn height(&self) -> i32 {
         lock(&self.node).chainstate.height() as i32
     }
+}
+
+/// Why a connection exists. Only `Auto` counts toward `max_outbound` and only
+/// `Auto` dials are retried through the address table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Link {
+    Inbound,
+    /// Automatic full-relay outbound, chosen from the address table.
+    Auto,
+    /// `-connect` or `-addnode`: redialed forever.
+    Fixed,
+    /// `-seednode`: one connection, dropped after the `addr` reply.
+    Seed,
 }
 
 async fn accept_loop(listener: TcpListener, ctx: Arc<Ctx>) {
@@ -118,32 +231,42 @@ async fn accept_loop(listener: TcpListener, ctx: Arc<Ctx>) {
         let ctx = ctx.clone();
         tokio::spawn(async move {
             let peer = Peer::from_stream(stream, addr, &ctx.params);
-            serve_connection(peer, &ctx).await;
+            serve_connection(peer, &ctx, addr, Link::Inbound).await;
             drop(permit);
         });
     }
 }
 
-async fn dial_loop(addr: SocketAddr, ctx: Arc<Ctx>) {
+/// Keeps a connection to `addr` alive, redialing after each disconnect.
+async fn dial_loop(addr: SocketAddr, ctx: Arc<Ctx>, link: Link) {
     loop {
-        if let Ok(permit) = ctx.outbound.clone().acquire_owned().await {
-            if let Ok(peer) = Peer::connect(addr, &ctx.params).await {
-                serve_connection(peer, &ctx).await;
-            }
-            drop(permit);
-        }
+        dial_once(addr, &ctx, link).await;
         sleep(RETRY_INTERVAL).await;
     }
 }
 
+/// One outbound attempt, then serve the connection until it ends.
+async fn dial_once(addr: SocketAddr, ctx: &Ctx, link: Link) {
+    let limit = if link == Link::Auto { DIAL_TIMEOUT } else { CONNECT_TIMEOUT };
+    match timeout(limit, Peer::connect(addr, &ctx.params)).await {
+        Ok(Ok(peer)) => serve_connection(peer, ctx, addr, link).await,
+        _ => {
+            let _ = ctx.events.send(Event::DialFailed { addr, link }).await;
+        }
+    }
+}
+
 /// Handshake, then forward messages both ways until the connection ends.
-async fn serve_connection(mut peer: Peer<TcpStream>, ctx: &Ctx) {
+async fn serve_connection(mut peer: Peer<TcpStream>, ctx: &Ctx, addr: SocketAddr, link: Link) {
     let local = LocalVersion {
         user_agent: ctx.user_agent.clone(),
         start_height: ctx.height(),
         ..LocalVersion::default()
     };
     let Ok(info) = peer.handshake(&local).await else {
+        if link != Link::Inbound {
+            let _ = ctx.events.send(Event::DialFailed { addr, link }).await;
+        }
         return;
     };
 
@@ -154,6 +277,8 @@ async fn serve_connection(mut peer: Peer<TcpStream>, ctx: &Ctx) {
         id,
         start_height: info.start_height,
         outbound: out_tx,
+        addr,
+        link,
     };
     if ctx.events.send(connected).await.is_err() {
         return;
@@ -177,6 +302,8 @@ enum Event {
         id: PeerId,
         start_height: i32,
         outbound: mpsc::Sender<Wire>,
+        addr: SocketAddr,
+        link: Link,
     },
     Message {
         id: PeerId,
@@ -185,25 +312,63 @@ enum Event {
     Closed {
         id: PeerId,
     },
+    /// An outbound attempt or handshake failed.
+    DialFailed {
+        addr: SocketAddr,
+        link: Link,
+    },
+    /// DNS seed lookup finished.
+    Resolved(Vec<SocketAddr>),
 }
 
-/// Owns the sync state and every peer's outbound queue.
+/// Manager-side state of one connected peer.
+struct PeerState {
+    outbound: mpsc::Sender<Wire>,
+    addr: SocketAddr,
+    link: Link,
+    /// Core's `m_addr_token_bucket`: one token per address accepted.
+    addr_tokens: f64,
+    addr_refilled: Instant,
+    /// Inbound peers get one `getaddr` reply.
+    getaddr_recvd: bool,
+    /// Seed connections are dropped at this instant if no `addr` arrived first.
+    seed_deadline: Option<Instant>,
+}
+
+/// Owns the sync state, the address table and every peer's outbound queue.
 struct Manager {
     node: SharedNode,
+    ctx: Arc<Ctx>,
     magic: [u8; 4],
+    config: P2pConfig,
+    addrman: Arc<Mutex<AddrMan>>,
     sync: SyncManager,
-    peers: HashMap<PeerId, mpsc::Sender<Wire>>,
+    peers: HashMap<PeerId, PeerState>,
+    /// Automatic outbound dials in flight.
+    dialing: HashSet<SocketAddr>,
+    last_seed: Option<Instant>,
+    last_dump: Instant,
     started: Instant,
+    /// A block arrived: request more right away instead of waiting a tick.
+    refill: bool,
 }
 
 impl Manager {
-    fn new(node: SharedNode, magic: [u8; 4]) -> Self {
+    fn new(node: SharedNode, ctx: Arc<Ctx>, config: P2pConfig, addrman: Arc<Mutex<AddrMan>>) -> Self {
+        let magic = ctx.params.magic;
         Self {
             node,
+            ctx,
             magic,
+            config,
+            addrman,
             sync: SyncManager::new(),
             peers: HashMap::new(),
+            dialing: HashSet::new(),
+            last_seed: None,
+            last_dump: Instant::now(),
             started: Instant::now(),
+            refill: false,
         }
     }
 
@@ -211,16 +376,22 @@ impl Manager {
         let stop = shutdown.notified();
         tokio::pin!(stop);
         let mut ticker = interval(TICK_INTERVAL);
+        let mut outbound = interval(self.config.outbound_interval.max(Duration::from_millis(1)));
         loop {
             tokio::select! {
                 _ = &mut stop => break,
                 _ = ticker.tick() => self.tick(),
+                _ = outbound.tick() => self.fill_outbound(),
                 event = events.recv() => match event {
                     Some(event) => self.on_event(event),
                     None => break,
                 },
             }
+            if std::mem::take(&mut self.refill) {
+                self.tick();
+            }
         }
+        self.dump();
     }
 
     fn on_event(&mut self, event: Event) {
@@ -229,12 +400,64 @@ impl Manager {
                 id,
                 start_height,
                 outbound,
-            } => {
-                self.peers.insert(id, outbound);
-                self.sync.peer_connected(id, start_height);
-            }
+                addr,
+                link,
+            } => self.on_connected(id, start_height, outbound, addr, link),
             Event::Message { id, msg } => self.on_message(id, msg),
             Event::Closed { id } => self.drop_peer(id),
+            Event::DialFailed { addr, link } => {
+                if link == Link::Auto {
+                    self.dialing.remove(&addr);
+                    lock_addrman(&self.addrman).attempt(&net_addr(addr, 0, 0), true);
+                }
+            }
+            Event::Resolved(addrs) => {
+                let now = unix_now();
+                let mut am = lock_addrman(&self.addrman);
+                for addr in addrs {
+                    am.add(net_addr(addr, 0, now), net_addr(addr, 0, now));
+                }
+            }
+        }
+    }
+
+    fn on_connected(
+        &mut self,
+        id: PeerId,
+        start_height: i32,
+        outbound: mpsc::Sender<Wire>,
+        addr: SocketAddr,
+        link: Link,
+    ) {
+        let now = Instant::now();
+        self.peers.insert(
+            id,
+            PeerState {
+                outbound,
+                addr,
+                link,
+                addr_tokens: 1.0,
+                addr_refilled: now,
+                getaddr_recvd: false,
+                seed_deadline: (link == Link::Seed).then(|| now + self.config.seed_timeout),
+            },
+        );
+        self.sync.peer_connected(id, start_height);
+        if link == Link::Inbound {
+            return;
+        }
+        if link == Link::Auto {
+            self.dialing.remove(&addr);
+        }
+        lock_addrman(&self.addrman).mark_good(&net_addr(addr, 0, 0));
+
+        self.send(id, to_wire(self.magic, &NetworkMessage::GetAddr));
+        if let Some(peer) = self.peers.get_mut(&id) {
+            peer.addr_tokens += GETADDR_TOKEN_GRANT;
+        }
+        if let Some(own) = self.ctx.advertise.filter(|_| link != Link::Seed) {
+            let entry = (unix_now(), Address::new(&own, ServiceFlags::NONE));
+            self.send(id, to_wire(self.magic, &NetworkMessage::Addr(vec![entry])));
         }
     }
 
@@ -262,6 +485,22 @@ impl Manager {
                 let node = lock(&self.node);
                 mempool_replies(&node, self.magic)
             }
+            NetworkMessage::GetAddr => self.getaddr_replies(id),
+            NetworkMessage::Addr(list) => {
+                let total = list.len();
+                let addrs = list
+                    .iter()
+                    .filter_map(|(time, addr)| addr_v1_to_net(*time, addr))
+                    .collect();
+                self.on_addr(id, total, addrs);
+                return;
+            }
+            NetworkMessage::AddrV2(list) => {
+                let total = list.len();
+                let addrs = list.iter().filter_map(addr_v2_to_net).collect();
+                self.on_addr(id, total, addrs);
+                return;
+            }
             other => {
                 let actions = {
                     let node = lock(&self.node);
@@ -274,6 +513,104 @@ impl Manager {
         for reply in replies {
             self.send(id, reply);
         }
+    }
+
+    /// `ProcessMessage` for `addr` and `addrv2`: rate limit, store, relay.
+    /// `total` counts every entry in the message, including ones we cannot store.
+    fn on_addr(&mut self, id: PeerId, total: usize, mut addrs: Vec<NetAddr>) {
+        if total > MAX_ADDR_TO_SEND {
+            self.drop_peer(id);
+            return;
+        }
+        let now = unix_now();
+        let Some(peer) = self.peers.get_mut(&id) else {
+            return;
+        };
+        let admitted = admit_addresses(
+            &mut peer.addr_tokens,
+            &mut peer.addr_refilled,
+            Instant::now(),
+            addrs.len(),
+        );
+        addrs.truncate(admitted);
+        let source = net_addr(peer.addr, 0, now);
+        let is_seed = peer.link == Link::Seed;
+
+        for addr in &mut addrs {
+            if addr.time <= ADDR_MIN_TIME || addr.time > now + ADDR_FUTURE_SECS {
+                addr.time = now.saturating_sub(ADDR_UNDATED_AGE_SECS);
+            }
+        }
+        let own = self.ctx.advertise;
+        addrs.retain(|addr| {
+            !own.is_some_and(|me| me.ip() == addr.ip && me.port() == addr.port)
+        });
+
+        let mut am = lock_addrman(&self.addrman);
+        let usable: Vec<NetAddr> = addrs.iter().copied().filter(|addr| am.accepts_ip(addr.ip)).collect();
+        if total <= ADDR_RELAY_MAX {
+            let fresh: Vec<NetAddr> = usable
+                .iter()
+                .copied()
+                .filter(|addr| addr.time > now.saturating_sub(ADDR_FRESH_SECS))
+                .collect();
+            if !fresh.is_empty() {
+                drop(am);
+                self.relay_addrs(id, &fresh);
+                am = lock_addrman(&self.addrman);
+            }
+        }
+        for addr in &usable {
+            am.add(*addr, source);
+        }
+        drop(am);
+
+        if is_seed {
+            self.drop_peer(id);
+        }
+    }
+
+    /// `RelayAddress`: sends fresh addresses to up to two other peers, chosen at random.
+    fn relay_addrs(&mut self, source: PeerId, addrs: &[NetAddr]) {
+        let mut targets: Vec<PeerId> = self
+            .peers
+            .iter()
+            .filter(|(id, peer)| **id != source && peer.link != Link::Seed)
+            .map(|(id, _)| *id)
+            .collect();
+        for i in 0..targets.len().min(ADDR_RELAY_PEERS) {
+            let j = i + random_below((targets.len() - i) as u64) as usize;
+            targets.swap(i, j);
+        }
+        let entries: Vec<(u32, Address)> = addrs.iter().map(to_v1_entry).collect();
+        let wire = to_wire(self.magic, &NetworkMessage::Addr(entries));
+        for id in targets.into_iter().take(ADDR_RELAY_PEERS) {
+            self.send(id, wire.clone());
+        }
+    }
+
+    /// `getaddr` from an inbound peer gets one reply: a random sample of the
+    /// table, plus our own address when advertised.
+    fn getaddr_replies(&mut self, id: PeerId) -> Vec<Wire> {
+        let Some(peer) = self.peers.get_mut(&id) else {
+            return Vec::new();
+        };
+        if peer.link != Link::Inbound || peer.getaddr_recvd {
+            return Vec::new();
+        }
+        peer.getaddr_recvd = true;
+
+        let own = self.ctx.advertise;
+        let reserve = usize::from(own.is_some());
+        let sample = lock_addrman(&self.addrman).get_addresses(MAX_ADDR_TO_SEND - reserve, MAX_PCT_ADDR_TO_SEND);
+        let mut entries: Vec<(u32, Address)> = sample.iter().map(to_v1_entry).collect();
+        if let Some(own) = own {
+            entries.push((unix_now(), Address::new(&own, ServiceFlags::NONE)));
+        }
+        if entries.is_empty() {
+            return Vec::new();
+        }
+        vec![to_wire(self.magic, &NetworkMessage::Addr(entries))]
     }
 
     fn tick(&mut self) {
@@ -289,6 +626,101 @@ impl Manager {
             (node.take_new_tips(), node.take_new_txs())
         };
         self.announce(&tips, &txs);
+
+        let at = Instant::now();
+        let expired: Vec<PeerId> = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.seed_deadline.is_some_and(|deadline| deadline <= at))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            self.drop_peer(id);
+        }
+        if self.last_dump.elapsed() >= self.config.dump_interval {
+            self.dump();
+        }
+    }
+
+    /// Opens automatic outbound connections until `max_outbound` are in flight
+    /// or connected. Addresses come from the table; with an empty table, DNS seeds are resolved.
+    fn fill_outbound(&mut self) {
+        let max = if self.config.connect.is_empty() {
+            self.config.max_outbound
+        } else {
+            0
+        };
+        if max == 0 {
+            return;
+        }
+        let auto = self.peers.values().filter(|peer| peer.link == Link::Auto).count() + self.dialing.len();
+        if auto >= max {
+            return;
+        }
+        if lock_addrman(&self.addrman).size() == 0 {
+            self.maybe_resolve_seeds();
+            return;
+        }
+
+        // Each `select` can be costly (it retries while the chance is low), so the
+        // number of draws per tick is bounded. Rejected draws are cheap to repeat later.
+        let mut free = max - auto;
+        let mut draws = 2 * free + 2;
+        while free > 0 && draws > 0 {
+            draws -= 1;
+            let candidate = lock_addrman(&self.addrman).select(false);
+            let Some(candidate) = candidate else {
+                break;
+            };
+            let addr = SocketAddr::new(candidate.ip, candidate.port);
+            if !self.dial_allowed(addr) {
+                continue;
+            }
+            self.dialing.insert(addr);
+            let ctx = self.ctx.clone();
+            tokio::spawn(async move { dial_once(addr, &ctx, Link::Auto).await });
+            free -= 1;
+        }
+    }
+
+    /// Whether an automatic dial to `addr` makes sense now: not us, not a
+    /// fixed peer (those have their own loops), not already connected or dialing,
+    /// and not in a netgroup we already use for outbound.
+    fn dial_allowed(&self, addr: SocketAddr) -> bool {
+        if self.ctx.advertise.is_some_and(|me| me == addr) {
+            return false;
+        }
+        if self.config.connect.contains(&addr) || self.config.add_nodes.contains(&addr) {
+            return false;
+        }
+        if self.dialing.contains(&addr) || self.peers.values().any(|peer| peer.addr == addr) {
+            return false;
+        }
+        let group = netgroup(addr.ip());
+        let busy_dial = self.dialing.iter().any(|other| netgroup(other.ip()) == group);
+        let busy_peer = self
+            .peers
+            .values()
+            .any(|peer| peer.link == Link::Auto && netgroup(peer.addr.ip()) == group);
+        !busy_dial && !busy_peer
+    }
+
+    /// Starts a DNS seed lookup, at most once per `SEED_RETRY`.
+    fn maybe_resolve_seeds(&mut self) {
+        if !self.config.dns_seed || self.ctx.params.seeds.is_empty() {
+            return;
+        }
+        if self.last_seed.is_some_and(|at| at.elapsed() < SEED_RETRY) {
+            return;
+        }
+        self.last_seed = Some(Instant::now());
+        let seeds = self.ctx.params.seeds.clone();
+        let port = self.ctx.params.default_port;
+        let events = self.ctx.events.clone();
+        tokio::spawn(async move {
+            let found = resolve_seeds(&seeds, port).await;
+            let _ = events.send(Event::Resolved(found)).await;
+        });
     }
 
     /// Relays new tips as `headers` (so a peer learns every new block from one
@@ -314,8 +746,8 @@ impl Manager {
             }
         }
         for message in messages {
-            for outbound in self.peers.values() {
-                let _ = outbound.try_send(message.clone());
+            for peer in self.peers.values() {
+                let _ = peer.outbound.try_send(message.clone());
             }
         }
     }
@@ -342,6 +774,7 @@ impl Manager {
                         continue;
                     };
                     let result = lock(&self.node).submit_block(&block);
+                    self.refill = true;
                     if let Err(err) = result {
                         if !matches!(err, ValidationError::Duplicate) {
                             self.drop_peer(id);
@@ -359,8 +792,8 @@ impl Manager {
     }
 
     fn send(&self, id: PeerId, msg: Wire) {
-        if let Some(outbound) = self.peers.get(&id) {
-            let _ = outbound.try_send(msg);
+        if let Some(peer) = self.peers.get(&id) {
+            let _ = peer.outbound.try_send(msg);
         }
     }
 
@@ -368,6 +801,89 @@ impl Manager {
         self.sync.peer_disconnected(id);
         self.peers.remove(&id);
     }
+
+    /// Writes `peers.dat` when a data directory is configured.
+    fn dump(&mut self) {
+        self.last_dump = Instant::now();
+        let Some(dir) = self.config.datadir.as_deref() else {
+            return;
+        };
+        let path = peers_path(dir);
+        if let Err(err) = lock_addrman(&self.addrman).save(&path) {
+            eprintln!("warning: cannot write {}: {err}", path.display());
+        }
+    }
+}
+
+/// Resolves DNS seed entries. Each is `host`, `host:port`, or an `ip:port`
+/// literal; a bare host uses the chain's default port.
+async fn resolve_seeds(seeds: &[String], default_port: u16) -> Vec<SocketAddr> {
+    let mut found = Vec::new();
+    for seed in seeds {
+        if let Ok(addr) = seed.parse::<SocketAddr>() {
+            found.push(addr);
+            continue;
+        }
+        let parsed = seed
+            .rsplit_once(':')
+            .filter(|(host, _)| !host.contains(':'))
+            .and_then(|(host, port)| Some((host, port.parse::<u16>().ok()?)));
+        let (host, port) = parsed.unwrap_or((seed.as_str(), default_port));
+        if let Ok(addrs) = lookup_host((host, port)).await {
+            found.extend(addrs);
+        }
+    }
+    found
+}
+
+/// Core's address token bucket. The bucket refills at `MAX_ADDR_RATE_PER_SECOND`
+/// up to `MAX_ADDR_TO_SEND`, and each admitted address costs one token. Returns
+/// how many of `wanted` addresses may be processed.
+fn admit_addresses(tokens: &mut f64, last: &mut Instant, now: Instant, wanted: usize) -> usize {
+    let cap = MAX_ADDR_TO_SEND as f64;
+    if *tokens < cap {
+        let elapsed = now.saturating_duration_since(*last).as_secs_f64();
+        *tokens = (*tokens + elapsed * MAX_ADDR_RATE_PER_SECOND).min(cap);
+    }
+    *last = now;
+    let admitted = (tokens.floor().max(0.0) as usize).min(wanted);
+    *tokens -= admitted as f64;
+    admitted
+}
+
+fn addr_v1_to_net(time: u32, addr: &Address) -> Option<NetAddr> {
+    let sock = addr.socket_addr().ok()?;
+    Some(net_addr(sock, addr.services.to_u64(), time))
+}
+
+fn addr_v2_to_net(msg: &AddrV2Message) -> Option<NetAddr> {
+    let sock = msg.socket_addr().ok()?;
+    Some(net_addr(sock, msg.services.to_u64(), msg.time))
+}
+
+fn to_v1_entry(addr: &NetAddr) -> (u32, Address) {
+    let sock = SocketAddr::new(addr.ip, addr.port);
+    (addr.time, Address::new(&sock, ServiceFlags::from(addr.services)))
+}
+
+fn net_addr(addr: SocketAddr, services: u64, time: u32) -> NetAddr {
+    NetAddr::new(addr.ip(), addr.port(), services, time)
+}
+
+fn unix_now() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as u32)
+        .unwrap_or(0)
+}
+
+/// Uniform-ish value below `n` (`n > 0`), from std's OS-seeded hasher.
+fn random_below(n: u64) -> u64 {
+    RandomState::new().build_hasher().finish() % n
+}
+
+fn lock_addrman(addrman: &Mutex<AddrMan>) -> MutexGuard<'_, AddrMan> {
+    addrman.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn lock(node: &SharedNode) -> MutexGuard<'_, Node> {
@@ -669,11 +1185,21 @@ mod tests {
 
     fn config(connect: Vec<SocketAddr>) -> P2pConfig {
         P2pConfig {
-            listen: None,
             connect,
-            max_outbound: 8,
             user_agent: "/p2p-test:0.0.1/".to_string(),
+            accept_local: true,
+            ..P2pConfig::default()
         }
+    }
+
+    fn table() -> Arc<Mutex<AddrMan>> {
+        let mut am = AddrMan::new();
+        am.set_accept_local(true);
+        Arc::new(Mutex::new(am))
+    }
+
+    fn local(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
     }
 
     async fn wait_for_tip(follower: &SharedNode, leader: &SharedNode) {
@@ -806,7 +1332,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let stop_a = Arc::new(Notify::new());
-        tokio::spawn(run_with_listener(a.clone(), Some(listener), config(Vec::new()), stop_a.clone()));
+        tokio::spawn(run_with_listener(a.clone(), Some(listener), config(Vec::new()), table(), stop_a.clone()));
 
         let b = regtest_node().shared();
         let stop_b = Arc::new(Notify::new());
@@ -819,5 +1345,137 @@ mod tests {
 
         stop_a.notify_one();
         stop_b.notify_one();
+    }
+
+    #[tokio::test]
+    async fn wallet_tx_relays_to_peer_mempool() {
+        let dir = std::env::temp_dir().join(format!("p2p-txrelay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = regtest_node().shared();
+        let to = {
+            let mut node = lock(&a);
+            node.attach_wallet(btc_wallet::Wallet::create(&dir.join("w.json")).unwrap()).unwrap();
+            let script = node.wallet.as_mut().unwrap().new_script(btc_wallet::ScriptKind::P2wpkh).unwrap();
+            node.generate(101, &script).unwrap();
+            script
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop_a = Arc::new(Notify::new());
+        tokio::spawn(run_with_listener(a.clone(), Some(listener), config(Vec::new()), table(), stop_a.clone()));
+        let b = regtest_node().shared();
+        let stop_b = Arc::new(Notify::new());
+        tokio::spawn(run_p2p(b.clone(), config(vec![addr]), stop_b.clone()));
+        wait_for_tip(&b, &a).await;
+
+        let txid = lock(&a).wallet_send(to, 100_000_000, None, false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !lock(&b).mempool.contains(&txid) {
+            assert!(Instant::now() < deadline, "tx never reached peer mempool");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        stop_a.notify_one();
+        stop_b.notify_one();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core's token bucket: starts at 1, refills at 0.1 per second, caps at 1000,
+    /// and a `getaddr` reply adds 1000.
+    #[test]
+    fn addr_rate_limit_admits_refill_and_burst() {
+        let t0 = Instant::now();
+        let mut tokens = 1.0;
+        let mut last = t0;
+        assert_eq!(admit_addresses(&mut tokens, &mut last, t0, 5), 1);
+        assert_eq!(admit_addresses(&mut tokens, &mut last, t0, 5), 0);
+        assert_eq!(admit_addresses(&mut tokens, &mut last, t0 + Duration::from_secs(10), 5), 1);
+        tokens += GETADDR_TOKEN_GRANT;
+        assert_eq!(admit_addresses(&mut tokens, &mut last, t0 + Duration::from_secs(10), 2000), 1000);
+        let later = t0 + Duration::from_secs(100_000);
+        assert_eq!(admit_addresses(&mut tokens, &mut last, later, 2000), 1000);
+        assert_eq!(admit_addresses(&mut tokens, &mut last, later, 2000), 0);
+    }
+
+    #[test]
+    fn dns_seed_entries_parse_without_lookup() {
+        let seeds = vec![
+            "127.0.0.1:18444".to_string(),
+            "[::1]:18445".to_string(),
+        ];
+        let found = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(resolve_seeds(&seeds, 8333));
+        assert_eq!(found, vec![local(18444), "[::1]:18445".parse().unwrap()]);
+    }
+
+    /// B and C both connect to A. C advertises its own address, and B must
+    /// learn it through A's `addr` relay. C starts after B so that B is
+    /// already connected when A relays C's address.
+    #[tokio::test]
+    async fn addr_relay_teaches_peers_a_new_address() {
+        let a = regtest_node().shared();
+        let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        let stop_a = Arc::new(Notify::new());
+        tokio::spawn(run_with_listener(a.clone(), Some(listener_a), config(Vec::new()), table(), stop_a.clone()));
+
+        let b = regtest_node().shared();
+        let addrman_b = table();
+        let stop_b = Arc::new(Notify::new());
+        tokio::spawn(run_with_listener(b.clone(), None, config(vec![addr_a]), addrman_b.clone(), stop_b.clone()));
+        sleep(Duration::from_millis(500)).await;
+
+        let c = regtest_node().shared();
+        let listener_c = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_c = listener_c.local_addr().unwrap();
+        let stop_c = Arc::new(Notify::new());
+        let config_c = P2pConfig {
+            advertise: Some(addr_c),
+            listen: Some(addr_c),
+            ..config(vec![addr_a])
+        };
+        tokio::spawn(run_with_listener(c.clone(), Some(listener_c), config_c, table(), stop_c.clone()));
+
+        let learned = NetAddr::new(addr_c.ip(), addr_c.port(), 0, 0);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !lock_addrman(&addrman_b).contains(&learned) {
+            assert!(Instant::now() < deadline, "B never learned C's address {addr_c}");
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        stop_a.notify_one();
+        stop_b.notify_one();
+        stop_c.notify_one();
+    }
+
+    /// With no `-connect` list, the outbound loop dials an address from the table
+    /// and syncs from it.
+    #[tokio::test]
+    async fn outbound_loop_dials_address_from_table() {
+        let a = regtest_node().shared();
+        lock(&a).generate(20, &op_true()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener.local_addr().unwrap();
+        let stop_a = Arc::new(Notify::new());
+        tokio::spawn(run_with_listener(a.clone(), Some(listener), config(Vec::new()), table(), stop_a.clone()));
+
+        let known = table();
+        let source = NetAddr::new(addr_a.ip(), addr_a.port(), 0, unix_now());
+        lock_addrman(&known).add(source, source);
+
+        let e = regtest_node().shared();
+        let stop_e = Arc::new(Notify::new());
+        let config_e = P2pConfig {
+            outbound_interval: Duration::from_millis(100),
+            ..config(Vec::new())
+        };
+        tokio::spawn(run_with_listener(e.clone(), None, config_e, known, stop_e.clone()));
+        wait_for_tip(&e, &a).await;
+
+        stop_a.notify_one();
+        stop_e.notify_one();
     }
 }

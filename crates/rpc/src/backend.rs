@@ -1,6 +1,7 @@
 //! The node interface the RPC layer is written against.
 
 use bitcoin::Network;
+use btc_wallet::address::{AddressParams, Network as WalletNetwork};
 use btc_primitives::{Block, BlockHash, BlockHeader, OutPoint, ScriptBuf, Tx, TxOut, Txid};
 
 /// Subset of `getblockchaininfo` the RPC layer renders.
@@ -45,5 +46,77 @@ pub trait RpcBackend: Send + Sync + 'static {
     /// Returns the output, its confirmations and whether it is a coinbase output.
     fn get_tx_out(&self, outpoint: &OutPoint) -> Option<(TxOut, u32, bool)>;
     fn network(&self) -> Network;
+    /// Address prefixes of this chain. Custom coins override this.
+    fn address_params(&self) -> AddressParams {
+        let n = match self.network() {
+            Network::Bitcoin => WalletNetwork::Main,
+            Network::Regtest => WalletNetwork::Regtest,
+            _ => WalletNetwork::Test,
+        };
+        AddressParams::from(n)
+    }
+    /// The loaded wallet, if any (`-disablewallet` = None).
+    fn wallet(&self) -> Option<&dyn WalletRpc> {
+        None
+    }
     fn stop(&self);
+}
+
+/// One wallet-owned unspent output (`listunspent`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletUtxo {
+    pub outpoint: OutPoint,
+    pub script_pubkey: ScriptBuf,
+    pub amount: i64,
+    pub confirmations: u32,
+    pub spendable: bool,
+}
+
+/// `getwalletinfo` fields.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WalletInfo {
+    pub name: String,
+    pub balance: i64,
+    pub unconfirmed_balance: i64,
+    pub immature_balance: i64,
+    pub tx_count: usize,
+    pub keypool_size: usize,
+    pub encrypted: bool,
+    /// Unix time the wallet relocks at; 0 = locked (only when encrypted).
+    pub unlocked_until: u64,
+}
+
+/// One `listtransactions` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletTx {
+    pub txid: Txid,
+    /// "send", "receive", "generate" or "immature".
+    pub category: String,
+    /// Net amount in satoshis (negative for sends).
+    pub amount: i64,
+    pub fee: Option<i64>,
+    pub script_pubkey: Option<ScriptBuf>,
+    /// -1 / 0 = unconfirmed, conflicted handled as 0.
+    pub confirmations: i64,
+    pub blockhash: Option<BlockHash>,
+    pub time: i64,
+}
+
+/// Wallet methods (`src/wallet/rpc/*.cpp`). Amounts are satoshis; errors are
+/// Core-style messages forwarded to the client.
+pub trait WalletRpc: Send + Sync {
+    /// `kind`: "legacy", "p2sh-segwit", "bech32" (default), "bech32m".
+    fn get_new_address(&self, kind: Option<&str>) -> Result<ScriptBuf, String>;
+    fn get_balance(&self, minconf: u32) -> i64;
+    fn list_unspent(&self, minconf: u32, maxconf: u32) -> Vec<WalletUtxo>;
+    /// Builds, signs and broadcasts. `fee_rate` in sat/kvB (None = estimate or fallback).
+    fn send_to(&self, script: ScriptBuf, amount: i64, fee_rate: Option<i64>, subtract_fee: bool) -> Result<Txid, String>;
+    fn dump_privkey(&self, script: &ScriptBuf) -> Result<String, String>;
+    fn import_privkey(&self, wif: &str) -> Result<(), String>;
+    fn wallet_info(&self) -> WalletInfo;
+    /// Newest last, like Core: skip `skip` newest then return up to `count`.
+    fn list_transactions(&self, count: usize, skip: usize) -> Vec<WalletTx>;
+    fn encrypt_wallet(&self, passphrase: &str) -> Result<(), String>;
+    fn wallet_passphrase(&self, passphrase: &str, timeout_secs: u64) -> Result<(), String>;
+    fn wallet_lock(&self) -> Result<(), String>;
 }
