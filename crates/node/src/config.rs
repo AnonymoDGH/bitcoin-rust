@@ -54,6 +54,10 @@ pub struct NodeConfig {
     pub external_ip: Option<IpAddr>,
     /// Connection limit (`-maxconnections=<n>`, default 125). Eight of these are outbound.
     pub max_connections: usize,
+    /// Wallet file name inside the datadir (`-wallet=<name>`, default `wallet.json`).
+    pub wallet: String,
+    /// Run without a wallet (`-disablewallet`).
+    pub disable_wallet: bool,
     /// Mine blocks in the background (`-gen`).
     pub generate: bool,
     /// Address or script hex that mined blocks pay to (`-genaddress=`).
@@ -111,6 +115,8 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
     let mut dns_seed = true;
     let mut external_ip: Option<IpAddr> = None;
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
+    let mut wallet = "wallet.json".to_owned();
+    let mut disable_wallet = false;
     let mut generate = false;
     let mut gen_address: Option<String> = None;
     let mut print_chainspec = false;
@@ -148,6 +154,8 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
             "dnsseed" => dns_seed = parse_bool("dnsseed", value)?,
             "externalip" => external_ip = Some(parse_value("externalip", value)?),
             "maxconnections" => max_connections = parse_value("maxconnections", value)?,
+            "wallet" => wallet = required("wallet", value)?.to_owned(),
+            "disablewallet" => disable_wallet = parse_bool("disablewallet", value)?,
             "gen" => generate = parse_bool("gen", value)?,
             "genaddress" => gen_address = Some(required("genaddress", value)?.to_owned()),
             "printchainspec" => print_chainspec = parse_bool("printchainspec", value)?,
@@ -236,6 +244,8 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
         dns_seed,
         external_ip,
         max_connections,
+        wallet,
+        disable_wallet,
         generate,
         gen_address,
         print_chainspec,

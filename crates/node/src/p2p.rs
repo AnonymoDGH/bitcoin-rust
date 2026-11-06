@@ -349,6 +349,8 @@ struct Manager {
     last_seed: Option<Instant>,
     last_dump: Instant,
     started: Instant,
+    /// A block arrived: request more right away instead of waiting a tick.
+    refill: bool,
 }
 
 impl Manager {
@@ -366,6 +368,7 @@ impl Manager {
             last_seed: None,
             last_dump: Instant::now(),
             started: Instant::now(),
+            refill: false,
         }
     }
 
@@ -383,6 +386,9 @@ impl Manager {
                     Some(event) => self.on_event(event),
                     None => break,
                 },
+            }
+            if std::mem::take(&mut self.refill) {
+                self.tick();
             }
         }
         self.dump();
@@ -768,6 +774,7 @@ impl Manager {
                         continue;
                     };
                     let result = lock(&self.node).submit_block(&block);
+                    self.refill = true;
                     if let Err(err) = result {
                         if !matches!(err, ValidationError::Duplicate) {
                             self.drop_peer(id);
@@ -1338,6 +1345,39 @@ mod tests {
 
         stop_a.notify_one();
         stop_b.notify_one();
+    }
+
+    #[tokio::test]
+    async fn wallet_tx_relays_to_peer_mempool() {
+        let dir = std::env::temp_dir().join(format!("p2p-txrelay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = regtest_node().shared();
+        let to = {
+            let mut node = lock(&a);
+            node.attach_wallet(btc_wallet::Wallet::create(&dir.join("w.json")).unwrap()).unwrap();
+            let script = node.wallet.as_mut().unwrap().new_script(btc_wallet::ScriptKind::P2wpkh).unwrap();
+            node.generate(101, &script).unwrap();
+            script
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop_a = Arc::new(Notify::new());
+        tokio::spawn(run_with_listener(a.clone(), Some(listener), config(Vec::new()), table(), stop_a.clone()));
+        let b = regtest_node().shared();
+        let stop_b = Arc::new(Notify::new());
+        tokio::spawn(run_p2p(b.clone(), config(vec![addr]), stop_b.clone()));
+        wait_for_tip(&b, &a).await;
+
+        let txid = lock(&a).wallet_send(to, 100_000_000, None, false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !lock(&b).mempool.contains(&txid) {
+            assert!(Instant::now() < deadline, "tx never reached peer mempool");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        stop_a.notify_one();
+        stop_b.notify_one();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Core's token bucket: starts at 1, refills at 0.1 per second, caps at 1000,

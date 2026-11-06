@@ -263,8 +263,7 @@ fn encrypt_wallet(wallet: &dyn WalletRpc, args: &Args) -> RpcResult<Value> {
     }
     wallet.encrypt_wallet(passphrase).map_err(wallet_error)?;
     Ok(json!(
-        "wallet encrypted; The keypool has been flushed and a new HD seed was generated. \
-         You need to make a new backup with the backupwallet RPC."
+        "wallet encrypted; back up the wallet file again (it now holds only encrypted keys)."
     ))
 }
 
