@@ -1,0 +1,10 @@
+[package]
+name = "btc-primitives"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bitcoin = { workspace = true }
+bitcoin_hashes = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
