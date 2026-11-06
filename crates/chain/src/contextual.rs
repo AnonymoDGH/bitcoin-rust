@@ -11,7 +11,26 @@ use crate::{BlockTree, IndexId, ValidationError};
 /// P2SH|WITNESS|TAPROOT always (unless a `script_flag_exceptions` entry),
 /// DERSIG from bip66, CLTV from bip65, CSV from csv, NULLDUMMY from segwit.
 pub fn block_script_flags(height: u32, hash: &btc_primitives::BlockHash, params: &ChainParams) -> ScriptVerifyFlags {
-    todo!()
+    let d = &params.deployments;
+    let mut flags = d
+        .script_flag_exceptions
+        .iter()
+        .find(|(h, _)| h == hash)
+        .map(|(_, bits)| ScriptVerifyFlags::from_bits(*bits))
+        .unwrap_or(ScriptVerifyFlags::P2SH | ScriptVerifyFlags::WITNESS | ScriptVerifyFlags::TAPROOT);
+    if height >= d.bip66_height {
+        flags |= ScriptVerifyFlags::DERSIG;
+    }
+    if height >= d.bip65_height {
+        flags |= ScriptVerifyFlags::CHECKLOCKTIMEVERIFY;
+    }
+    if height >= d.csv_height {
+        flags |= ScriptVerifyFlags::CHECKSEQUENCEVERIFY;
+    }
+    if height >= d.segwit_height {
+        flags |= ScriptVerifyFlags::NULLDUMMY;
+    }
+    flags
 }
 
 /// `ContextualCheckBlockHeader(header, prev)`: nBits == next_work_required,
