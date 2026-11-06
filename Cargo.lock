@@ -171,6 +171,7 @@ dependencies = [
  "bitcoin_hashes",
  "btc-primitives",
  "btc-wallet",
+ "getrandom 0.2.17",
  "serde",
  "serde_json",
  "thiserror",
