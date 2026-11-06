@@ -150,8 +150,11 @@ pub fn signature_hash_taproot(
         ss.extend_from_slice(&(n_in as u32).to_le_bytes());
     }
     if let Some(annex) = annex {
-        // m_annex_hash = single SHA256 of the annex buffer (including the 0x50 tag).
-        let annex_hash = sha256::Hash::hash(annex).to_byte_array();
+        // m_annex_hash = single SHA256 of (CompactSize(annex.len()) || annex), annex includes the 0x50 tag.
+        let mut b = Vec::new();
+        write_compact_size(&mut b, annex.len() as u64);
+        b.extend_from_slice(annex);
+        let annex_hash = sha256::Hash::hash(&b).to_byte_array();
         ss.extend_from_slice(&annex_hash);
     }
 

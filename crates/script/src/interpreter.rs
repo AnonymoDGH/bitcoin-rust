@@ -125,8 +125,9 @@ fn check_sig_pre_tapscript(
     checker: &dyn SignatureChecker,
     sigversion: SigVersion,
 ) -> Result<bool, ScriptError> {
-    let sig = stack.pop().ok_or(ScriptError::InvalidStackOperation)?;
+    // Core: vchSig = stacktop(-2), vchPubKey = stacktop(-1); pubkey on top.
     let pubkey = stack.pop().ok_or(ScriptError::InvalidStackOperation)?;
+    let sig = stack.pop().ok_or(ScriptError::InvalidStackOperation)?;
 
     let mut script_code: &[u8] = &script[code_start..];
     let mut owned: Option<Vec<u8>> = None;
@@ -156,8 +157,9 @@ fn check_sig_tapscript(
     sigversion: SigVersion,
     exec_data: &mut ExecData,
 ) -> Result<bool, ScriptError> {
-    let sig = stack.pop().ok_or(ScriptError::InvalidStackOperation)?;
+    // Core: sig = stacktop(-2), pubkey = stacktop(-1).
     let pubkey = stack.pop().ok_or(ScriptError::InvalidStackOperation)?;
+    let sig = stack.pop().ok_or(ScriptError::InvalidStackOperation)?;
 
     let success = !sig.is_empty();
     if success {
@@ -208,37 +210,57 @@ fn multisig_verify_operands(
     }
     let sigs: Vec<Vec<u8>> = stack.drain(stack.len() - m as usize..).collect();
 
+    // Core drops the dummy argument as part of the argument cleanup; NULLDUMMY checks it here.
     let dummy = stack.pop().ok_or(ScriptError::InvalidStackOperation)?;
     let null_dummy = dummy.is_empty() || (dummy.len() == 1 && dummy[0] == 0);
     if flags.contains(ScriptVerifyFlags::NULLDUMMY) && !null_dummy {
         return Err(ScriptError::SigNulldummy);
     }
 
-    let mut i = 0usize;
-    let mut pubkey_i = 0usize;
-    while i < m as usize && pubkey_i < n as usize {
-        let ok = {
-            let sig = &sigs[i];
-            let pubkey = &pubkeys[pubkey_i];
-            let mut script_code: &[u8] = &script[code_start..];
-            let mut owned: Option<Vec<u8>> = None;
-            if sigversion == SigVersion::Base && !sig.is_empty() {
-                let sig_push = encode_push(sig);
-                let (cleaned, found) = find_and_delete(script_code, &sig_push);
-                if found > 0 && flags.contains(ScriptVerifyFlags::CONST_SCRIPTCODE) {
-                    return Err(ScriptError::SigFindanddelete);
-                }
-                owned = Some(cleaned);
-                script_code = owned.as_deref().unwrap();
+    // Pre-segwit: drop the signatures from a copy of the scriptCode for every sig.
+    let mut script_code = script[code_start..].to_vec();
+    if sigversion == SigVersion::Base {
+        for sig in &sigs {
+            if sig.is_empty() {
+                continue;
             }
-            checker.check_ecdsa_signature(sig, pubkey, script_code, sigversion)
-        };
+            let sig_push = encode_push(sig);
+            let (cleaned, found) = find_and_delete(&script_code, &sig_push);
+            if found > 0 && flags.contains(ScriptVerifyFlags::CONST_SCRIPTCODE) {
+                return Err(ScriptError::SigFindanddelete);
+            }
+            script_code = cleaned;
+        }
+    }
+
+    let mut i = 0usize; // index into sigs (consumed)
+    let mut pubkey_i = 0usize; // index into pubkeys (consumed)
+    while i < m as usize && pubkey_i < n as usize {
+        let sig = &sigs[i];
+        let pubkey = &pubkeys[pubkey_i];
+        // Encoding is checked for every attempted pair; order matters (Script_InValid tests).
+        crate::sig_encoding::check_signature_encoding(sig, flags)?;
+        crate::sig_encoding::check_pubkey_encoding(pubkey, flags, sigversion)?;
+        let ok = checker.check_ecdsa_signature(sig, pubkey, &script_code, sigversion);
         if ok {
             i += 1;
         }
         pubkey_i += 1;
+        // More signatures left than keys left: fail early without further checks.
+        if (m as usize - i) > (n as usize - pubkey_i) {
+            break;
+        }
     }
-    Ok(i == m as usize)
+    let success = i == m as usize;
+    if !success && flags.contains(ScriptVerifyFlags::NULLFAIL) {
+        // If the multisig failed, all signatures in it must be empty.
+        for sig in &sigs {
+            if !sig.is_empty() {
+                return Err(ScriptError::SigNullfail);
+            }
+        }
+    }
+    Ok(success)
 }
 
 pub fn eval_script(
@@ -709,9 +731,10 @@ pub fn eval_script(
                 if sigversion != SigVersion::Tapscript {
                     return Err(ScriptError::DisabledOpcode);
                 }
-                let sig = stack.pop().ok_or(ScriptError::InvalidStackOperation)?;
+                // Core: sig = stacktop(-3), num = stacktop(-2), pubkey = stacktop(-1).
                 let pubkey = stack.pop().ok_or(ScriptError::InvalidStackOperation)?;
                 let n = pop_number(stack, require_minimal, MAX_NUM_SIZE)?.value();
+                let sig = stack.pop().ok_or(ScriptError::InvalidStackOperation)?;
                 let success = !sig.is_empty();
                 if success {
                     if let Some(left) = exec_data.validation_weight_left.as_mut() {
@@ -749,5 +772,7 @@ pub fn eval_script(
     exec_data.validation_weight_left; // keep field referenced in all paths
     Ok(())
 }
+
+
 
 
