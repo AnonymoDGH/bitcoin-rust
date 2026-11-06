@@ -1,0 +1,12 @@
+[package]
+name = "btc-wallet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+btc-primitives = { path = "../primitives" }
+btc-consensus = { path = "../consensus" }
+bitcoin = { workspace = true }
+bitcoin_hashes = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
