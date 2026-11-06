@@ -12,3 +12,7 @@ bitcoin_hashes = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 getrandom = "0.2"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+sha2 = "0.10"
+serde_json = "1"
