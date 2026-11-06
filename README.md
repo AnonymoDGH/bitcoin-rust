@@ -47,6 +47,11 @@ Wallet RPCs: `getnewaddress`, `getbalance`, `getbalances`, `listunspent`, `sendt
 `validateaddress`. Flags: `-wallet=<file>`, `-disablewallet`, `-seednode`, `-addnode`, `-dnsseed`,
 `-externalip`, `-maxconnections`. Add `"seeds": ["host:port", ...]` to the chain spec for discovery.
 
+Mining: `generatetoaddress <n> <address>` for explicit blocks, or `-gen -genaddress=<address|script hex>`
+to mine in the background. `-gen` hashes until a block is found and immediately starts the next template;
+add `-blockinterval=<secs>` to throttle (old fixed-interval behaviour) and `-maxblocks=<n>` to stop after
+n blocks. On regtest that is roughly 90 blocks/s, so use `-maxblocks` when leaving it unattended.
+
 Pending: DoS scoring/banning, mempool ancestor limits + RBF + persistence, UTXO cache (coins db is fully
 in RAM), per-candidate best-chain index, header-only index on disk, compact blocks, BIP324, descriptors/PSBT.
 
@@ -64,10 +69,13 @@ cargo test --workspace
 ```
 crates/
   primitives/   block + transaction data model
-  consensus/    chain params, PoW, subsidies
+  consensus/    chain params, PoW, subsidies, custom genesis
   validation/   UTXO set, tx/block checks, mempool, policy
+  chain/        chainstate, reorgs, connect/disconnect, miner, validation
+  storage/      flat block/undo files, hash index, coins log
   network/      P2P framing, handshake, address manager
-  wallet/       addresses, coin selection
-  node/         argument parsing, config resolution
+  wallet/       addresses, coin selection, signing, encrypted wallet
+  rpc/          JSON-RPC HTTP server, dispatch, cookie auth
+  node/         daemon entry point: wires chain, storage, P2P, RPC, wallet
   script/       script interpreter (full dispatch, all Core script vectors pass)
 ```
