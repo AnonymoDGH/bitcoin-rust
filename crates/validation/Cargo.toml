@@ -1,0 +1,13 @@
+[package]
+name = "btc-validation"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+btc-primitives = { path = "../primitives" }
+btc-consensus = { path = "../consensus" }
+bitcoin = { workspace = true }
+bitcoin_hashes = { workspace = true }
+primitive-types = "0.13"
+serde = { workspace = true }
+thiserror = { workspace = true }
