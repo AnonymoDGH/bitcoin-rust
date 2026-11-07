@@ -131,10 +131,19 @@ protects the middle; the edges must be designed for too.
   `getpoolinfo` exposes anchor/height/note count. Mempool E2E tests
   cover append-accept and spend-accept+mine; the funding cap rejects
   inflated spends (unit tested).
+- **Miner inclusion (fees fixed).** The block assembler includes
+  mempool note spends and pays their real fee
+  (`note.value - outputs`) to the coinbase; pool-creating txs carry
+  no miner fee — the locked value transfers into the pool's ledger
+  (funding cap), it is not coinbase revenue. Without that
+  subtraction the note value would be minted twice (as fee and as
+  later spend). Covered by `miner_includes_mempool_note_spend_and_pays_its_fee`.
 - **Remaining limits (honest):** spent note values are transparent
   at spend (a SNARK/Orchard-style upgrade would hide them); CT miner
-  inclusion and on-chain CT mining remain TODO; onion inbound P2P is
-  not supported (outbound SOCKS5 only).
+  fee inclusion (CT fees are proven by balance proofs; currently
+  assembled fees treat CT txs at mempool-recorded fees) and on-chain
+  CT mining remain TODO; onion inbound P2P is not supported
+  (outbound SOCKS5 only).
 
 ### Phase 3 — shielded pool
 **Implemented now (pre-zk milestone):** `crates/chain/src/notes.rs` —
