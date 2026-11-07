@@ -574,7 +574,7 @@ impl Wallet {
         value: u64,
         fee: i64,
     ) -> Result<(Tx, NoteCoinInfo, OutPoint), WalletError> {
-        use btc_chain::notes::{encode_pool_note, note_commitment, Note};
+        use btc_chain::notes::{encode_pool_note_committed, note_commitment, Note};
         use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
         self.check_unlocked()?;
         if value == 0 {
@@ -624,7 +624,15 @@ impl Wallet {
             value,
             rcm,
         };
-        let pool_script = ScriptBuf::from_bytes(encode_pool_note(&note_commitment(&note)));
+        // Value commitment published with the note: C = value*G + rcm*H.
+        // The spend opening (value, rcm) re-checks it on chain.
+        let value_commitment =
+            btc_chain::confidential::commitment_point(value, rcm)
+                .map_err(|_| WalletError::Build("note value commitment failed".into()))?;
+        let pool_script = ScriptBuf::from_bytes(encode_pool_note_committed(
+            &note_commitment(&note),
+            &value_commitment,
+        ));
         let mut vout = vec![TxOut::new(0, pool_script)];
         let change_value = spent.value - required;
         if change_value >= 546 {
