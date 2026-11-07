@@ -191,7 +191,6 @@ pub fn verify_note_tx_block(
         let Some(pool_cmu) = pool_cmu else {
             continue; // plain input: script checks run elsewhere
         };
-        eprintln!("ct-note dbg: pool input {i} spending cmu from script");
         let note_bytes = input.witness.iter().next().map(|b| b.to_vec());
         let Some(note_bytes) = note_bytes else {
             return Err(NoteError::Invalid);
