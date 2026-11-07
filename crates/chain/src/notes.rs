@@ -95,14 +95,15 @@ pub fn encode_pool_note_committed(cmu: &[u8; 32], commitment: &[u8; 33]) -> Vec<
     script
 }
 
-/// True if `script` is a pool note output script (legacy 35-byte or
-/// value-committed 68-byte form).
+/// True if `script` is a pool note output script (legacy 35-byte,
+/// value-committed 68-byte or Poseidon 100-byte form).
 pub fn is_pool_script(script: &[u8]) -> bool {
     script.len() >= 3
         && script[0] == 0x6a
         && script[1] == 0x4c
         && ((script[2] == 32 && script.len() == 35)
-            || (script[2] == 65 && script.len() == 68))
+            || (script[2] == 65 && script.len() == 68)
+            || (script[2] == 97 && script.len() == 100))
 }
 
 /// Extracts the commitment from a pool note output script.
@@ -116,12 +117,47 @@ pub fn decode_pool_note(script: &[u8]) -> Option<[u8; 32]> {
 /// Extracts `(cmu, value_commitment)` — `None` commitment on legacy
 /// 35-byte scripts.
 pub fn decode_pool_note_full(script: &[u8]) -> Option<([u8; 32], Option<[u8; 33]>)> {
-    let cmu = decode_pool_note(script)?;
-    if script.len() == 68 {
-        Some((cmu, Some(script[35..68].try_into().ok()?)))
-    } else {
-        Some((cmu, None))
+    let (cmu, pedersen, _) = decode_pool_script_full(script)?;
+    Some((cmu, pedersen))
+}
+
+/// Full pool script contents: `(cmu, Pedersen commitment, Poseidon
+/// preimage hash)`. Script shapes:
+/// * 35B legacy: `OP_RETURN PUSHDATA1(32) <cmu>`
+/// * 68B committed: `OP_RETURN PUSHDATA1(65) <cmu || C>`
+/// * 100B Poseidon: `OP_RETURN PUSHDATA1(97)`
+///   `<cmu || poseidon(32 canonical) || C(33)>`
+pub fn decode_pool_script_full(
+    script: &[u8],
+) -> Option<([u8; 32], Option<[u8; 33]>, Option<[u8; 32]>)> {
+    if !is_pool_script(script) {
+        return None;
     }
+    let cmu: [u8; 32] = script[3..35].try_into().ok()?;
+    match script.len() {
+        35 => Some((cmu, None, None)),
+        68 => Some((cmu, Some(script[35..68].try_into().ok()?), None)),
+        100 => Some((
+            cmu,
+            Some(script[67..100].try_into().ok()?),
+            Some(script[35..67].try_into().ok()?),
+        )),
+        _ => None,
+    }
+}
+
+/// Pool output script (Poseidon): `OP_RETURN PUSHDATA1(97)` with
+/// `cmu || poseidon_cmu || Pedersen C`.
+pub fn encode_pool_note_v3(
+    cmu: &[u8; 32],
+    poseidon: &[u8; 32],
+    pedersen: &[u8; 33],
+) -> Vec<u8> {
+    let mut script = vec![0x6a, 0x4c, 97];
+    script.extend_from_slice(cmu);
+    script.extend_from_slice(poseidon);
+    script.extend_from_slice(pedersen);
+    script
 }
 
 /// Funding caps for the pool outputs created by one transaction:
@@ -325,6 +361,8 @@ pub fn verify_note_tx_block_with_caps(
         else {
             continue; // plain input: script checks run elsewhere
         };
+        let script_poseidon = decode_pool_script_full(spent_out.script_pubkey.as_bytes())
+            .and_then(|(_, _, poseidon)| poseidon);
         let note_bytes = input.witness.iter().next().map(|b| b.to_vec());
         let Some(note_bytes) = note_bytes else {
             return Err(NoteError::Invalid);
@@ -408,6 +446,14 @@ pub fn verify_note_tx_block_with_caps(
                     fee: fee_u64,
                     cap,
                     cmu: crate::value_snark::cmu_field(&pool_cmu),
+                    poseidon: match &script_poseidon {
+                        Some(bytes) => crate::value_snark::bytes_to_field(bytes),
+                        None => crate::value_snark::poseidon_cmu(
+                            &note.spending_pub,
+                            note.value,
+                            &note.rcm,
+                        ),
+                    },
                     c_old: crate::value_snark::value_commitment(note.value, &note.rcm, &pool_cmu),
                     c_new: [c_new0, c_new1],
                 };
@@ -823,6 +869,7 @@ mod tests {
         let witness = crate::value_snark::ValueWitness {
             v_old: n.value,
             rcm_old: n.rcm,
+            spending_pub: n.spending_pub,
             v_new: [outputs_total, 0],
             rcm_new: [dummy, dummy],
         };
@@ -854,6 +901,31 @@ mod tests {
         )
         .is_err());
         let _ = fee;
+    }
+
+    #[test]
+    fn poseidon_script_v3_roundtrips() {
+        let n = note(5);
+        let cmu = note_commitment(&n);
+        let poseidon = crate::value_snark::field_to_bytes(&crate::value_snark::poseidon_cmu(
+            &n.spending_pub,
+            n.value,
+            &n.rcm,
+        ));
+        let pedersen = crate::confidential::commitment_point(n.value, n.rcm).unwrap();
+        let script = encode_pool_note_v3(&cmu, &poseidon, &pedersen);
+        assert_eq!(script.len(), 100);
+        assert!(is_pool_script(&script));
+        assert_eq!(decode_pool_note(&script), Some(cmu));
+        assert_eq!(
+            decode_pool_script_full(&script),
+            Some((cmu, Some(pedersen), Some(poseidon)))
+        );
+        // Legacy shapes still decode.
+        assert_eq!(
+            decode_pool_script_full(&encode_pool_note(&cmu)),
+            Some((cmu, None, None))
+        );
     }
 
     #[test]
@@ -894,7 +966,8 @@ mod tests {
         let transcript = crate::value_snark::ValueTranscript {
             fee,
             cap: n.value,
-            cmu: ark_ff::PrimeField::from_be_bytes_mod_order(&cmu),
+            cmu: crate::value_snark::cmu_field(&cmu),
+            poseidon: crate::value_snark::poseidon_cmu(&n.spending_pub, n.value, &n.rcm),
             c_old: crate::value_snark::value_commitment(n.value, &n.rcm, &cmu),
             c_new: [
                 crate::value_snark::new_commitment(new_value, &new_note.rcm),
@@ -904,6 +977,7 @@ mod tests {
         let witness = crate::value_snark::ValueWitness {
             v_old: n.value,
             rcm_old: n.rcm,
+            spending_pub: n.spending_pub,
             v_new: [new_value, 0],
             rcm_new: [new_note.rcm, dummy],
         };
