@@ -1,0 +1,21 @@
+{
+  "name": "hardcoin",
+  "magic": "5f4c7ea1",
+  "default_port": 18555,
+  "rpc_port": 18556,
+  "genesis_timestamp": "btc-rust hardcoin genesis",
+  "genesis_output_script": "6a",
+  "genesis_time": 1767225600,
+  "genesis_bits": "1e00ffff",
+  "genesis_reward": 5000000000,
+  "halving_interval": 210000,
+  "target_spacing": 600,
+  "target_timespan": 1209600,
+  "pow_limit": "000000ffff000000000000000000000000000000000000000000000000000000",
+  "allow_min_difficulty_blocks": false,
+  "no_retargeting": false,
+  "bech32_hrp": "hc",
+  "pubkey_address_prefix": 65,
+  "script_address_prefix": 10,
+  "seeds": []
+}
