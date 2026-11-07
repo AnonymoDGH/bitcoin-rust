@@ -99,10 +99,15 @@ protects the middle; the edges must be designed for too.
   in `crates/chain/src/confidential.rs`.
   Bootstrap note: CT transactions must be all-CT (all inputs and
   outputs confidential) — mixing plaintext inputs/outputs is rejected
-  by the value ledger (`InputsBelowOutputs`, 0 vs >0). Wallet coin
-  bookkeeping must retain CT blindings to spend them; that is the
-  wallet-spend phase. First CT liquidity therefore enters via chain
-  construction in tests, not via the wallet yet.
+  by the value ledger (`InputsBelowOutputs`, 0 vs >0). Hybrid shield
+  spends are the supported entry point: the wallet's `shieldtoct` RPC
+  spends a mature P2PKH coin, carrying the input blinding + balance
+  proof in a shield marker (`OP_RETURN 0x51 | r_in | balance`, 106-byte
+  payload; the CT context zeroes its balance bytes, breaking the
+  fixed-point), and runs script checks only for plaintext inputs.
+  Wallet CT spends (`create_ct_spend`) are authorised by 16-key ring
+  signatures over the on-chain keys. First CT liquidity therefore
+  enters via the wallet shield itself.
 - **Ring signatures** (Monero-style, fixed ring size 16): 1-out-of-16
   Schnorr ring (`crates/chain/src/ringsig.rs`), tested. Spending
   authorisation through rings is enforced by chain validation as
