@@ -45,6 +45,18 @@ pub(crate) fn call(backend: &dyn RpcBackend, method: &str, args: &Args) -> RpcRe
             Ok(Value::Null)
         }
         "getnewstealthaddress" => Ok(json!(wallet.get_stealth_address().map_err(wallet_error)?)),
+        "sendtostealthaddress" => {
+            let address = args.str_req(0, "stealth_address")?;
+            let sats = args.amount_req(1, "amount")?;
+            if sats <= 0 {
+                return Err(RpcError::new(RPC_TYPE_ERROR, "Invalid amount for send"));
+            }
+            let fee_rate = args.scaled(2, 3)?;
+            let txid = wallet
+                .send_to_stealth(address.to_owned(), sats, fee_rate)
+                .map_err(wallet_error)?;
+            Ok(json!(txid.to_string()))
+        }
         "liststealthutxos" => {
             let minconf = args.u32(0)?.unwrap_or(0);
             let max_blocks = args.u32(1)?.unwrap_or(2000);
