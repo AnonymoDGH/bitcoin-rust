@@ -511,6 +511,94 @@ mod tests {
     }
 
     #[test]
+    fn miner_includes_mempool_note_spend_and_pays_its_fee() {
+        use crate::mempool_accept::accept_to_mempool;
+        use crate::notes::{
+            authorize_spend, encode_note, encode_path, encode_pool_note, encode_spend_auth,
+            note_commitment, Note, NoteTree,
+        };
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        use bitcoin::Witness;
+
+        let mut cs = new_chain();
+        let hashes = mine_blocks(&mut cs, &Mempool::new(100), 101);
+        let secp = Secp256k1::new();
+        let mut secret = [0u8; 32];
+        secret[0] = 42;
+        secret[31] = 3;
+        let note = Note {
+            spending_pub: PublicKey::from_secret_key(
+                &secp,
+                &SecretKey::from_slice(&secret).unwrap(),
+            )
+            .serialize(),
+            value: 25_00000000,
+            rcm: [9u8; 32],
+        };
+        let cmu = note_commitment(&note);
+
+        // Block 102: append the note (entry fee 0 — pool creation is
+        // not miner revenue; the locked value moves into the pool).
+        let append = Tx::new(
+            1,
+            vec![TxIn::new(coinbase_outpoint(&cs, &hashes[0]))],
+            vec![
+                TxOut::new(subsidy(1) - note.value as i64 - 1_000, op_true()),
+                TxOut::new(0, ScriptBuf::from_bytes(encode_pool_note(&cmu))),
+            ],
+            0,
+        );
+        let append_id = append.txid();
+        let mut pool = Mempool::new(100);
+        pool.add(pool_entry(append, 0)).unwrap();
+        let mut template = create_new_block(&cs, &pool, op_true(), NOW);
+        assert_eq!(template.block.txdata.len(), 2);
+        assert_eq!(template.block.txdata[1].txid(), append_id);
+        assert_eq!(template.block.txdata[0].vout[0].value, subsidy(102));
+        assert!(mine_block(&mut template.block, 1 << 32));
+        assert_eq!(cs.process_new_block(&template.block, NOW), Ok(true));
+        assert_eq!(cs.pool_len(), 1);
+        let anchor = cs.pool_root();
+
+        // Note spend enters via the real mempool path (real fee).
+        let mut tree = NoteTree::new();
+        tree.insert(cmu);
+        assert_eq!(tree.root(), anchor);
+        let path = tree.path(0);
+        let mut tx = Tx::new(
+            2,
+            vec![TxIn::new(OutPoint { txid: append_id, vout: 1 })],
+            vec![TxOut::new(
+                24_99000000 / 1000,
+                ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([0x42; 20])),
+            )],
+            0,
+        );
+        let context = crate::confidential::ct_context(&tx);
+        let sig = authorize_spend(&note, &secret, &anchor, &context).unwrap();
+        tx.vin[0].witness = Witness::from_slice(&[
+            encode_note(&note),
+            encode_spend_auth(&anchor, 0, &sig),
+            encode_path(&path),
+        ]);
+        let spend_id = tx.txid();
+        let mut pool = Mempool::new(100);
+        accept_to_mempool(&cs, &mut pool, tx).expect("note spend accepted");
+        let note_fee: i64 = note.value as i64 - 24_99000000 / 1000;
+        assert_eq!(pool.get(&spend_id).unwrap().fee, note_fee);
+
+        // Miner includes it and pays the fee to the coinbase.
+        let mut template = create_new_block(&cs, &pool, op_true(), NOW);
+        assert_eq!(template.height, 103);
+        assert_eq!(template.block.txdata.len(), 2);
+        assert_eq!(template.block.txdata[1].txid(), spend_id);
+        assert_eq!(template.block.txdata[0].vout[0].value, subsidy(103) + note_fee);
+        assert!(mine_block(&mut template.block, 1 << 32));
+        assert_eq!(cs.process_new_block(&template.block, NOW), Ok(true));
+        assert_eq!(cs.height(), 103);
+    }
+
+    #[test]
     fn skips_missing_inputs_and_non_final_txs_and_respects_weight() {
         let mut cs = new_chain();
         let pool_empty = Mempool::new(100);
