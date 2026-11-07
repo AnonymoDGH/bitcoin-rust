@@ -324,6 +324,33 @@ pub fn verify_note_tx_block_with_caps(
         // the caller through the chainstate pool registry.
         verify_spend(&anchors, &std::collections::HashSet::new(), &note, &anchor, index, &path, &context, &signature)?;
         total_value += note.value as i64;
+        // Optional Groth16 value-hiding proof (witness[3]). Bound to
+        // this note's opening (`C_old` from `(value, rcm)`) and to the
+        // funding cap; outputs stay transparent in this integration
+        // mode, so the proof re-proves conservation + cap on chain.
+        // Present-but-invalid proofs are rejected (never ignored).
+        if let Some(proof_bytes) = input.witness.iter().nth(3) {
+            if tx.vin.len() != 1 {
+                return Err(NoteError::Invalid);
+            }
+            let proof =
+                crate::value_snark::deserialize_proof(proof_bytes).ok_or(NoteError::Invalid)?;
+            let cap = match funding_caps {
+                Some(caps) => *caps.get(&pool_cmu).ok_or(NoteError::Invalid)?,
+                None => note.value,
+            };
+            let value_out: i64 = tx.vout.iter().map(|o| o.value).sum();
+            let fee_u64 = (note.value as i64 - value_out).max(0) as u64;
+            let transcript = crate::value_snark::transcript_for_spend(
+                &note,
+                value_out.max(0) as u64,
+                fee_u64,
+                cap,
+            );
+            if !crate::value_snark::verify(transcript, &proof) {
+                return Err(NoteError::Invalid);
+            }
+        }
     }
     let value_out: i64 = tx.vout.iter().map(|o| o.value).sum();
     let fee = total_value - value_out;
@@ -666,5 +693,84 @@ mod tests {
             Some(&cap_map),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn snark_proof_spend_verifies_and_tamper_rejected() {
+        use std::collections::HashMap;
+        use btc_primitives::{ScriptBuf, TxIn, TxOut};
+        use bitcoin::Witness;
+
+        let n = note(5);
+        let cmu = note_commitment(&n);
+        let mut tree = NoteTree::new();
+        tree.insert(cmu);
+        let anchor = tree.root();
+        let path = tree.path(0);
+        let spent_out = TxOut::new(0, ScriptBuf::from_bytes(encode_pool_note(&cmu)));
+        let outputs_total: u64 = 1_000_000;
+        let fee: u64 = n.value - outputs_total;
+        let mut secret = [0u8; 32];
+        secret[0] = 5;
+        secret[31] = 9;
+        let mut tx = btc_primitives::Tx::new(
+            2,
+            vec![TxIn::new(bitcoin::OutPoint::null())],
+            vec![TxOut::new(outputs_total as i64, ScriptBuf::new())],
+            0,
+        );
+        let context = crate::confidential::ct_context(&tx);
+        let sig = authorize_spend(&n, &secret, &anchor, &context).unwrap();
+        tx.vin[0].witness = Witness::from_slice(&[
+            encode_note(&n),
+            encode_spend_auth(&anchor, 0, &sig),
+            encode_path(&path),
+        ]);
+        // Legacy spend (no proof) verifies.
+        assert!(verify_note_tx_block_with_caps(
+            &tx,
+            std::slice::from_ref(&spent_out),
+            Some(anchor),
+            None,
+        )
+        .is_ok());
+        // SNARK spend verifies.
+        let transcript =
+            crate::value_snark::transcript_for_spend(&n, outputs_total, fee, n.value);
+        let dummy = [0u8; 32];
+        let witness = crate::value_snark::ValueWitness {
+            v_old: n.value,
+            rcm_old: n.rcm,
+            v_new: [outputs_total, 0],
+            rcm_new: [dummy, dummy],
+        };
+        let proof = crate::value_snark::prove(transcript, witness).expect("proves");
+        let mut proof_tx = tx.clone();
+        proof_tx.vin[0].witness = Witness::from_slice(&[
+            encode_note(&n),
+            encode_spend_auth(&anchor, 0, &sig),
+            encode_path(&path),
+            crate::value_snark::serialize_proof(&proof),
+        ]);
+        let mut caps = HashMap::new();
+        caps.insert(cmu, n.value);
+        assert!(verify_note_tx_block_with_caps(
+            &proof_tx,
+            std::slice::from_ref(&spent_out),
+            Some(anchor),
+            Some(&caps),
+        )
+        .is_ok());
+        // Proof bound to a different cap also fails (cap is public input).
+        let mut bad_caps = HashMap::new();
+        bad_caps.insert(cmu, n.value + 1);
+        assert!(verify_note_tx_block_with_caps(
+            &proof_tx,
+            std::slice::from_ref(&spent_out),
+            Some(anchor),
+            Some(&bad_caps),
+        )
+        .is_err());
+        let _ = fee;
     }
 }
