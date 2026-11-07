@@ -409,7 +409,11 @@ pub fn verify_ct_transaction(
     context: &[u8],
 ) -> Result<(), CtError> {
     for commitment in inputs.iter().chain(outputs) {
-        verify_range(&commitment.commitment, &commitment.proof)?;
+        // Plaintext-derived commitments (empty proof) skip the range check;
+        // the ledger has already MoneyRange-checked the value.
+        if !commitment.proof.bit_commitments.is_empty() {
+            verify_range(&commitment.commitment, &commitment.proof)?;
+        }
     }
     let secp = Secp256k1::new();
     // sum_in(C) - sum_out(C) - fee*G must equal the balance proof's point.
@@ -557,15 +561,48 @@ fn deserialize_range_proof(data: &[u8]) -> Option<RangeProof> {
 }
 
 /// Sighash-like context for CT proofs of one transaction: SHA256D of the
-/// wire encoding with witnesses stripped (serialisation is deterministic).
+/// wire encoding with witnesses *and* scriptSigs stripped and
+/// shield-marker balance bytes zeroed. Stripping the scriptSig breaks
+/// the fixed-point problem: the ECDSA signature signs the marker
+/// content, and the proof is computed over the same deterministic
+/// digest either way.
 pub fn ct_context(tx: &btc_primitives::Tx) -> [u8; 32] {
     let mut stripped = tx.clone();
     for input in &mut stripped.vin {
         input.witness = bitcoin::Witness::new();
+        input.script_sig = btc_primitives::ScriptBuf::new();
+    }
+    for output in &mut stripped.vout {
+        output.script_pubkey = zero_shield_balance(&output.script_pubkey);
     }
     let bytes = bitcoin::consensus::encode::serialize(&stripped);
     let hash = bitcoin_hashes::sha256d::Hash::hash(&bytes);
     hash.to_byte_array()
+}
+
+/// Returns the script with shield-marker balance bytes zeroed, or the
+/// original script when it is not a shield marker.
+pub fn zero_shield_balance(script: &btc_primitives::ScriptBuf) -> btc_primitives::ScriptBuf {
+    let bytes = script.as_bytes();
+    if is_shield_marker(script) {
+        let mut zeroed = bytes.to_vec();
+        // Payload starts at byte 4: [0x51][r_in: 5..37][balance: 37..110].
+        for byte in &mut zeroed[37..110] {
+            *byte = 0;
+        }
+        return btc_primitives::ScriptBuf::from_bytes(zeroed);
+    }
+    script.clone()
+}
+
+/// True for shield markers: `OP_RETURN <106-byte payload starting 0x51>`.
+pub fn is_shield_marker(script: &btc_primitives::ScriptBuf) -> bool {
+    let bytes = script.as_bytes();
+    bytes.len() == 4 + 106
+        && bytes[0] == 0x6a
+        && bytes[1] == 0x4d
+        && u16::from_le_bytes(bytes[2..4].try_into().unwrap()) == 106
+        && bytes[4] == 0x51
 }
 
 /// Balance proof with the public fee prefixed: `fee(8 LE) || r_pub(33) || z(32)`.
@@ -624,81 +661,148 @@ pub fn deserialize_ring_sig(data: &[u8]) -> Option<crate::ringsig::RingSignature
     Some(crate::ringsig::RingSignature { responses })
 }
 
-/// Full chain-level CT verification for one transaction:
-/// - every output/input is a CT output (all-CT rule, enforced by the
-///   value ledger: CT entries carry value 0, so mixed txs cannot balance),
-/// - range proofs for inputs and outputs verify,
-/// - every input carries a valid ring signature whose ring contains the
-///   pubkey hashing to the embedded pubkey_hash,
-/// - the balance proof ties inputs to outputs with fee 0.
+/// Parses shield markers: `OP_RETURN <0x51 | r_in(32) | balance_proof(73)>`.
+/// Each marker carries one plaintext input's blinding plus — on the
+/// first marker — the balance proof. Distinct from the stealth marker
+/// (33-byte pubkey) by the leading `0x51` and the 106-byte payload.
+pub fn shield_markers(tx: &btc_primitives::Tx) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut markers = Vec::new();
+    for output in &tx.vout {
+        let bytes = output.script_pubkey.as_bytes();
+        // OP_RETURN, PUSHDATA2 len=106, payload 106 bytes
+        if bytes.len() == 4 + 106
+            && bytes[0] == 0x6a
+            && bytes[1] == 0x4d
+            && u16::from_le_bytes(bytes[2..4].try_into().unwrap()) == 106
+            && bytes[4] == 0x51
+        {
+            let payload = &bytes[4..];
+            let r_in = payload[1..33].to_vec();
+            let balance = payload[33..106].to_vec();
+            if balance.len() == 73 {
+                markers.push((r_in, balance));
+            }
+        }
+    }
+    markers
+}
+
+/// Push-encoding for a shield marker payload.
+pub fn encode_shield_marker(r_in: &[u8; 32], balance_proof_bytes: &[u8]) -> Vec<u8> {
+    let mut payload = vec![0x51u8];
+    payload.extend_from_slice(r_in);
+    payload.extend_from_slice(balance_proof_bytes);
+    let mut script = vec![0x6a, 0x4d];
+    script.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    script.extend_from_slice(&payload);
+    script
+}
+
+/// Full chain-level CT verification for one transaction.
+///
+/// Rules:
+/// - every output is CT, or a plaintext output only when the transaction
+///   also spends a plaintext input (hybrid shielding spend),
+/// - range proofs for CT inputs and outputs verify,
+/// - CT inputs are authorised by a valid ring signature whose ring
+///   contains the pubkey hashing to the embedded pubkey_hash,
+/// - plaintext inputs are authorised by ordinary script execution
+///   (scriptSig) and carry their blinding in `witness[0]` so the
+///   verifier rebuilds `v*G + r*H` for them,
+/// - the balance proof ties the CT half with fee prefix 0 (miners are
+///   paid from the plaintext half, which the value ledger accounts).
 pub fn verify_ct_tx_block(
     tx: &btc_primitives::Tx,
-    spent_scripts: &[btc_primitives::ScriptBuf],
+    spent_outs: &[btc_primitives::TxOut],
+    script_check: &dyn Fn(
+        &btc_primitives::Tx,
+        &[btc_primitives::TxOut],
+        &[usize],
+    ) -> Result<(), crate::ValidationError>,
 ) -> Result<(), CtError> {
-    if spent_scripts.len() != tx.vin.len() {
+    if spent_outs.len() != tx.vin.len() {
         return Err(CtError::BalanceProof);
     }
-    let mut inputs = Vec::with_capacity(spent_scripts.len());
-    let mut input_keys = Vec::with_capacity(spent_scripts.len());
-    for script in spent_scripts {
-        let data = decode_ct_script(script.as_bytes()).ok_or(CtError::BalanceProof)?;
-        input_keys.push(data.pubkey_hash);
-        inputs.push(AmountCommitment {
-            commitment: data.commitment,
-            proof: data.proof,
-        });
+    let mut ct_inputs: Vec<AmountCommitment> = Vec::new();
+    let mut input_key_hashes: Vec<Option<[u8; 20]>> = Vec::with_capacity(spent_outs.len());
+    let mut plain_indices: Vec<usize> = Vec::new();
+    let mut plain_commitments: Vec<([u8; 33],)> = Vec::new();
+    let shield = shield_markers(tx);
+    for (i, (vin, spent_out)) in tx.vin.iter().zip(spent_outs).enumerate() {
+        if let Some(data) = decode_ct_script(spent_out.script_pubkey.as_bytes()) {
+            input_key_hashes.push(Some(data.pubkey_hash));
+            ct_inputs.push(AmountCommitment {
+                commitment: data.commitment,
+                proof: data.proof,
+            });
+        } else {
+            input_key_hashes.push(None);
+            plain_indices.push(i);
+            let plain_ordinal = plain_indices.len() - 1;
+            let blinding: [u8; 32] = shield
+                .get(plain_ordinal)
+                .and_then(|(r_in, _)| r_in.as_slice().try_into().ok())
+                .ok_or(CtError::BalanceProof)?;
+            let commitment = commitment_point(spent_out.value as u64, blinding)?;
+            plain_commitments.push((commitment, ));
+        }
     }
-    let mut outputs = Vec::with_capacity(tx.vout.len());
+    let mut outputs: Vec<AmountCommitment> = Vec::with_capacity(tx.vout.len());
     for output in &tx.vout {
+        let Some(data) = decode_ct_script(output.script_pubkey.as_bytes()) else {
+            continue; // plaintext output: handled by the value ledger
+        };
         if output.value != 0 {
             return Err(CtError::BalanceProof);
         }
-        let data = decode_ct_script(output.script_pubkey.as_bytes()).ok_or(CtError::BalanceProof)?;
         outputs.push(AmountCommitment {
             commitment: data.commitment,
             proof: data.proof,
         });
     }
-    if inputs.is_empty() || outputs.is_empty() {
+    if ct_inputs.is_empty() && plain_commitments.is_empty() {
         return Err(CtError::BalanceProof);
+    }
+    let mut all_inputs: Vec<AmountCommitment> = ct_inputs;
+    for (commitment,) in plain_commitments {
+        all_inputs.push(AmountCommitment {
+            commitment,
+            proof: RangeProof {
+                bit_commitments: Vec::new(),
+                bit_proofs: Vec::new(),
+            },
+        });
     }
 
     let context = ct_context(tx);
-    // Ring signature per input; balance proof lives in the first input.
+    // Ring signature per CT input.
     for (i, input) in tx.vin.iter().enumerate() {
-        let stack: Vec<&[u8]> = input.witness.iter().collect();
-        let ring_keys: Vec<[u8; 33]> = if i == 0 {
-            stack
-                .get(2)
-                .and_then(|data| {
-                    data.chunks_exact(33)
-                        .map(|chunk| chunk.try_into().ok())
-                        .collect::<Option<Vec<[u8; 33]>>>()
-                })
-                .unwrap_or_default()
-        } else {
-            stack
-                .get(1)
-                .and_then(|data| {
-                    data.chunks_exact(33)
-                        .map(|chunk| chunk.try_into().ok())
-                        .collect::<Option<Vec<[u8; 33]>>>()
-                })
-                .unwrap_or_default()
+        let Some(hash) = input_key_hashes[i] else {
+            continue;
         };
+        let stack: Vec<&[u8]> = input.witness.iter().collect();
+        // input 0: [balance, ring_sig, ring_keys]; others: [ring_sig, ring_keys]
+        let (sig_pos, keys_pos) = if i == 0 { (1, 2) } else { (0, 1) };
+        let ring_keys: Vec<[u8; 33]> = stack
+            .get(keys_pos)
+            .and_then(|data| {
+                data.chunks_exact(33)
+                    .map(|chunk| chunk.try_into().ok())
+                    .collect::<Option<Vec<[u8; 33]>>>()
+            })
+            .unwrap_or_default();
         if ring_keys.len() != crate::ringsig::RING_SIZE {
             return Err(CtError::BalanceProof);
         }
-        let sig_bytes = if i == 0 { stack.get(1) } else { stack.first() };
-        let Some(sig_bytes) = sig_bytes else {
+        let Some(sig_bytes) = stack.get(sig_pos) else {
             return Err(CtError::BalanceProof);
         };
         let sig = deserialize_ring_sig(sig_bytes).ok_or(CtError::BalanceProof)?;
         let matches: Vec<_> = ring_keys
             .iter()
             .filter(|key| {
-                let hash = bitcoin_hashes::hash160::Hash::hash(*key);
-                &hash.to_byte_array()[..20] == input_keys[i].as_slice()
+                let hash160 = bitcoin_hashes::hash160::Hash::hash(*key);
+                &hash160.to_byte_array()[..20] == hash.as_slice()
             })
             .collect();
         if matches.len() != 1 {
@@ -708,13 +812,33 @@ pub fn verify_ct_tx_block(
             .map_err(|_| CtError::BalanceProof)?;
     }
 
-    let balance_bytes = tx.vin[0]
-        .witness
-        .iter()
-        .next()
-        .ok_or(CtError::BalanceProof)?;
+    // Plaintext inputs: ordinary script execution (scriptSig).
+    if !plain_indices.is_empty() {
+        script_check(tx, spent_outs, &plain_indices)
+            .map_err(|_| CtError::BalanceProof)?;
+    }
+
+    // Balance proof: shield marker first (hybrid spends), witness input 0
+    // as fallback (all-CT spends).
+    let balance_bytes_owned: Vec<u8>;
+    let balance_bytes: &[u8] = if !shield.is_empty() {
+        &shield[0].1
+    } else {
+        balance_bytes_owned = tx.vin[0]
+            .witness
+            .iter()
+            .next()
+            .ok_or(CtError::BalanceProof)?
+            .to_vec();
+        &balance_bytes_owned
+    };
     let balance = deserialize_balance_proof(balance_bytes).ok_or(CtError::BalanceProof)?;
-    verify_ct_transaction(&inputs, &outputs, proof_fee(balance_bytes), &balance, &context)
+    let fee = proof_fee(balance_bytes);
+    {
+        let left = scalar_mul(h_generator(), &balance.z);
+        eprintln!("ct dbg: fee={fee} left={left:?}");
+    }
+    verify_ct_transaction(&all_inputs, &outputs, fee, &balance, &context)
 }
 
 #[cfg(test)]
@@ -790,8 +914,12 @@ mod tests {
         assert!(decode_ct_script(in_script.as_bytes()).is_some());
         assert!(decode_ct_script(out_script.as_bytes()).is_some());
         // Stage 2: full verification.
-        let result = verify_ct_tx_block(&tx, &[in_script]);
-        eprintln!("verify_ct_tx_block: {result:?}");
+        let spent = [btc_primitives::TxOut::new(0, in_script.clone())];
+        let result = verify_ct_tx_block(
+            &tx,
+            &spent,
+            &|_tx, _spent, _indices| Ok(()),
+        );
         assert!(result.is_ok());
     }
 
