@@ -51,6 +51,10 @@ const METHODS: &[Method] = &[
         params: &[],
     },
     Method {
+        name: "getpoolinfo",
+        params: &[],
+    },
+    Method {
         name: "getrawmempool",
         params: &[("verbose", false)],
     },
@@ -287,6 +291,15 @@ pub(crate) fn call(backend: &dyn RpcBackend, method: &str, args: &Args) -> RpcRe
                 "difficulty": info.difficulty,
                 "mediantime": info.mediantime,
                 "chainwork": info.chainwork,
+            }))
+        }
+        "getpoolinfo" => {
+            let anchor = backend.pool_anchor();
+            Ok(json!({
+                "anchor": anchor.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "notes": backend.pool_len(),
+                "height": backend.get_block_count(),
+                "bestblockhash": backend.get_best_block_hash().to_string(),
             }))
         }
         "getrawmempool" => {
