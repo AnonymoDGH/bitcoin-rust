@@ -388,11 +388,11 @@ impl Default for CustomChainSpec {
         // difficulty can only ever get harder than this, never easier.
         let genesis_bits = 0x1e00_ffff;
         Self {
-            name: "customnet".to_string(),
+            name: "AnonCoin".to_string(),
             magic: [0x5f, 0x4c, 0x7e, 0xa1],
             default_port: 18555,
             rpc_port: 18556,
-            genesis_timestamp: "btc-rust custom chain genesis".to_string(),
+            genesis_timestamp: "AnonCoin genesis".to_string(),
             // Provably unspendable placeholder.
             genesis_output_script: ScriptBuf::from_bytes(vec![OP_RETURN]),
             // 2026-01-01T00:00:00Z.
@@ -405,7 +405,7 @@ impl Default for CustomChainSpec {
             pow_limit: decode_compact(genesis_bits).expect("hard-coded bits are valid"),
             allow_min_difficulty_blocks: false,
             no_retargeting: false,
-            bech32_hrp: "cx".to_string(),
+            bech32_hrp: "an".to_string(),
             pubkey_address_prefix: 65,
             script_address_prefix: 10,
             seeds: Vec::new(),
