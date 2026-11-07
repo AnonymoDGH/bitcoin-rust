@@ -68,6 +68,26 @@ pub fn nullifier(note: &Note) -> [u8; 32] {
     sha256::Hash::hash(&buf).to_byte_array()
 }
 
+/// Pool output script: `OP_RETURN 0x02 <cmu:32>`. A leaf in the pool tree.
+pub fn encode_pool_note(cmu: &[u8; 32]) -> Vec<u8> {
+    let mut script = vec![0x6a, 0x02];
+    script.extend_from_slice(cmu);
+    script
+}
+
+/// True if `script` is a pool note output script.
+pub fn is_pool_script(script: &[u8]) -> bool {
+    script.len() == 34 && script[0] == 0x6a && script[1] == 0x02
+}
+
+/// Extracts the commitment from a pool note output script.
+pub fn decode_pool_note(script: &[u8]) -> Option<[u8; 32]> {
+    if !is_pool_script(script) {
+        return None;
+    }
+    script[2..34].try_into().ok()
+}
+
 /// Spend authorisation: Schnorr signature (RFC6979 via secp256k1 ECDSA)
 /// over the note context with the spending secret. Returns the 64-byte
 /// signature.
