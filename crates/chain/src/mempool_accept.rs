@@ -148,9 +148,20 @@ pub fn accept_to_mempool(chainstate: &Chainstate, mempool: &mut Mempool, tx: Tx)
                 None => return Err(MempoolReject::MissingInputs),
             }
         }
-        let fee = check_tx_inputs(&tx, &view, next_height)
-            .map_err(|e| MempoolReject::Consensus(e.reject_reason().into()))?;
-        (spent, fee)
+        // Note spends replace the ledger with note values: they cannot run
+        // check_tx_inputs (pool scripts carry 0 in the UTXO value).
+        let has_note = spent
+            .iter()
+            .any(|coin| crate::notes::is_pool_script(coin.txout.script_pubkey.as_bytes()));
+        if has_note {
+            // Note value accounting happens in verify_note_tx_block.
+            // Return a placeholder fee the policy gate below ignores.
+            (spent, 0)
+        } else {
+            let fee = check_tx_inputs(&tx, &view, next_height)
+                .map_err(|e| MempoolReject::Consensus(e.reject_reason().into()))?;
+            (spent, fee)
+        }
     };
 
     if !sequence_locks_met(chainstate, &tx, &spent, next_height) {
@@ -158,6 +169,17 @@ pub fn accept_to_mempool(chainstate: &Chainstate, mempool: &mut Mempool, tx: Tx)
     }
 
     let spent_outs: Vec<TxOut> = spent.into_iter().map(|coin| coin.txout).collect();
+    let has_note_input = spent_outs
+        .iter()
+        .any(|o| crate::notes::is_pool_script(o.script_pubkey.as_bytes()));
+    if has_note_input {
+        // Note spends are authorised by pool verification; the spent
+        // record's tip anchor must be fresh (checked against the root map).
+        let root = chainstate.pool_root();
+        if crate::notes::verify_note_tx_block(&tx, &spent_outs, Some(root)).is_err() {
+            return Err(MempoolReject::Consensus("bad-note-tx".into()));
+        }
+    }
     let is_ct = chainstate.params.ct_enabled
         && (tx.vout.iter().any(|o| crate::confidential::is_ct_script(o.script_pubkey.as_bytes()))
             || spent_outs.iter().any(|o| crate::confidential::is_ct_script(o.script_pubkey.as_bytes())));
@@ -174,7 +196,10 @@ pub fn accept_to_mempool(chainstate: &Chainstate, mempool: &mut Mempool, tx: Tx)
         return Err(MempoolReject::Policy("bad-txns-too-many-sigops".into()));
     }
     let vsize = virtual_size(get_transaction_weight(&tx), sigop_cost);
-    if fee < fee_for_vsize(MIN_RELAY_FEE_PER_KVB, vsize) {
+    let note_like = spent_outs
+        .iter()
+        .any(|o| crate::notes::is_pool_script(o.script_pubkey.as_bytes()));
+    if !note_like && fee < fee_for_vsize(MIN_RELAY_FEE_PER_KVB, vsize) {
         return Err(MempoolReject::Policy("min relay fee not met".into()));
     }
 
