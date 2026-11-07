@@ -104,11 +104,78 @@ pub struct Peer<S> {
 impl Peer<TcpStream> {
     /// Opens an outbound TCP connection to `addr`.
     pub async fn connect(addr: SocketAddr, chain: &ChainParams) -> Result<Self, PeerError> {
-        let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        Self::connect_via_proxy(addr, None, chain).await
+    }
+
+    /// Opens an outbound connection, optionally tunnelled through a
+    /// SOCKS5 proxy (Tor's SOCKS port, `-proxy=`). The proxy resolves
+    /// nothing here: `addr` is always an IP, sent with ATYP=IPv4/IPv6.
+    /// Onion peers are not supported until the address table learns
+    /// hostnames.
+    pub async fn connect_via_proxy(
+        addr: SocketAddr,
+        proxy: Option<SocketAddr>,
+        chain: &ChainParams,
+    ) -> Result<Self, PeerError> {
+        let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(proxy.unwrap_or(addr)))
             .await
-            .map_err(|_| PeerError::ConnectTimeout(addr))??;
+            .map_err(|_| PeerError::ConnectTimeout(proxy.unwrap_or(addr)))??;
+        if let Some(proxy) = proxy {
+            socks5_handshake(&mut stream, addr).await?;
+            let _ = proxy;
+        }
         Ok(Self::from_stream(stream, addr, chain))
     }
+}
+
+/// SOCKS5 no-auth handshake and CONNECT. `stream` is already connected to
+/// the proxy; on success the stream speaks plain TCP to `dest`.
+async fn socks5_handshake<S>(stream: &mut S, dest: SocketAddr) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use std::io::{Error, ErrorKind};
+    let mut buf = vec![0x05u8, 0x01, 0x00];
+    stream.write_all(&buf).await?;
+    let mut buf = [0u8; 2];
+    stream.read_exact(&mut buf).await?;
+    if buf != [0x05, 0x00] {
+        return Err(Error::new(ErrorKind::InvalidData, "SOCKS5 proxy requires authentication"));
+    }
+    let mut request = vec![0x05u8, 0x01, 0x00];
+    match dest.ip() {
+        std::net::IpAddr::V4(ip) => {
+            request.push(0x01);
+            request.extend_from_slice(&ip.octets());
+        }
+        std::net::IpAddr::V6(ip) => {
+            request.push(0x04);
+            request.extend_from_slice(&ip.octets());
+        }
+    }
+    request.extend_from_slice(&dest.port().to_be_bytes());
+    stream.write_all(&request).await?;
+    let mut reply = vec![0u8; 4];
+    stream.read_exact(&mut reply).await?;
+    if reply[0] != 0x05 || reply[1] != 0x00 {
+        return Err(Error::new(ErrorKind::Other, format!("SOCKS5 CONNECT failed: rep={}", reply[1])));
+    }
+    // Consume the bound address: 4 or 16 bytes for IPv4/IPv6, else skip
+    // the length-prefixed domain form.
+    let atyp = reply[3];
+    let addr_len = match atyp {
+        0x01 => 4,
+        0x04 => 16,
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await?;
+            len[0] as usize
+        }
+        other => return Err(Error::new(ErrorKind::InvalidData, format!("SOCKS5 bad ATYP {other}"))),
+    };
+    let mut rest = vec![0u8; addr_len + 2];
+    stream.read_exact(&mut rest).await?;
+    Ok(())
 }
 
 impl<S> Peer<S>
@@ -379,6 +446,39 @@ mod tests {
         assert_eq!(info.user_agent, "/remote:1.0/");
         assert_eq!(info.start_height, 100);
         assert_eq!(info.addr, label_addr());
+    }
+
+    #[tokio::test]
+    async fn socks5_handshake_completes_ipv4_and_rejects_auth() {
+        let (mut ours_io, theirs_io) = duplex(1 << 16);
+        let dest: SocketAddr = "10.1.2.3:8333".parse().unwrap();
+        let client = async {
+            socks5_handshake(&mut ours_io, dest).await.unwrap();
+        };
+        let server = async move {
+            let (mut rd, mut wr) = split(theirs_io);
+            let mut greeting = [0u8; 3];
+            rd.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [0x05, 0x01, 0x00]);
+            wr.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut request = [0u8; 10];
+            rd.read_exact(&mut request).await.unwrap();
+            assert_eq!(request, [0x05, 0x01, 0x00, 0x01, 10, 1, 2, 3, 0x20, 0x8d]);
+            wr.write_all(&[0x05, 0x00, 0x00, 0x01, 1, 1, 1, 1, 0, 0]).await.unwrap();
+        };
+        tokio::join!(client, server);
+
+        // A proxy demanding credentials must be rejected, not silently used.
+        let (mut ours_io, theirs_io) = duplex(1 << 16);
+        let client = async { socks5_handshake(&mut ours_io, dest).await };
+        let server = async move {
+            let (mut rd, mut wr) = split(theirs_io);
+            let mut greeting = [0u8; 3];
+            rd.read_exact(&mut greeting).await.unwrap();
+            wr.write_all(&[0x05, 0x02]).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(client, server);
+        assert!(result.is_err());
     }
 
     #[tokio::test]
