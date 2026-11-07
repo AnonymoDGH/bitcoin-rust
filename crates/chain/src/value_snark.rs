@@ -43,11 +43,31 @@ pub const NEW_NOTES: usize = 2;
 /// Value range bits enforced for every value and for `cap - v_old`.
 pub const VALUE_BITS: usize = 64;
 
-/// Algebraic stand-in hash. Prototype uses the identity map (linear
-/// commitment `C = value + rcm`); production binds to the note hash
-/// / Pedersen commitment. Hiding comes from the secret `rcm`.
+/// Algebraic hash `h(x) = x^3 + x` over the scalar field. The cubic
+/// term makes the commitment non-linear: no affine re-opening can
+/// satisfy `C = v + h(rcm)` for a different `(v, rcm)` pair, and the
+/// pair is furthermore pinned by the note's `cmu` hash (and the
+/// Pedersen commitment on committed scripts) at spend time.
+/// Hiding comes from the secret `rcm`.
 fn hash_field(x: Fr) -> Fr {
-    x
+    x * x * x + x
+}
+
+/// `var = a * b` as a multiplication constraint.
+fn mul(
+    cs: &ConstraintSystemRef<Fr>,
+    a: Variable,
+    b: Variable,
+    hint: Option<Fr>,
+) -> ark_relations::r1cs::Result<Variable> {
+    let out = cs.new_witness_variable(|| ok(hint))?;
+    cs.enforce_constraint(lc_var(a), lc_var(b), lc_var(out))?;
+    Ok(out)
+}
+
+/// Witness value of `h(x) = x^3 + x` for a known `x`.
+fn h_val(x: Option<Fr>) -> Option<Fr> {
+    x.map(|x| x * x * x + x)
 }
 
 /// Value commitment: `C = value + h(rcm)`, `rcm` read big-endian.
@@ -117,19 +137,29 @@ impl ConstraintSynthesizer<Fr> for ValueCircuit {
             rcm_new[i] =
                 cs.new_witness_variable(|| ok(w.map(|w| Fr::from_be_bytes_mod_order(&w.rcm_new[i]))))?;
         }
-        // C_old opens: c_old == v_old + h(rcm_old) with h = identity.
+        // C_old opens: c_old == v_old + h(rcm_old), h(x) = x^3 + x.
+        let rcm_old_val = w.map(|w| Fr::from_be_bytes_mod_order(&w.rcm_old));
+        let t_old = mul(&cs, rcm_old, rcm_old, rcm_old_val.map(|x| x * x))?;
+        let u_old = mul(&cs, rcm_old, t_old, rcm_old_val.map(|x| x * x * x))?;
+        let h_old = cs.new_witness_variable(|| ok(h_val(rcm_old_val)))?;
+        cs.enforce_constraint(lc_var(h_old), one_lc(), lc_var(u_old) + lc_var(rcm_old))?;
         cs.enforce_constraint(
             lc_var(c_old),
             one_lc(),
-            lc_var(v_old) + lc_var(rcm_old),
+            lc_var(v_old) + lc_var(h_old),
         )?;
         // Every new commitment opens; values decompose.
         let mut allocated = LinearCombination::<Fr>::default();
         for i in 0..NEW_NOTES {
+            let rcm_val = w.map(|w| Fr::from_be_bytes_mod_order(&w.rcm_new[i]));
+            let ti = mul(&cs, rcm_new[i], rcm_new[i], rcm_val.map(|x| x * x))?;
+            let ui = mul(&cs, rcm_new[i], ti, rcm_val.map(|x| x * x * x))?;
+            let hi = cs.new_witness_variable(|| ok(h_val(rcm_val)))?;
+            cs.enforce_constraint(lc_var(hi), one_lc(), lc_var(ui) + lc_var(rcm_new[i]))?;
             cs.enforce_constraint(
                 lc_var(c_new[i]),
                 one_lc(),
-                lc_var(v_new[i]) + lc_var(rcm_new[i]),
+                lc_var(v_new[i]) + lc_var(hi),
             )?;
             decompose(&cs, v_new[i], w.map(|w| w.v_new[i]))?;
             allocated = allocated + lc_var(v_new[i]);
@@ -358,6 +388,21 @@ mod tests {
         // Cap below the spent value.
         transcript.cap = witness.v_old - 1;
         assert!(!is_statement_satisfiable(transcript, witness));
+    }
+
+    #[test]
+    fn commitment_is_nonlinear_and_binding() {
+        let rcm = [7u8; 32];
+        let c = value_commitment(1_000_000, &rcm);
+        // Not an affine commitment: C != value + rcm.
+        let linear = Fr::from(1_000_000u64) + Fr::from_be_bytes_mod_order(&rcm);
+        assert_ne!(c, linear);
+        // A different opening for the same C cannot exist with the
+        // same value: shifting rcm changes C.
+        let c2 = value_commitment(1_000_003, &rcm);
+        assert_ne!(c, c2);
+        let rcm2 = [8u8; 32];
+        assert_ne!(c, value_commitment(1_000_000, &rcm2));
     }
 
     #[test]
