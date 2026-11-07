@@ -83,8 +83,10 @@ pub fn is_unspendable(script_pubkey: &Script) -> bool {
     if bytes.get(1) == Some(&btc_consensus::CT_SCRIPT_VERSION) {
         return false;
     }
-    // Pool note: OP_RETURN OP_PUSHDATA1(32) <cmu>.
-    !(bytes.len() == 35 && bytes[1] == 0x4c && bytes[2] == 32)
+    // Pool note: OP_RETURN OP_PUSHDATA1(32) <cmu> (legacy) or
+    // OP_RETURN OP_PUSHDATA1(65) <cmu || value commitment> (committed).
+    !((bytes.len() == 35 && bytes[1] == 0x4c && bytes[2] == 32)
+        || (bytes.len() == 68 && bytes[1] == 0x4c && bytes[2] == 65))
 }
 
 /// In-memory UTXO set backed by a `HashMap`.
@@ -352,7 +354,15 @@ mod tests {
         assert!(!cache.have_coin(&op(0)));
         // CT script prefix: spendable ring-signature output.
         assert!(!is_unspendable(&ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x00])));
-        assert!(!is_unspendable(&ScriptBuf::from_bytes(vec![0x6a, 0x02, 0x00])));
+        // Pool note scripts: legacy (PUSHDATA1(32)) and value-committed
+        // (PUSHDATA1(65)) forms are spendable by note spends.
+        let mut legacy = vec![0x6a, 0x4c, 32];
+        legacy.extend_from_slice(&[0u8; 32]);
+        assert!(!is_unspendable(&ScriptBuf::from_bytes(legacy)));
+        let mut committed = vec![0x6a, 0x4c, 65];
+        committed.extend_from_slice(&[0u8; 65]);
+        assert!(!is_unspendable(&ScriptBuf::from_bytes(committed)));
+        assert!(is_unspendable(&ScriptBuf::from_bytes(vec![0x6a, 0x02, 0x00])));
 
         // Oversized scripts are unspendable; a script of exactly MAX_SCRIPT_SIZE is not.
         assert!(is_unspendable(&ScriptBuf::from_bytes(vec![0x51; MAX_SCRIPT_SIZE + 1])));
