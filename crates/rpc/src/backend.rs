@@ -119,4 +119,14 @@ pub trait WalletRpc: Send + Sync {
     fn encrypt_wallet(&self, passphrase: &str) -> Result<(), String>;
     fn wallet_passphrase(&self, passphrase: &str, timeout_secs: u64) -> Result<(), String>;
     fn wallet_lock(&self) -> Result<(), String>;
+
+    /// Reusable stealth invitation address, hex of 66 bytes
+    /// (spending_pub || scan_pub). Payments to it derive a fresh
+    /// one-time address per sender, so they cannot be linked.
+    fn get_stealth_address(&self) -> Result<String, String>;
+
+    /// Scans blocks and the mempool for stealth payments to this wallet:
+    /// transactions carrying a marker output (`OP_RETURN <ephemeral_pub>`)
+    /// whose other outputs match the derived one-time addresses.
+    fn list_stealth_utxos(&self, minconf: u32, max_blocks: u32) -> Vec<WalletUtxo>;
 }
