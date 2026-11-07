@@ -407,7 +407,8 @@ pub fn verify_note_tx_block_with_caps(
                 let transcript = crate::value_snark::ValueTranscript {
                     fee: fee_u64,
                     cap,
-                    c_old: crate::value_snark::value_commitment(note.value, &note.rcm),
+                    cmu: crate::value_snark::cmu_field(&pool_cmu),
+                    c_old: crate::value_snark::value_commitment(note.value, &note.rcm, &pool_cmu),
                     c_new: [c_new0, c_new1],
                 };
                 if !crate::value_snark::verify(transcript, &proof) {
@@ -418,6 +419,7 @@ pub fn verify_note_tx_block_with_caps(
                 let fee_u64 = (note.value as i64 - value_out).max(0) as u64;
                 let transcript = crate::value_snark::transcript_for_spend(
                     &note,
+                    &pool_cmu,
                     value_out.max(0) as u64,
                     fee_u64,
                     cap,
@@ -816,7 +818,7 @@ mod tests {
         .is_ok());
         // SNARK spend verifies.
         let transcript =
-            crate::value_snark::transcript_for_spend(&n, outputs_total, fee, n.value);
+            crate::value_snark::transcript_for_spend(&n, &cmu, outputs_total, fee, n.value);
         let dummy = [0u8; 32];
         let witness = crate::value_snark::ValueWitness {
             v_old: n.value,
@@ -892,10 +894,11 @@ mod tests {
         let transcript = crate::value_snark::ValueTranscript {
             fee,
             cap: n.value,
-            c_old: crate::value_snark::value_commitment(n.value, &n.rcm),
+            cmu: ark_ff::PrimeField::from_be_bytes_mod_order(&cmu),
+            c_old: crate::value_snark::value_commitment(n.value, &n.rcm, &cmu),
             c_new: [
-                crate::value_snark::value_commitment(new_value, &new_note.rcm),
-                crate::value_snark::value_commitment(0, &dummy),
+                crate::value_snark::new_commitment(new_value, &new_note.rcm),
+                crate::value_snark::new_commitment(0, &dummy),
             ],
         };
         let witness = crate::value_snark::ValueWitness {
