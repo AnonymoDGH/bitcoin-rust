@@ -13,3 +13,9 @@ bitcoin_hashes = { workspace = true }
 primitive-types = "0.13"
 thiserror = { workspace = true }
 getrandom = "0.2"
+ark-bn254 = "0.4"
+ark-ec = "0.4"
+ark-ff = "0.4"
+ark-groth16 = "0.4"
+ark-relations = "0.4"
+ark-std = "0.4"
