@@ -160,7 +160,12 @@ pub fn accept_to_mempool(chainstate: &Chainstate, mempool: &mut Mempool, tx: Tx)
         } else {
             let fee = check_tx_inputs(&tx, &view, next_height)
                 .map_err(|e| MempoolReject::Consensus(e.reject_reason().into()))?;
-            (spent, fee)
+            // Pool-creating txs: the locked note values are not miner
+            // revenue (mirrors ConnectBlock fee accounting).
+            let input_values: Vec<i64> = spent.iter().map(|c| c.txout.value).collect();
+            let caps = crate::notes::funding_caps_for_block(&tx, &input_values);
+            let locked: i64 = caps.iter().map(|(_, cap)| *cap as i64).sum();
+            (spent, fee - locked)
         }
     };
 
@@ -168,21 +173,26 @@ pub fn accept_to_mempool(chainstate: &Chainstate, mempool: &mut Mempool, tx: Tx)
         return Err(MempoolReject::Policy("non-BIP68-final".into()));
     }
 
+    let mut fee_used = fee;
     let spent_outs: Vec<TxOut> = spent.into_iter().map(|coin| coin.txout).collect();
     let has_note_input = spent_outs
         .iter()
         .any(|o| crate::notes::is_pool_script(o.script_pubkey.as_bytes()));
     if has_note_input {
         // Note spends are authorised by pool verification against the
-        // fresh tip anchor and the issuance funding ledger.
+        // fresh tip anchor and the issuance funding ledger; the
+        // returned fee is the real miner revenue for block assembly.
         let root = chainstate.pool_root();
         let caps = chainstate.pool_funding();
-        if crate::notes::verify_note_tx_block_with_caps(&tx, &spent_outs, Some(root), Some(caps))
-            .is_err()
+        match crate::notes::verify_note_tx_block_with_caps(&tx, &spent_outs, Some(root), Some(caps))
         {
-            return Err(MempoolReject::Consensus("bad-note-tx".into()));
+            Ok(note_fee) => {
+                fee_used = note_fee;
+            }
+            Err(_) => return Err(MempoolReject::Consensus("bad-note-tx".into())),
         }
     }
+    let fee = fee_used;
     let is_ct = chainstate.params.ct_enabled
         && (tx.vout.iter().any(|o| crate::confidential::is_ct_script(o.script_pubkey.as_bytes()))
             || spent_outs.iter().any(|o| crate::confidential::is_ct_script(o.script_pubkey.as_bytes())));
@@ -201,7 +211,8 @@ pub fn accept_to_mempool(chainstate: &Chainstate, mempool: &mut Mempool, tx: Tx)
     let vsize = virtual_size(get_transaction_weight(&tx), sigop_cost);
     let note_like = spent_outs
         .iter()
-        .any(|o| crate::notes::is_pool_script(o.script_pubkey.as_bytes()));
+        .any(|o| crate::notes::is_pool_script(o.script_pubkey.as_bytes()))
+        || tx.vout.iter().any(|o| crate::notes::is_pool_script(o.script_pubkey.as_bytes()));
     if !note_like && fee < fee_for_vsize(MIN_RELAY_FEE_PER_KVB, vsize) {
         return Err(MempoolReject::Policy("min relay fee not met".into()));
     }
