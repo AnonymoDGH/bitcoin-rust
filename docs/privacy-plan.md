@@ -115,9 +115,26 @@ protects the middle; the edges must be designed for too.
   live. Note spends in `ConnectBlock` verify membership, spend
   authorisation and fee accounting through `verify_note_tx_block`
   (witness layouts: note, auth+anchor+index, path).
-- **TODO before lane-ready:** SNARKs over the same note definition to
-  prove no inflation (utmost limitation of hash-based notes), view keys,
-  insertion of pool notes through the wallet and on-chain CT mining.
+- **Anti-inflation without a SNARK (funding ledger).** Note values are
+  revealed at spend, so the chain pins every spend to the value locked
+  at issuance: `funding_caps_for_block` records, per `cmu`, the amount
+  `inputs - non-pool outputs` locked by the creating tx (split evenly
+  across co-created notes, replayed by `Chainstate::refresh_pool`).
+  `verify_note_tx_block_with_caps` rejects any spend claiming more than
+  its cap. Value-committed scripts (`OP_RETURN PUSHDATA1(65) cmu||C`,
+  `C = value*G + rcm*H`) add a Pedersen opening check on top of the
+  hash binding. Multi-note creations are conservative (even split).
+- **Pool notes end to end.** Wallet `create_pool_note` /
+  `create_note_spend` with persisted `NoteCoinInfo`; RPC
+  `createpoolnote`/`spendnote`/`listnotes`/`exportviewkey` (view key =
+  `SHA256(scan_secret || "anon-view")` for blind audit scans);
+  `getpoolinfo` exposes anchor/height/note count. Mempool E2E tests
+  cover append-accept and spend-accept+mine; the funding cap rejects
+  inflated spends (unit tested).
+- **Remaining limits (honest):** spent note values are transparent
+  at spend (a SNARK/Orchard-style upgrade would hide them); CT miner
+  inclusion and on-chain CT mining remain TODO; onion inbound P2P is
+  not supported (outbound SOCKS5 only).
 
 ### Phase 3 — shielded pool
 **Implemented now (pre-zk milestone):** `crates/chain/src/notes.rs` —
@@ -129,9 +146,15 @@ replays the active chain to rebuild the commitment tree and per-tip
 anchors on every activation and at startup, and `pool_spent`/
 `register_nullifier` form the double-spend registry. `btc-wallet`
 creates, recovers (by spending secret) and authorises note spends.
-**TODO before lane-ready:** SNARKs over the same note definition to
-prove no inflation (utmost limitation of hash-based notes), on-chain
-shielded spends, and view keys.
+Pool output scripts come in two forms: legacy
+`OP_RETURN PUSHDATA1(32) cmu` and value-committed
+`OP_RETURN PUSHDATA1(65) cmu||C` (`C = value*G + rcm*H`, published by
+the wallet at creation). Inflation is bounded by the funding ledger
+(see §3), not by the hash: issuance locks real UTXO value behind
+each `cmu` and spends may claim at most that cap.
+**TODO before lane-ready:** hide spent values with an Orchard-style
+SNARK over the same note definition, CT miner inclusion, onion
+inbound P2P.
 
 ## 4. Threat model (explicit)
 
