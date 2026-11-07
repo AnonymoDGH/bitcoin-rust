@@ -194,6 +194,10 @@ const WALLET_METHODS: &[Method] = &[
             ("fee_rate", false),
         ],
     },
+    Method {
+        name: "shieldtoct",
+        params: &[("amount", true), ("fee", false)],
+    },
 ];
 
 /// Finds a method. Wallet methods are reported as missing when there is no wallet.
