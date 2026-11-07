@@ -118,7 +118,17 @@ pub fn accept_to_mempool(chainstate: &Chainstate, mempool: &mut Mempool, tx: Tx)
     if tx.is_coin_base() {
         return Err(MempoolReject::Consensus("coinbase".into()));
     }
-    is_standard_tx(&tx).map_err(|e| MempoolReject::Policy(e.reason().into()))?;
+    // Confidential outputs are OP_RETURN-shaped scripts; standardness
+    // policy is amended on CT-enabled chains to admit them.
+    let is_standard = is_standard_tx(&tx);
+    if chainstate.params.ct_enabled
+        && (tx.vout.iter().any(|o| crate::confidential::is_ct_script(o.script_pubkey.as_bytes())))
+    {
+        // CT output: admit past the standardness gate; CT verification
+        // below decides.
+    } else if let Err(e) = is_standard {
+        return Err(MempoolReject::Policy(e.reason().into()));
+    }
 
     let next_height = chainstate.height() + 1;
     if !is_final_tx(&tx, next_height as i32, chainstate.median_time_past_tip()) {
@@ -148,6 +158,16 @@ pub fn accept_to_mempool(chainstate: &Chainstate, mempool: &mut Mempool, tx: Tx)
     }
 
     let spent_outs: Vec<TxOut> = spent.into_iter().map(|coin| coin.txout).collect();
+    let is_ct = chainstate.params.ct_enabled
+        && (tx.vout.iter().any(|o| crate::confidential::is_ct_script(o.script_pubkey.as_bytes()))
+            || spent_outs.iter().any(|o| crate::confidential::is_ct_script(o.script_pubkey.as_bytes())));
+    if is_ct {
+        let spent_scripts: Vec<btc_primitives::ScriptBuf> =
+            spent_outs.iter().map(|o| o.script_pubkey.clone()).collect();
+        if crate::confidential::verify_ct_tx_block(&tx, &spent_scripts).is_err() {
+            return Err(MempoolReject::Consensus("bad-ct-tx".into()));
+        }
+    }
     let sigop_cost = transaction_sigop_cost(&tx, &spent_outs, standard_script_flags());
     if sigop_cost > MAX_STANDARD_TX_SIGOPS_COST {
         return Err(MempoolReject::Policy("bad-txns-too-many-sigops".into()));
@@ -157,17 +177,19 @@ pub fn accept_to_mempool(chainstate: &Chainstate, mempool: &mut Mempool, tx: Tx)
         return Err(MempoolReject::Policy("min relay fee not met".into()));
     }
 
-    if let Err(err) = check_input_scripts(&tx, &spent_outs, standard_script_flags()) {
-        return Err(match err {
-            ValidationError::Script { error, .. } => {
-                MempoolReject::Policy(format!("mempool-script-verify-flag-failed ({error})"))
-            }
-            other => MempoolReject::Policy(other.reject_reason().into()),
-        });
+    if !is_ct {
+        if let Err(err) = check_input_scripts(&tx, &spent_outs, standard_script_flags()) {
+            return Err(match err {
+                ValidationError::Script { error, .. } => {
+                    MempoolReject::Policy(format!("mempool-script-verify-flag-failed ({error})"))
+                }
+                other => MempoolReject::Policy(other.reject_reason().into()),
+            });
+        }
+        let block_flags = block_script_flags(next_height, &chainstate.tip_hash(), &chainstate.params);
+        check_input_scripts(&tx, &spent_outs, block_flags)
+            .map_err(|_| MempoolReject::Consensus("mandatory-script-verify-flag-failed".into()))?;
     }
-    let block_flags = block_script_flags(next_height, &chainstate.tip_hash(), &chainstate.params);
-    check_input_scripts(&tx, &spent_outs, block_flags)
-        .map_err(|_| MempoolReject::Consensus("mandatory-script-verify-flag-failed".into()))?;
 
     mempool
         .add(MempoolEntry { tx, fee, vsize: vsize as u64 })
