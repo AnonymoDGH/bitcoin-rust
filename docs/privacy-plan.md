@@ -153,9 +153,15 @@ protects the middle; the edges must be designed for too.
   range and `v_old <= funding cap` without revealing values (public
   inputs: fee, cap, commitments). Tests prove+verify a valid spend
   and reject tampered fee / inflation / over-cap / bad opening
-  witnesses. Prototype limits: linear stand-in commitment hash
-  (bind to `cmu`/Pedersen next); not yet wired to consensus —
-  hash-note pool with the funding ledger remains the active scheme.
+  witnesses. Wired into consensus verification: an optional Groth16
+  proof in `witness[3]` of a note spend is verified by
+  `verify_note_tx_block_with_caps` (ConnectBlock + mempool) with the
+  transcript reconstructed from the note opening, the tx outputs
+  and the funding cap; present-but-invalid proofs are rejected.
+  Prototype limits: linear stand-in commitment hash (bind to
+  `cmu`/Pedersen next); outputs transparent in this mode; wallet
+  proof generation not yet wired. The hash-note pool with the
+  funding ledger remains the active scheme.
 - **Remaining limits (honest):** spent note values are transparent
   at spend under the active (hash-note) scheme; onion inbound P2P
   is not supported (outbound SOCKS5 only).
