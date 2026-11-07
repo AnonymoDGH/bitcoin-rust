@@ -18,6 +18,7 @@ pub mod chainstate;
 pub mod confidential;
 pub mod miner;
 pub mod mempool_accept;
+pub mod notes;
 pub mod ringsig;
 
 pub use error::ValidationError;
