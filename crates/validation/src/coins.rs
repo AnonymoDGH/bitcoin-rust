@@ -69,9 +69,9 @@ impl fmt::Display for CoinsError {
 impl std::error::Error for CoinsError {}
 
 /// True if a scriptPubKey can never be spent (Core `CScript::IsUnspendable`).
-/// Confidential outputs (`OP_RETURN 0x01 ...`) and shielded pool scripts are spendable by
-/// ring/note proofs respectively, so they are not unspendable even though
-/// they start with OP_RETURN.
+/// Confidential outputs (`OP_RETURN 0x01 ...`) are spendable by ring proofs,
+/// and pool note scripts (`OP_RETURN OP_PUSHDATA1(32) ...`) by note spend
+/// proofs, so they are not unspendable even though they start with OP_RETURN.
 pub fn is_unspendable(script_pubkey: &Script) -> bool {
     if script_pubkey.len() > MAX_SCRIPT_SIZE {
         return true;
@@ -80,8 +80,11 @@ pub fn is_unspendable(script_pubkey: &Script) -> bool {
     if bytes.first() != Some(&OP_RETURN) {
         return false;
     }
-    let version = bytes.get(1);
-    !matches!(version, Some(&btc_consensus::CT_SCRIPT_VERSION) | Some(&0x02))
+    if bytes.get(1) == Some(&btc_consensus::CT_SCRIPT_VERSION) {
+        return false;
+    }
+    // Pool note: OP_RETURN OP_PUSHDATA1(32) <cmu>.
+    !(bytes.len() == 35 && bytes[1] == 0x4c && bytes[2] == 32)
 }
 
 /// In-memory UTXO set backed by a `HashMap`.
