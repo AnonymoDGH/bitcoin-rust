@@ -110,7 +110,29 @@ pub fn connect_block(
                     return Err(ValidationError::AccumulatedFeeOutOfRange);
                 }
             } else {
+                // Ledger fee overstates the true fee for note-creating
+                // txs by the locked note values: those sats move into
+                // the pool (ledger value = funding cap), they are not
+                // miner revenue. Subtract the caps so the coinbase can
+                // only claim real fees — otherwise the note value is
+                // minted twice (fee + later spend).
                 let fee = check_tx_inputs(tx, coins, height)?;
+                let fee = if tx.vout.iter().any(|o| {
+                    crate::notes::is_pool_script(o.script_pubkey.as_bytes())
+                }) {
+                    let input_values: Vec<i64> =
+                        spent_outs.iter().map(|o| o.value).collect();
+                    let caps =
+                        crate::notes::funding_caps_for_block(tx, &input_values);
+                    let locked: i64 =
+                        caps.iter().map(|(_, cap)| *cap as i64).sum();
+                    fee - locked
+                } else {
+                    fee
+                };
+                if fee < 0 {
+                    return Err(ValidationError::AccumulatedFeeOutOfRange);
+                }
                 fees += fee;
                 if !(0..=MAX_MONEY).contains(&fees) {
                     return Err(ValidationError::AccumulatedFeeOutOfRange);
