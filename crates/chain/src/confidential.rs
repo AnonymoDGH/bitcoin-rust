@@ -23,6 +23,7 @@ use std::sync::OnceLock;
 
 use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
 use bitcoin_hashes::{sha256, Hash as _};
+use btc_primitives::ScriptBuf;
 use thiserror::Error;
 
 pub const VALUE_BITS: usize = 64;
@@ -449,6 +450,273 @@ pub fn verify_ct_transaction(
     Ok(())
 }
 
+/// Confidential output script: `OP_RETURN 0x01 <commitment:33> <pubkey_hash:20> <range_proof:6272>`.
+/// Value must be 0 (the amount is hidden in the commitment).
+pub struct CtOutputData {
+    pub commitment: [u8; 33],
+    pub pubkey_hash: [u8; 20],
+    pub proof: RangeProof,
+}
+
+pub fn encode_ct_script(data: &CtOutputData) -> Result<btc_primitives::ScriptBuf, CtError> {
+    let mut buf = vec![0x6a, 0x01];
+    buf.extend_from_slice(&data.commitment);
+    buf.extend_from_slice(&data.pubkey_hash);
+    let proof_bytes = serialize_range_proof(&data.proof);
+    push_data(&mut buf, &proof_bytes);
+    Ok(btc_primitives::ScriptBuf::from_bytes(buf))
+}
+
+fn push_data(buf: &mut Vec<u8>, data: &[u8]) {
+    if data.len() < 0x4c {
+        buf.push(data.len() as u8);
+    } else if data.len() <= 0xff {
+        buf.push(0x4c);
+        buf.push(data.len() as u8);
+    } else {
+        buf.push(0x4d);
+        buf.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    }
+    buf.extend_from_slice(data);
+}
+
+pub fn decode_ct_script(script: &[u8]) -> Option<CtOutputData> {
+    let len = script.len();
+    if len < 2 || script[0] != 0x6a || script[1] != 0x01 {
+        return None;
+    }
+    // [0x6a, 0x01, commitment:33, pubkey_hash:20, push(proof)]
+    let commitment: [u8; 33] = script.get(2..35)?.try_into().ok()?;
+    let pubkey_hash: [u8; 20] = script.get(35..55)?.try_into().ok()?;
+    let proof_data = parse_push(script.get(55..)?)?;
+    let proof = deserialize_range_proof(proof_data)?;
+    if !verify_range(&commitment, &proof).is_ok() {
+        return None;
+    }
+    Some(CtOutputData {
+        commitment,
+        pubkey_hash,
+        proof,
+    })
+}
+
+pub fn is_ct_script(script: &[u8]) -> bool {
+    decode_ct_script(script).is_some()
+}
+
+fn parse_push(data: &[u8]) -> Option<&[u8]> {
+    let (len, header) = match data.first()? {
+        b if *b < 0x4c => (*b as usize, 1),
+        0x4c => (*data.get(1)? as usize, 2),
+        0x4d => {
+            let len = u16::from_le_bytes(data.get(1..3)?.try_into().ok()?) as usize;
+            (len, 3)
+        }
+        _ => return None,
+    };
+    if header + len != data.len() {
+        return None;
+    }
+    Some(&data[header..])
+}
+
+fn serialize_range_proof(proof: &RangeProof) -> Vec<u8> {
+    let mut out = Vec::with_capacity(VALUE_BITS * (33 + 65));
+    for commitment in &proof.bit_commitments {
+        out.extend_from_slice(commitment);
+    }
+    for bp in &proof.bit_proofs {
+        out.extend_from_slice(&bp.commit);
+        out.extend_from_slice(&bp.response);
+    }
+    out
+}
+
+fn deserialize_range_proof(data: &[u8]) -> Option<RangeProof> {
+    let expected = VALUE_BITS * (33 + 65);
+    if data.len() != expected {
+        return None;
+    }
+    let mut bit_commitments = Vec::with_capacity(VALUE_BITS);
+    for i in 0..VALUE_BITS {
+        bit_commitments.push(data[i * 33..(i + 1) * 33].try_into().ok()?);
+    }
+    let mut bit_proofs = Vec::with_capacity(VALUE_BITS);
+    let tail = &data[VALUE_BITS * 33..];
+    for i in 0..VALUE_BITS {
+        let entry = &tail[i * 65..(i + 1) * 65];
+        bit_proofs.push(BitProof {
+            commit: entry[..33].try_into().ok()?,
+            response: entry[33..].try_into().ok()?,
+        });
+    }
+    Some(RangeProof {
+        bit_commitments,
+        bit_proofs,
+    })
+}
+
+/// Sighash-like context for CT proofs of one transaction: SHA256D of the
+/// wire encoding with witnesses stripped (serialisation is deterministic).
+pub fn ct_context(tx: &btc_primitives::Tx) -> [u8; 32] {
+    let mut stripped = tx.clone();
+    for input in &mut stripped.vin {
+        input.witness = bitcoin::Witness::new();
+    }
+    let bytes = bitcoin::consensus::encode::serialize(&stripped);
+    let hash = bitcoin_hashes::sha256d::Hash::hash(&bytes);
+    hash.to_byte_array()
+}
+
+/// Balance proof with the public fee prefixed: `fee(8 LE) || r_pub(33) || z(32)`.
+/// The fee stays public so the verifier can reconstruct
+/// `fee*G` while the amounts remain hidden.
+pub fn serialize_balance_proof(proof: &BalanceProof) -> Vec<u8> {
+    let mut out = Vec::with_capacity(73);
+    out.extend_from_slice(&0u64.to_le_bytes());
+    out.extend_from_slice(&proof.r_pub);
+    out.extend_from_slice(&proof.z);
+    out
+}
+
+/// Sets the fee prefix on a serialized balance proof.
+pub fn with_fee(mut bytes: Vec<u8>, fee: u64) -> Vec<u8> {
+    bytes[..8].copy_from_slice(&fee.to_le_bytes());
+    bytes
+}
+
+/// Extracts the public fee prefix.
+pub fn proof_fee(data: &[u8]) -> u64 {
+    if data.len() != 73 {
+        return 0;
+    }
+    u64::from_le_bytes(data[..8].try_into().expect("8 bytes"))
+}
+
+pub fn deserialize_balance_proof(data: &[u8]) -> Option<BalanceProof> {
+    if data.len() != 73 {
+        return None;
+    }
+    Some(BalanceProof {
+        r_pub: data[8..41].try_into().ok()?,
+        z: data[41..].try_into().ok()?,
+    })
+}
+
+pub fn serialize_ring_sig(sig: &crate::ringsig::RingSignature) -> Vec<u8> {
+    let mut out = Vec::with_capacity(crate::ringsig::RING_SIZE * 64);
+    for (c, z) in &sig.responses {
+        out.extend_from_slice(c);
+        out.extend_from_slice(z);
+    }
+    out
+}
+
+pub fn deserialize_ring_sig(data: &[u8]) -> Option<crate::ringsig::RingSignature> {
+    if data.len() != crate::ringsig::RING_SIZE * 64 {
+        return None;
+    }
+    let mut responses = Vec::with_capacity(crate::ringsig::RING_SIZE);
+    for i in 0..crate::ringsig::RING_SIZE {
+        let entry = &data[i * 64..(i + 1) * 64];
+        responses.push((entry[..32].try_into().ok()?, entry[32..].try_into().ok()?));
+    }
+    Some(crate::ringsig::RingSignature { responses })
+}
+
+/// Full chain-level CT verification for one transaction:
+/// - every output/input is a CT output (all-CT rule, enforced by the
+///   value ledger: CT entries carry value 0, so mixed txs cannot balance),
+/// - range proofs for inputs and outputs verify,
+/// - every input carries a valid ring signature whose ring contains the
+///   pubkey hashing to the embedded pubkey_hash,
+/// - the balance proof ties inputs to outputs with fee 0.
+pub fn verify_ct_tx_block(
+    tx: &btc_primitives::Tx,
+    spent_scripts: &[btc_primitives::ScriptBuf],
+) -> Result<(), CtError> {
+    if spent_scripts.len() != tx.vin.len() {
+        return Err(CtError::BalanceProof);
+    }
+    let mut inputs = Vec::with_capacity(spent_scripts.len());
+    let mut input_keys = Vec::with_capacity(spent_scripts.len());
+    for script in spent_scripts {
+        let data = decode_ct_script(script.as_bytes()).ok_or(CtError::BalanceProof)?;
+        input_keys.push(data.pubkey_hash);
+        inputs.push(AmountCommitment {
+            commitment: data.commitment,
+            proof: data.proof,
+        });
+    }
+    let mut outputs = Vec::with_capacity(tx.vout.len());
+    for output in &tx.vout {
+        if output.value != 0 {
+            return Err(CtError::BalanceProof);
+        }
+        let data = decode_ct_script(output.script_pubkey.as_bytes()).ok_or(CtError::BalanceProof)?;
+        outputs.push(AmountCommitment {
+            commitment: data.commitment,
+            proof: data.proof,
+        });
+    }
+    if inputs.is_empty() || outputs.is_empty() {
+        return Err(CtError::BalanceProof);
+    }
+
+    let context = ct_context(tx);
+    // Ring signature per input; balance proof lives in the first input.
+    for (i, input) in tx.vin.iter().enumerate() {
+        let stack: Vec<&[u8]> = input.witness.iter().collect();
+        let ring_keys: Vec<[u8; 33]> = if i == 0 {
+            stack
+                .get(2)
+                .and_then(|data| {
+                    data.chunks_exact(33)
+                        .map(|chunk| chunk.try_into().ok())
+                        .collect::<Option<Vec<[u8; 33]>>>()
+                })
+                .unwrap_or_default()
+        } else {
+            stack
+                .get(1)
+                .and_then(|data| {
+                    data.chunks_exact(33)
+                        .map(|chunk| chunk.try_into().ok())
+                        .collect::<Option<Vec<[u8; 33]>>>()
+                })
+                .unwrap_or_default()
+        };
+        if ring_keys.len() != crate::ringsig::RING_SIZE {
+            return Err(CtError::BalanceProof);
+        }
+        let sig_bytes = if i == 0 { stack.get(1) } else { stack.first() };
+        let Some(sig_bytes) = sig_bytes else {
+            return Err(CtError::BalanceProof);
+        };
+        let sig = deserialize_ring_sig(sig_bytes).ok_or(CtError::BalanceProof)?;
+        let matches: Vec<_> = ring_keys
+            .iter()
+            .filter(|key| {
+                let hash = bitcoin_hashes::hash160::Hash::hash(*key);
+                &hash.to_byte_array()[..20] == input_keys[i].as_slice()
+            })
+            .collect();
+        if matches.len() != 1 {
+            return Err(CtError::BalanceProof);
+        }
+        crate::ringsig::verify_ring(&context, &ring_keys, &sig)
+            .map_err(|_| CtError::BalanceProof)?;
+    }
+
+    let balance_bytes = tx.vin[0]
+        .witness
+        .iter()
+        .next()
+        .ok_or(CtError::BalanceProof)?;
+    let balance = deserialize_balance_proof(balance_bytes).ok_or(CtError::BalanceProof)?;
+    verify_ct_transaction(&inputs, &outputs, proof_fee(balance_bytes), &balance, &context)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,6 +726,73 @@ mod tests {
         buf[0] = seed;
         buf[31] = 1;
         buf
+    }
+
+    #[test]
+    fn ct_script_round_trips_and_rejects_tampering() {
+        let c = create_commitment(10_00000000, blinding(5)).unwrap();
+        let data = CtOutputData {
+            commitment: c.commitment,
+            pubkey_hash: [7u8; 20],
+            proof: c.proof,
+        };
+        let script = encode_ct_script(&data).unwrap();
+        let back = decode_ct_script(script.as_bytes()).unwrap();
+        assert_eq!(back.commitment, data.commitment);
+        assert_eq!(back.pubkey_hash, [7u8; 20]);
+        let mut bytes = script.as_bytes().to_vec();
+        bytes[10] ^= 1; // inside the commitment: range proof must fail
+        assert!(decode_ct_script(&bytes).is_none());
+        assert!(!is_ct_script(&ScriptBuf::from_bytes(vec![0x6a]).as_bytes()));
+    }
+
+    #[test]
+    fn ct_tx_block_verify_end_to_end() {
+        use crate::ringsig::sign_ring;
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        use bitcoin::Witness;
+        let secp = Secp256k1::new();
+        let mut secrets = Vec::new();
+        let mut pubs: Vec<[u8; 33]> = Vec::new();
+        for i in 1..=16u8 {
+            let mut buf = [0u8; 32];
+            buf[0] = i;
+            buf[31] = 5;
+            let sk = SecretKey::from_slice(&buf).unwrap();
+            secrets.push(buf);
+            pubs.push(PublicKey::from_secret_key(&secp, &sk).serialize());
+        }
+        let own = 3usize;
+        let r_in = [11u8; 32];
+        let r_out = [22u8; 32];
+        let in_c = create_commitment(5_00000000u64, r_in).unwrap();
+        let own_hash = bitcoin_hashes::hash160::Hash::hash(&pubs[own]).to_byte_array();
+        let mut own_hash20 = [0u8; 20];
+        own_hash20.copy_from_slice(&own_hash[..20]);
+        let in_data = CtOutputData { commitment: in_c.commitment, pubkey_hash: own_hash20, proof: in_c.proof };
+        let in_script = encode_ct_script(&in_data).unwrap();
+        let out_c = create_commitment(4_99990000u64, r_out).unwrap();
+        let out_data = CtOutputData { commitment: out_c.commitment, pubkey_hash: [7u8; 20], proof: out_c.proof };
+        let out_script = encode_ct_script(&out_data).unwrap();
+        let prevout = btc_primitives::OutPoint { txid: bitcoin::Txid::from_slice(&[99u8; 32]).unwrap(), vout: 0 };
+        let mut input = btc_primitives::TxIn::new(prevout);
+        let mut tx = btc_primitives::Tx::new(2, vec![input.clone()], vec![btc_primitives::TxOut::new(0, out_script.clone())], 0);
+        let context = ct_context(&tx);
+        let (proof, _) = create_balance_proof(&[r_in], &[r_out], 10_000, &context).unwrap();
+        let sig = sign_ring(&context, &pubs, own, &secrets[own]).unwrap();
+        let mut ring_bytes = Vec::new();
+        for key in &pubs {
+            ring_bytes.extend_from_slice(key);
+        }
+        input.witness = Witness::from_slice(&[with_fee(serialize_balance_proof(&proof), 10_000), serialize_ring_sig(&sig).to_vec(), ring_bytes]);
+        tx.vin[0] = input;
+        // Stage 1: script decoding and stack parsing.
+        assert!(decode_ct_script(in_script.as_bytes()).is_some());
+        assert!(decode_ct_script(out_script.as_bytes()).is_some());
+        // Stage 2: full verification.
+        let result = verify_ct_tx_block(&tx, &[in_script]);
+        eprintln!("verify_ct_tx_block: {result:?}");
+        assert!(result.is_ok());
     }
 
     #[test]
