@@ -60,8 +60,8 @@ difficulty is the launch difficulty, and retargeting every `target_timespan / ta
 
 | Preset | `genesis_bits` | Expected hashes/block | Time/block (1 CPU core, release) |
 |---|---|---|---|
-| `chains/hardcoin.json` | `1e00ffff` | ~16.7 M | ~40–200 s |
-| `-printchainspec` default | `1e00ffff` | ~16.7 M | ~40–200 s |
+| `chains/anoncoin.json` (**AnonCoin**) | `1e00ffff` | ~16.7 M | ~40–200 s |
+| `-printchainspec` default (**AnonCoin**) | `1e00ffff` | ~16.7 M | ~40–200 s |
 | `chains/satoshibtc.json` | `1d00ffff` (Bitcoin initial difficulty) | ~4.3 B | ~3 h |
 
 Halving the mantissa doubles the difficulty: `1e003fff` ≈ 67 M hashes, `1e001fff` ≈ 134 M.
@@ -69,9 +69,9 @@ Barely-harder than current defaults: `1f00ffff` ≈ 65 k hashes (~0.5 s).
 
 ```bash
 cargo build --release -p btc-node
-./target/release/btc-node -chainspec=chains/hardcoin.json -datadir=./node1 \
+./target/release/btc-node -chainspec=chains/anoncoin.json -datadir=./node1 \
   -gen -genaddress=<address-or-script-hex> -maxblocks=10
-# mining genesis block for hardcoin (bits 0x1e00ffff, expected ~16777472 hashes, ...)
+# mining genesis block for AnonCoin (bits 0x1e00ffff, expected ~16777472 hashes, ...)
 ```
 
 Warning: genesis is mined synchronously at startup, so a `1d00ffff`-class spec does not start
