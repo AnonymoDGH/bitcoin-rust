@@ -85,11 +85,17 @@ protects the middle; the edges must be designed for too.
 - Amounts remain visible in this phase (documented limitation);
   the address graph is already broken.
 
-### Phase 2 — hidden amounts and ambiguous sender
-- **Confidential Transactions** (RingCT/bulletproofs): amounts hidden,
-  balance proof per transaction.
-- **Ring signatures** (Monero-style, fixed ring size, default on):
-  sender hidden among decoys.
+### Phase 2 - hidden amounts and ambiguous sender (implemented, primitives-level)
+- **Confidential Transactions**: Pedersen commitments `C(v,r) = v*G + r*H`
+  (`H = SHA256("AnonCoin-H-v1")*G`) with 64-bit range proofs (binary
+  Schnorr OR-proofs) and Schnorr balance proofs proving
+  `sum_in - sum_out - fee = 0` without revealing amounts. Implemented
+  and tested in `crates/chain/src/confidential.rs`; wallet helpers in
+  `crates/wallet/src/privpay.rs`. Consensus activation (new output
+  type in `ConnectBlock`) is the next step.
+- **Ring signatures** (Monero-style, fixed ring size 16): 1-out-of-16
+  Schnorr ring (`crates/chain/src/ringsig.rs`), tested. Spending
+  authorisation through rings is the next step.
 - **Fungibility**: identical-looking outputs; no tainted-coin
   signalling at the protocol level.
 
