@@ -169,9 +169,16 @@ protects the middle; the edges must be designed for too.
   `commitment_is_nonlinear_and_binding` locks the non-linearity.
   Moreover `C_old` now binds the on-chain `cmu` itself as a public
   input (`C = v + h(rcm) + cmu_field`): a proof issued for a
-  different note cannot verify against this transcript. The full
-  preimage-in-circuit binding (Poseidon over `cmu`) remains future
-  work.
+  different note cannot verify against this transcript. **Poseidon
+  preimage binding is wired too**: the circuit absorbs the note's
+  `(pub, value, rcm)` preimage in a Poseidon-like sponge (8 lanes,
+  4 full S-box rounds, domain constants) and checks the digest
+  against the `poseidon` public input. Pool scripts v3
+  (`OP_RETURN PUSHDATA1(97) cmu || poseidon || Pedersen C`) carry
+  that digest on-chain; on legacy scripts the verifier recomputes
+  it from the revealed opening. The permutation is a simplified
+  Poseidon-like construction (not the production Poseidon
+  parameters); the SHA-256 `cmu` tree leaf is unchanged.
   Wallet generation is wired too: `create_note_spend` takes the
   on-chain funding cap, proves the spend and attaches `witness[3]`
   (RPC `spendnote` supplies the cap from the ledger). **Shielded
@@ -180,9 +187,10 @@ protects the middle; the edges must be designed for too.
   public fee + new commitments travel in `witness[4]`, the miner
   fee is the public one, and the funding ledger records the new
   note with `spent value - fee` (hidden values flow through the
-  proof, not the ledger). Prototype limits: the in-field hash is
-  cubic (replace with a note-hash preimage circuit, e.g. Poseidon
-  over `cmu`, for the full binding).
+  proof, not the ledger). Prototype limits: the Poseidon-like
+  permutation is simplified (production parameters + `C_new`
+  binding remain); multiple new notes per spend are not yet
+  supported (conservative single-note rule).
 - **Remaining limits (honest):** spent note values are transparent
   at spend under the active (hash-note) scheme; onion inbound P2P
   is not supported (outbound SOCKS5 only).
