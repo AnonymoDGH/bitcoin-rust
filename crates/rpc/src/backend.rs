@@ -111,11 +111,14 @@ pub trait WalletRpc: Send + Sync {
     fn list_unspent(&self, minconf: u32, maxconf: u32) -> Vec<WalletUtxo>;
     /// Builds, signs and broadcasts. `fee_rate` in sat/kvB (None = estimate or fallback).
     fn send_to(&self, script: ScriptBuf, amount: i64, fee_rate: Option<i64>, subtract_fee: bool) -> Result<Txid, String>;
-
     /// Builds, signs and broadcasts a stealth payment to a reusable
     /// invitation address (66 bytes hex). A fresh one-time output is
     /// paid and an `OP_RETURN` marker publishes the ephemeral key.
     fn send_to_stealth(&self, address_hex: String, amount: i64, fee_rate: Option<i64>) -> Result<Txid, String>;
+
+    /// Shields `amount` satoshis of plaintext balance into a confidential
+    /// output (hybrid spend: P2PKH input, CT output, public fee).
+    fn send_to_confidential(&self, amount: i64, fee: i64) -> Result<Txid, String>;
 
     fn dump_privkey(&self, script: &ScriptBuf) -> Result<String, String>;
     fn import_privkey(&self, wif: &str) -> Result<(), String>;
