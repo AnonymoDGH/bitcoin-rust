@@ -328,6 +328,31 @@ mod tests {
     }
 
     #[test]
+    fn shipped_presets_are_hard_and_valid() {
+        // Parse-only: mining bitcoin-level genesis would take hours, so these
+        // tests validate the files without calling ChainParams::custom.
+        let hard = parse_chain_spec(include_str!("../../../chains/hardcoin.json")).unwrap();
+        assert_eq!(hard.genesis_bits, 0x1e00_ffff);
+        assert_eq!(hard.pow_limit, decode_compact(0x1e00_ffff).unwrap());
+        assert_eq!(hard.target_spacing, 600);
+        assert_eq!(hard.target_timespan / hard.target_spacing, 2016);
+        assert!(!hard.allow_min_difficulty_blocks);
+
+        let level =
+            parse_chain_spec(include_str!("../../../chains/satoshibtc.json")).unwrap();
+        assert_eq!(level.genesis_bits, 0x1d00_ffff);
+        assert_eq!(level.pow_limit, decode_compact(0x1d00_ffff).unwrap());
+        assert_eq!(level.target_spacing, 600);
+        assert!(!level.allow_min_difficulty_blocks);
+
+        // The default spec matches the hard preset; both are strictly
+        // easier than bitcoin-level.
+        let default = CustomChainSpec::default();
+        assert_eq!(default.genesis_bits, hard.genesis_bits);
+        assert!(default.pow_limit > level.pow_limit);
+    }
+
+    #[test]
     fn custom_params_mine_a_valid_genesis() {
         let spec = parse_chain_spec(&format!(
             r#"{{"name": "easycoin", "genesis_bits": "207fffff", "pow_limit": "{REGTEST_LIMIT}"}}"#
