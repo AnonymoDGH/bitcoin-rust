@@ -70,6 +70,142 @@ fn h_val(x: Option<Fr>) -> Option<Fr> {
     x.map(|x| x * x * x + x)
 }
 
+/// Enforces `poseidon(preimage) == poseidon` for a note's
+/// `(pub, value, rcm)` preimage. Mirrors [`poseidon_states`].
+fn poseidon_check(
+    cs: &ConstraintSystemRef<Fr>,
+    target: Variable,
+    preimage: Option<([u8; 33], u64, [u8; 32])>,
+) -> ark_relations::r1cs::Result<()> {
+    let limb = |b: &[u8]| Fr::from_be_bytes_mod_order(b);
+    let states = preimage.map(|(pubkey, value, rcm)| poseidon_states(&pubkey, value, &rcm));
+    // Initial state variables: pub limbs, value, rcm limbs, zero.
+    // (Explicit zero lane: Variable::Zero is not evaluable in LCs.)
+    let zero = cs.new_witness_variable(|| ok(Some(Fr::default())))?;
+    let mut state = [zero; POSEIDON_LANES];
+    let pub_limbs = preimage.map(|(pubkey, _, _)| limbs_of(&pubkey));
+    for i in 0..3 {
+        state[i] = cs.new_witness_variable(|| ok(pub_limbs.as_ref().map(|l| l[i])))?;
+    }
+    state[3] = cs.new_witness_variable(|| ok(preimage.map(|p| Fr::from(p.1))))?;
+    let rcm_limbs = preimage.map(|(_, _, rcm)| limbs_of(&rcm));
+    for i in 0..3 {
+        state[4 + i] = cs.new_witness_variable(|| ok(rcm_limbs.as_ref().map(|l| l[i])))?;
+    }
+    let _ = limb;
+    for r in 0..POSEIDON_ROUNDS {
+        // Round constants + S-box.
+        let mut sboxed = [Variable::One; POSEIDON_LANES];
+        for i in 0..POSEIDON_LANES {
+            let x = cs.new_witness_variable(|| {
+                ok(states.as_ref().map(|s| {
+                    let _ = limb;
+                    s[r][i] + round_constant(r, i)
+                }))
+            })?;
+            cs.enforce_constraint(
+                lc_var(x),
+                one_lc(),
+                LinearCombination(vec![
+                    (Fr::from(1u64), state[i]),
+                    (round_constant(r, i), Variable::One),
+                ]),
+            )?;
+            let x2 = mul(cs, x, x, states.as_ref().map(|s| {
+                let v = s[r][i] + round_constant(r, i);
+                v * v
+            }))?;
+            sboxed[i] = mul(cs, x, x2, states.as_ref().map(|s| {
+                let v = s[r][i] + round_constant(r, i);
+                v * v * v
+            }))?;
+        }
+        // Linear layer.
+        for i in 0..POSEIDON_LANES {
+            let out = cs.new_witness_variable(|| ok(states.as_ref().map(|s| s[r + 1][i])))?;
+            let mut terms = Vec::with_capacity(POSEIDON_LANES);
+            for j in 0..POSEIDON_LANES {
+                terms.push((linear_coeff(i, j), sboxed[j]));
+            }
+            cs.enforce_constraint(lc_var(out), one_lc(), LinearCombination(terms))?;
+            state[i] = out;
+        }
+    }
+    cs.enforce_constraint(lc_var(state[0]), one_lc(), lc_var(target))?;
+    Ok(())
+}
+
+/// Poseidon-like preimage hash of a note: absorb
+/// `(pub limbs, value, rcm limbs)` in an 8-lane sponge with 4
+/// full S-box rounds (`x^3`), per-lane round constants and a fixed
+/// small-coefficient linear layer. This is a domain-separated field
+/// binding over the note preimage — it is NOT the on-chain SHA-256
+/// `cmu`; the two bind the same preimage jointly (see docs).
+pub const POSEIDON_LANES: usize = 8;
+pub const POSEIDON_ROUNDS: usize = 4;
+
+/// Round constant for round `r`, lane `i` (deterministic small ints).
+fn round_constant(r: usize, i: usize) -> Fr {
+    Fr::from(((i + 1) * (r + 7) + 5) as u64)
+}
+
+/// Linear layer coefficient `M[i][j]` (small positive ints).
+fn linear_coeff(i: usize, j: usize) -> Fr {
+    Fr::from((i + j + 1) as u64)
+}
+
+/// Splits bytes into 11-byte big-endian field limbs.
+fn limbs_of(bytes: &[u8]) -> Vec<Fr> {
+    bytes
+        .chunks(11)
+        .map(Fr::from_be_bytes_mod_order)
+        .collect()
+}
+
+/// Off-circuit Poseidon-like hash of a note preimage.
+pub fn poseidon_cmu(spending_pub: &[u8; 33], value: u64, rcm: &[u8; 32]) -> Fr {
+    poseidon_states(spending_pub, value, rcm)[POSEIDON_ROUNDS][0]
+}
+
+/// All intermediate states of the Poseidon-like permutation
+/// (initial state + one per round). Used as prover hints.
+pub fn poseidon_states(
+    spending_pub: &[u8; 33],
+    value: u64,
+    rcm: &[u8; 32],
+) -> [[Fr; POSEIDON_LANES]; POSEIDON_ROUNDS + 1] {
+    let mut out = [[Fr::default(); POSEIDON_LANES]; POSEIDON_ROUNDS + 1];
+    let pub_limbs = limbs_of(spending_pub);
+    let rcm_limbs = limbs_of(rcm);
+    out[0][0] = pub_limbs[0];
+    out[0][1] = pub_limbs[1];
+    out[0][2] = pub_limbs[2];
+    out[0][3] = Fr::from(value);
+    out[0][4] = rcm_limbs[0];
+    out[0][5] = rcm_limbs[1];
+    out[0][6] = rcm_limbs[2];
+    out[0][7] = Fr::default();
+    for r in 0..POSEIDON_ROUNDS {
+        let mut state = out[r];
+        // Round constants + S-box.
+        for i in 0..POSEIDON_LANES {
+            let x = state[i] + round_constant(r, i);
+            state[i] = x * x * x;
+        }
+        // Linear layer.
+        let old = state;
+        for i in 0..POSEIDON_LANES {
+            let mut acc = Fr::default();
+            for j in 0..POSEIDON_LANES {
+                acc += linear_coeff(i, j) * old[j];
+            }
+            state[i] = acc;
+        }
+        out[r + 1] = state;
+    }
+    out
+}
+
 /// Value commitment bound to the note's `cmu` (used for `C_old`):
 /// `C = value + h(rcm) + cmu_field`, where `cmu_field` is the on-chain
 /// `cmu` read as a field element. The verifier derives it from the
@@ -97,6 +233,9 @@ pub struct ValueTranscript {
     pub cap: u64,
     /// On-chain note commitment (from the spent pool output).
     pub cmu: Fr,
+    /// Poseidon-like hash of the note preimage (from the pool script
+    /// on v3 notes; recomputed from the opening on legacy notes).
+    pub poseidon: Fr,
     /// Commitment of the spent note.
     pub c_old: Fr,
     /// Commitments of the two new notes.
@@ -108,6 +247,7 @@ pub struct ValueTranscript {
 pub struct ValueWitness {
     pub v_old: u64,
     pub rcm_old: [u8; 32],
+    pub spending_pub: [u8; 33],
     pub v_new: [u64; NEW_NOTES],
     pub rcm_new: [[u8; 32]; NEW_NOTES],
 }
@@ -137,6 +277,7 @@ impl ConstraintSynthesizer<Fr> for ValueCircuit {
         let fee = cs.new_input_variable(|| ok(t.map(|t| Fr::from(t.fee))))?;
         let cap = cs.new_input_variable(|| ok(t.map(|t| Fr::from(t.cap))))?;
         let cmu = cs.new_input_variable(|| ok(t.map(|t| t.cmu)))?;
+        let poseidon = cs.new_input_variable(|| ok(t.map(|t| t.poseidon)))?;
         let c_old = cs.new_input_variable(|| ok(t.map(|t| t.c_old)))?;
         let mut c_new = [Variable::One; NEW_NOTES];
         for i in 0..NEW_NOTES {
@@ -153,7 +294,13 @@ impl ConstraintSynthesizer<Fr> for ValueCircuit {
             rcm_new[i] =
                 cs.new_witness_variable(|| ok(w.map(|w| Fr::from_be_bytes_mod_order(&w.rcm_new[i]))))?;
         }
-        // C_old opens: c_old == v_old + h(rcm_old), h(x) = x^3 + x.
+        // Preimage binding: poseidon(pub, v_old, rcm_old) == poseidon.
+        poseidon_check(
+            &cs,
+            poseidon,
+            w.map(|w| (w.spending_pub, w.v_old, w.rcm_old)),
+        )?;
+        // C_old opens: c_old == v_old + h(rcm_old) + cmu, h(x) = x^3 + x.
         let rcm_old_val = w.map(|w| Fr::from_be_bytes_mod_order(&w.rcm_old));
         let t_old = mul(&cs, rcm_old, rcm_old, rcm_old_val.map(|x| x * x))?;
         let u_old = mul(&cs, rcm_old, t_old, rcm_old_val.map(|x| x * x * x))?;
@@ -275,6 +422,7 @@ pub fn verify(transcript: ValueTranscript, proof: &Proof<Bn254>) -> bool {
         Fr::from(transcript.fee),
         Fr::from(transcript.cap),
         transcript.cmu,
+        transcript.poseidon,
         transcript.c_old,
         transcript.c_new[0],
         transcript.c_new[1],
@@ -343,6 +491,7 @@ pub fn transcript_for_spend(
         fee,
         cap,
         cmu: Fr::from_be_bytes_mod_order(cmu),
+        poseidon: poseidon_cmu(&note.spending_pub, note.value, &note.rcm),
         c_old: value_commitment(note.value, &note.rcm, cmu),
         c_new: [
             new_commitment(outputs_total, &DUMMY_RCM),
@@ -362,10 +511,12 @@ mod tests {
         let v_new = [60_000_000u64, 39_999_000u64];
         let fee = 1_000u64;
         let cmu = [11u8; 32];
+        let spending_pub = [5u8; 33];
         let transcript = ValueTranscript {
             fee,
             cap: v_old,
             cmu: Fr::from_be_bytes_mod_order(&cmu),
+            poseidon: poseidon_cmu(&spending_pub, v_old, &rcm_old),
             c_old: value_commitment(v_old, &rcm_old, &cmu),
             c_new: [
                 new_commitment(v_new[0], &rcm_new[0]),
@@ -375,6 +526,7 @@ mod tests {
         let witness = ValueWitness {
             v_old,
             rcm_old,
+            spending_pub,
             v_new,
             rcm_new,
         };
@@ -447,6 +599,25 @@ mod tests {
     fn wrong_opening_cannot_prove() {
         let (transcript, mut witness) = transcript_and_witness();
         witness.rcm_old = [1u8; 32];
+        assert!(!is_statement_satisfiable(transcript, witness));
+    }
+
+    #[test]
+    fn poseidon_preimage_binding() {
+        let pubkey = [5u8; 33];
+        let rcm = [7u8; 32];
+        let p1 = poseidon_cmu(&pubkey, 1_000_000, &rcm);
+        // Deterministic.
+        assert_eq!(p1, poseidon_cmu(&pubkey, 1_000_000, &rcm));
+        // Any preimage change changes the binding.
+        assert_ne!(p1, poseidon_cmu(&pubkey, 1_000_001, &rcm));
+        assert_ne!(p1, poseidon_cmu(&pubkey, 1_000_000, &[8u8; 32]));
+        let mut other_pub = pubkey;
+        other_pub[0] = 6;
+        assert_ne!(p1, poseidon_cmu(&other_pub, 1_000_000, &rcm));
+        // Circuit enforces the preimage: wrong pubkey fails.
+        let (transcript, mut witness) = transcript_and_witness();
+        witness.spending_pub = [99u8; 33];
         assert!(!is_statement_satisfiable(transcript, witness));
     }
 }
