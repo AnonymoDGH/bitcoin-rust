@@ -18,7 +18,7 @@ use crate::{BlockTree, IndexId, ValidationError};
 /// First height where a BIP34 coinbase could repeat an earlier one.
 const BIP34_IMPLIES_BIP30_LIMIT: u32 = 1_983_702;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConnectOptions {
     /// Run script verification (false = assumevalid-style skip).
     pub check_scripts: bool,
@@ -26,16 +26,10 @@ pub struct ConnectOptions {
     pub script_threads: usize,
     /// Pool anchor considered fresh for note spends (chain tip root).
     pub pool_root: Option<[u8; 32]>,
-}
-
-impl Default for ConnectOptions {
-    fn default() -> Self {
-        Self {
-            check_scripts: true,
-            script_threads: 1,
-            pool_root: None,
-        }
-    }
+    /// Anti-inflation funding ledger (`cmu -> max spendable sats`)
+    /// from the chain being extended. Note spends must claim at most
+    /// their cap; `None` disables the cap check (unit tests).
+    pub pool_funding: Option<std::collections::HashMap<[u8; 32], u64>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,7 +53,7 @@ pub fn connect_block(
     id: IndexId,
     coins: &mut CoinsViewCache<'_>,
     params: &ChainParams,
-    opts: ConnectOptions,
+    mut opts: ConnectOptions,
 ) -> Result<ConnectSummary, ValidationError> {
     let index = tree.get(id);
     let height = index.height;
@@ -104,10 +98,11 @@ pub fn connect_block(
                 .iter()
                 .any(|o| crate::notes::is_pool_script(o.script_pubkey.as_bytes()));
             if has_note_input {
-                let fee_note = crate::notes::verify_note_tx_block(
+                let fee_note = crate::notes::verify_note_tx_block_with_caps(
                     tx,
                     &spent_outs,
                     opts.pool_root,
+                    opts.pool_funding.as_ref(),
                 )
                 .map_err(|_| ValidationError::BadCt)?;
                 fees += fee_note;
@@ -166,6 +161,15 @@ pub fn connect_block(
                 .map(|(i, _)| i)
                 .collect();
             crate::inputs::check_input_indices(tx, &spent_outs, flags, &plain_indices)?;
+        }
+
+        // Notes created earlier in this same block become spendable
+        // with their funding cap for later txs in the block.
+        if let Some(funding) = opts.pool_funding.as_mut() {
+            let input_values: Vec<i64> = spent_outs.iter().map(|o| o.value).collect();
+            for (cmu, cap) in crate::notes::funding_caps_for_block(tx, &input_values) {
+                funding.insert(cmu, cap);
+            }
         }
 
         update_coins(tx, coins, &mut undo, height)?;
