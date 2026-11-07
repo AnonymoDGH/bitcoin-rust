@@ -8,12 +8,14 @@ pub mod coinjoin;
 pub mod coinselection;
 pub mod crypter;
 pub mod keys;
+pub mod privpay;
 pub mod signer;
 pub mod stealth;
 pub mod wallet;
 
 pub use builder::{build_transaction, BuildError};
 pub use coinjoin::{commit_output, coinjoin_output, CoinJoinError, CoinJoinRound, Participant};
+pub use privpay::{confidential_output, sign_privately, verify_confidential, verify_privately, PrivPayError};
 pub use keys::{KeyError, KeyId, KeyStore, ScriptKind};
 pub use signer::{sign_transaction, SignError};
 pub use stealth::{StealthAddress, StealthError, StealthKeys, StealthPayment};
