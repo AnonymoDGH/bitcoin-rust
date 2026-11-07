@@ -30,6 +30,7 @@ use ark_relations::r1cs::{
     ConstraintSynthesizer, ConstraintSystem, ConstraintSystemRef, LinearCombination, SynthesisError,
     Variable,
 };
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::rngs::StdRng;
 use ark_std::rand::SeedableRng;
 
@@ -237,6 +238,51 @@ pub fn verify(transcript: ValueTranscript, proof: &Proof<Bn254>) -> bool {
     };
     Groth16::<Bn254>::verify_proof_with_prepared_inputs(&keys().pvk, proof, &prepared)
         .unwrap_or(false)
+}
+
+/// Witness proof encoding: `a (32) || b (64) || c (32)` compressed
+/// affine coordinates (x-coordinate only) — 128 bytes total.
+pub fn serialize_proof(proof: &Proof<Bn254>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
+    proof.a.serialize_compressed(&mut out).expect("G1 fits");
+    proof.b.serialize_compressed(&mut out).expect("G2 fits");
+    proof.c.serialize_compressed(&mut out).expect("G1 fits");
+    debug_assert_eq!(out.len(), 128);
+    out
+}
+
+/// Decodes a witness proof encoding. `None` on malformed bytes.
+pub fn deserialize_proof(bytes: &[u8]) -> Option<Proof<Bn254>> {
+    use ark_bn254::{G1Affine, G2Affine};
+    if bytes.len() != 128 {
+        return None;
+    }
+    let a = G1Affine::deserialize_compressed(&bytes[0..32]).ok()?;
+    let b = G2Affine::deserialize_compressed(&bytes[32..96]).ok()?;
+    let c = G1Affine::deserialize_compressed(&bytes[96..128]).ok()?;
+    Some(Proof { a, b, c })
+}
+
+/// Transcript for a pool-note spend paid to transparent outputs:
+/// the single new "note" slot carries the outputs total. Bound to the
+/// spent note via `C_old = value_commitment(value, rcm)` (the same
+/// `(value, rcm)` the `cmu` hash pins).
+pub fn transcript_for_spend(
+    note: &crate::notes::Note,
+    outputs_total: u64,
+    fee: u64,
+    cap: u64,
+) -> ValueTranscript {
+    const DUMMY_RCM: [u8; 32] = [0; 32];
+    ValueTranscript {
+        fee,
+        cap,
+        c_old: value_commitment(note.value, &note.rcm),
+        c_new: [
+            value_commitment(outputs_total, &DUMMY_RCM),
+            value_commitment(0, &DUMMY_RCM),
+        ],
+    }
 }
 
 #[cfg(test)]
