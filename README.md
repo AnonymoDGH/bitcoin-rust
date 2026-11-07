@@ -16,6 +16,14 @@ organized as a workspace of 10 crates that mirror `src/`:
 | `btc-storage` | `blk*.dat`/`rev*.dat` flat files, Core coin compression, crash-safe UTXO db |
 | `btc-rpc` | JSON-RPC HTTP server (cookie/basic auth), Core error codes |
 
+## AnonCoin (ANC)
+
+The live custom chain in this repo: spec `chains/anoncoin.json` (also the `-printchainspec` default),
+genesis message "AnonCoin genesis", P2P 18555 / RPC 18556, bech32 HRP `an`, 50 ANC per block,
+halving every 210 000 blocks, capped at 21 M ANC (20 999 949.98 spendable). Ticker **ANC** is a
+brand/exchange symbol, not a consensus field, so it lives here rather than in the chain spec.
+Freeze the spec after launch: changing `genesis_bits`, `magic` or ports afterwards orphans the chain.
+
 ## Status
 
 - Phase 1 — `btc-primitives`, `btc-consensus`: data model and consensus math, 15 unit tests pass.
