@@ -70,14 +70,14 @@ pub fn nullifier(note: &Note) -> [u8; 32] {
 
 /// Pool output script: `OP_RETURN 0x02 <cmu:32>`. A leaf in the pool tree.
 pub fn encode_pool_note(cmu: &[u8; 32]) -> Vec<u8> {
-    let mut script = vec![0x6a, 0x02];
+    let mut script = vec![0x6a, 0x4c, 32];
     script.extend_from_slice(cmu);
     script
 }
 
 /// True if `script` is a pool note output script.
 pub fn is_pool_script(script: &[u8]) -> bool {
-    script.len() == 34 && script[0] == 0x6a && script[1] == 0x02
+    script.len() == 35 && script[0] == 0x6a && script[1] == 0x4c && script[2] == 32
 }
 
 /// Extracts the commitment from a pool note output script.
@@ -85,7 +85,7 @@ pub fn decode_pool_note(script: &[u8]) -> Option<[u8; 32]> {
     if !is_pool_script(script) {
         return None;
     }
-    script[2..34].try_into().ok()
+    script[3..35].try_into().ok()
 }
 
 /// Spend authorisation: Schnorr signature (RFC6979 via secp256k1 ECDSA)
@@ -257,7 +257,6 @@ pub fn authorize_message(note: &Note, anchor: &[u8; 32], context: &[u8]) -> [u8;
 }
 
 /// Incremental Merkle tree over note commitments.
-#[derive(Clone, Debug)]
 pub struct NoteTree {
     layers: Vec<Vec<[u8; 32]>>,
     leaves: Vec<[u8; 32]>,
@@ -281,6 +280,19 @@ impl NoteTree {
 
     pub fn is_empty(&self) -> bool {
         self.leaves.is_empty()
+    }
+
+    /// Leaves in insertion order.
+    pub fn entries(&self) -> &[[u8; 32]] {
+        &self.leaves
+    }
+
+    /// Position of a commitment, if present.
+    pub fn position_of(&self, cmu: &[u8; 32]) -> Option<u32> {
+        self.leaves
+            .iter()
+            .position(|leaf| leaf == cmu)
+            .map(|i| i as u32)
     }
 
     /// Root of the tree at the current size.
