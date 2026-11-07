@@ -122,9 +122,13 @@ async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
     println!("genesis hash: {}", params.genesis_hash);
 
     let p2p_config = P2pConfig {
-        listen: config
-            .listen
-            .then(|| SocketAddr::from(([0, 0, 0, 0], config.p2p_port))),
+        listen: if config.proxy.is_some() {
+            None
+        } else {
+            config
+                .listen
+                .then(|| SocketAddr::from(([0, 0, 0, 0], config.p2p_port)))
+        },
         connect: config.connect.clone(),
         max_outbound: MAX_OUTBOUND_PEERS.min(config.max_connections),
         max_inbound: config.max_connections.saturating_sub(MAX_OUTBOUND_PEERS),
@@ -135,6 +139,9 @@ async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
         advertise: config
             .external_ip
             .map(|ip| SocketAddr::new(ip, config.p2p_port)),
+        // With a proxy there is no inbound listener and no cleartext DNS.
+        proxy: config.proxy,
+        relay_jitter: config.proxy.map_or(Duration::ZERO, |_| Duration::from_secs(2)),
         datadir: Some(config.datadir.clone()),
         // A regtest network runs on one machine, so loopback peers are normal there.
         accept_local: config.chain == ChainType::Regtest,
