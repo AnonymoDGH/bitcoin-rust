@@ -377,6 +377,11 @@ mod tests {
             0,
         );
         let mut block = Block::new(header, txdata);
+        // Witness-data blocks need the coinbase commitment, like the real
+        // block assembler does.
+        if block.txdata.iter().any(|t| t.has_witness()) {
+            crate::witness::generate_coinbase_commitment(&mut block);
+        }
         block.header.merkle_root = block_merkle_root(&block).0;
         block.header = grind(block.header);
         block
@@ -442,6 +447,79 @@ mod tests {
         let main = extend(&mut cs, genesis_hash(), 101, 0);
         cs.take_events();
         (cs, main)
+    }
+
+    #[test]
+    fn note_spend_is_accepted_to_mempool_and_mined() {
+        use crate::notes::{
+            authorize_spend, encode_note, encode_path, encode_pool_note, encode_spend_auth,
+            note_commitment, Note, NoteTree, NOTE_DEPTH,
+        };
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        use bitcoin::Witness;
+
+        let (mut cs, main) = chain_with_mature_coinbases();
+        let secp = Secp256k1::new();
+        let mut secret = [0u8; 32];
+        secret[0] = 42;
+        secret[31] = 3;
+        let pubkey = PublicKey::from_secret_key(
+            &secp,
+            &SecretKey::from_slice(&secret).unwrap(),
+        )
+        .serialize();
+        let note = Note {
+            spending_pub: pubkey,
+            value: 25_00000000,
+            rcm: [9u8; 32],
+        };
+        let cmu = note_commitment(&note);
+
+        // Block 102 appends the note output.
+        let append_tx = Tx::new(
+            1,
+            vec![TxIn::new(coinbase_outpoint(&main[0]))],
+            vec![
+                TxOut::new(subsidy(1) - FEE, op_true()),
+                TxOut::new(0, ScriptBuf::from_bytes(encode_pool_note(&cmu))),
+            ],
+            0,
+        );
+        let (tip_header, tip_height) = cs.header_of(&cs.tip_hash()).unwrap();
+        let block = mine(&tip_header, tip_height, vec![append_tx.clone()], subsidy(102), 5);
+        assert_eq!(cs.process_new_block(&block, NOW), Ok(true));
+        assert_eq!(cs.pool_len(), 1);
+        let anchor = cs.pool_root();
+        cs.take_events();
+
+        // Note spend at the mempool.
+        let note_outpoint = OutPoint {
+            txid: append_tx.txid(),
+            vout: 1,
+        };
+        let mut tree = NoteTree::new();
+        assert_eq!(tree.insert(cmu), 0);
+        assert_eq!(tree.root(), anchor);
+        let path = tree.path(0);
+        let mut tx = Tx::new(2, vec![TxIn::new(note_outpoint)], vec![TxOut::new(24_99000000 / 1000, p2wsh_true())], 0);
+        let context = crate::confidential::ct_context(&tx);
+        let sig = authorize_spend(&note, &secret, &anchor, &context).unwrap();
+        tx.vin[0].witness = Witness::from_slice(&[
+            encode_note(&note),
+            encode_spend_auth(&anchor, 0, &sig),
+            encode_path(&path),
+        ]);
+
+        let mut pool = Mempool::new(100);
+        let txid = accept_to_mempool(&cs, &mut pool, tx.clone()).expect("note spend must enter mempool");
+        assert!(pool.contains(&txid));
+
+        // Mine it and confirm it connects.
+        let (header, height) = cs.header_of(&cs.tip_hash()).unwrap();
+        let fee_note: i64 = note.value as i64 - 24_99000000 / 1000;
+        let block2 = mine(&header, height, vec![tx], subsidy(103) + fee_note, 6);
+        assert_eq!(cs.process_new_block(&block2, NOW), Ok(true));
+        let _ = NOTE_DEPTH;
     }
 
     #[test]
