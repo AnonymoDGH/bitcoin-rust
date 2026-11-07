@@ -158,6 +158,15 @@ protects the middle; the edges must be designed for too.
   `verify_note_tx_block_with_caps` (ConnectBlock + mempool) with the
   transcript reconstructed from the note opening, the tx outputs
   and the funding cap; present-but-invalid proofs are rejected.
+  **Joint binding:** the SNARK commitment is `C = v + h(rcm)` with
+  the non-linear field hash `h(x) = x^3 + x` (multiplication
+  constraints in-circuit), and the verifier derives `C_old` from the
+  spent note's own `(value, rcm)` opening — the same pair the
+  `cmu` hash pins and, on committed scripts, the Pedersen
+  commitment opens. A forged `(v', rcm')` pair cannot satisfy the
+  `cmu`, the Pedersen opening, the funding cap and `C_old`
+  simultaneously; the test
+  `commitment_is_nonlinear_and_binding` locks the non-linearity.
   Wallet generation is wired too: `create_note_spend` takes the
   on-chain funding cap, proves the spend and attaches `witness[3]`
   (RPC `spendnote` supplies the cap from the ledger). **Shielded
@@ -166,8 +175,9 @@ protects the middle; the edges must be designed for too.
   public fee + new commitments travel in `witness[4]`, the miner
   fee is the public one, and the funding ledger records the new
   note with `spent value - fee` (hidden values flow through the
-  proof, not the ledger). Prototype limits: linear stand-in
-  commitment hash (bind to `cmu`/Pedersen next).
+  proof, not the ledger). Prototype limits: the in-field hash is
+  cubic (replace with a note-hash preimage circuit, e.g. Poseidon
+  over `cmu`, for the full binding).
 - **Remaining limits (honest):** spent note values are transparent
   at spend under the active (hash-note) scheme; onion inbound P2P
   is not supported (outbound SOCKS5 only).
