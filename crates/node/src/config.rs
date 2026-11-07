@@ -52,6 +52,10 @@ pub struct NodeConfig {
     pub dns_seed: bool,
     /// Address to advertise to peers (`-externalip=<ip>`), with the p2p port.
     pub external_ip: Option<IpAddr>,
+    /// SOCKS5 proxy for outbound peers (`-proxy=<ip:port>`, e.g. Tor's
+    /// SOCKS port). When set, inbound listening is disabled and DNS seeds
+    /// are not resolved in cleartext.
+    pub proxy: Option<SocketAddr>,
     /// Connection limit (`-maxconnections=<n>`, default 125). Eight of these are outbound.
     pub max_connections: usize,
     /// Wallet file name inside the datadir (`-wallet=<name>`, default `wallet.json`).
@@ -119,6 +123,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
     let mut seed_nodes = Vec::new();
     let mut dns_seed = true;
     let mut external_ip: Option<IpAddr> = None;
+    let mut proxy: Option<SocketAddr> = None;
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
     let mut wallet = "wallet.json".to_owned();
     let mut disable_wallet = false;
@@ -160,6 +165,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
             "seednode" => seed_nodes.push(parse_value("seednode", value)?),
             "dnsseed" => dns_seed = parse_bool("dnsseed", value)?,
             "externalip" => external_ip = Some(parse_value("externalip", value)?),
+            "proxy" => proxy = Some(parse_value("proxy", value)?),
             "maxconnections" => max_connections = parse_value("maxconnections", value)?,
             "wallet" => wallet = required("wallet", value)?.to_owned(),
             "disablewallet" => disable_wallet = parse_bool("disablewallet", value)?,
@@ -268,8 +274,9 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
         connect,
         add_nodes,
         seed_nodes,
-        dns_seed,
+        dns_seed: proxy.is_none() && dns_seed,
         external_ip,
+        proxy,
         max_connections,
         wallet,
         disable_wallet,
@@ -559,6 +566,17 @@ mod tests {
             parse(&["-seednode=10.0.0.1"]),
             Err(ConfigError::InvalidValue { name: "seednode", .. })
         ));
+    }
+
+    #[test]
+    fn proxy_flag_disables_dns_seed() {
+        let config = parse(&["-proxy=127.0.0.1:9050"]).unwrap();
+        assert_eq!(
+            config.proxy,
+            Some("127.0.0.1:9050".parse::<SocketAddr>().unwrap())
+        );
+        assert!(!config.dns_seed, "cleartext DNS would bypass the proxy");
+        assert!(parse(&["-proxy=garbage"]).is_err());
     }
 
     #[test]
