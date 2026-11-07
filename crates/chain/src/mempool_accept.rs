@@ -165,7 +165,18 @@ pub fn accept_to_mempool(chainstate: &Chainstate, mempool: &mut Mempool, tx: Tx)
             let input_values: Vec<i64> = spent.iter().map(|c| c.txout.value).collect();
             let caps = crate::notes::funding_caps_for_block(&tx, &input_values);
             let locked: i64 = caps.iter().map(|(_, cap)| *cap as i64).sum();
-            (spent, fee - locked)
+            // All-CT spends and hybrid shields: fee comes from the
+            // balance-proof prefix (the ledger fee would overstate by
+            // the hidden amounts).
+            let spent_outs_peek: Vec<TxOut> = spent.iter().map(|c| c.txout.clone()).collect();
+            let ct_fee = if chainstate.params.ct_enabled
+                && crate::confidential::is_ct_tx(&tx, &spent_outs_peek)
+            {
+                Some(crate::confidential::ct_public_fee(&tx) as i64)
+            } else {
+                None
+            };
+            (spent, ct_fee.unwrap_or(fee - locked))
         }
     };
 
