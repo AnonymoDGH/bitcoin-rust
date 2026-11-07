@@ -1,0 +1,22 @@
+{
+  "name": "devcoin",
+  "magic": "aabbccdd",
+  "default_port": 18655,
+  "rpc_port": 18656,
+  "genesis_timestamp": "DevCoin genesis",
+  "genesis_output_script": "6a",
+  "genesis_time": 1767225600,
+  "genesis_bits": "207fffff",
+  "genesis_reward": 5000000000,
+  "halving_interval": 210000,
+  "target_spacing": 10,
+  "target_timespan": 20160,
+  "pow_limit": "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "allow_min_difficulty_blocks": true,
+  "no_retargeting": true,
+  "ct_enabled": true,
+  "bech32_hrp": "dc",
+  "pubkey_address_prefix": 100,
+  "script_address_prefix": 110,
+  "seeds": []
+}
