@@ -158,6 +158,32 @@ impl Node {
         Ok(txid)
     }
 
+    /// `sendtostealthaddress`: builds a stealth payment with its marker
+    /// output, accepts it to the mempool, then commits it to the wallet.
+    pub fn wallet_send_stealth(
+        &mut self,
+        address: btc_wallet::stealth::StealthAddress,
+        amount: i64,
+        fee_rate: Option<i64>,
+    ) -> Result<Txid, String> {
+        let rate = fee_rate.unwrap_or_else(|| self.wallet_fee_rate());
+        if amount <= 0 {
+            return Err("Invalid amount for send".to_string());
+        }
+        let tip = self.chainstate.height();
+        let wallet = self.wallet.as_mut().ok_or("wallet disabled")?;
+        let tx = wallet
+            .create_stealth_transaction(tip, address, amount, rate)
+            .map_err(wallet_error_message)?;
+        let txid = self
+            .submit_tx(tx.clone())
+            .map_err(|e| format!("transaction rejected: {e:?}"))?;
+        if let Some(w) = self.wallet.as_mut() {
+            w.commit_transaction(&tx).map_err(wallet_error_message)?;
+        }
+        Ok(txid)
+    }
+
     /// `ProcessNewBlock` + mempool/fee updates. Ok(true) if new.
     pub fn submit_block(&mut self, block: &Block) -> Result<bool, ValidationError> {
         let result = self.chainstate.process_new_block(block, now_secs());
