@@ -17,7 +17,7 @@ use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::hex::{DisplayHex, FromHex};
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use bitcoin::{BlockHash, NetworkKind, OutPoint, PrivateKey, PublicKey, ScriptBuf, Txid};
-use btc_primitives::{Block, Tx, TxOut};
+use btc_primitives::{Block, Tx, TxIn, TxOut};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -95,6 +95,18 @@ struct Coin {
     height: Option<u32>,
     is_coinbase: bool,
     spent_by: Option<Txid>,
+    /// Blinding of a confidential coin created by this wallet.
+    ct: Option<CtCoinInfo>,
+}
+
+/// Wallet bookkeeping for a confidential coin: the blinding is required
+/// to spend it (balance proof), and the one-time key secret to sign.
+#[derive(Clone, Debug)]
+pub struct CtCoinInfo {
+    pub value: u64,
+    pub blinding: [u8; 32],
+    pub secret: [u8; 32],
+    pub pubkey_hash: [u8; 20],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -234,6 +246,133 @@ impl Wallet {
             &derive(b"anoncoin-stealth-scan")?,
         )
         .map_err(WalletError::Stealth)
+    }
+
+    /// Imports a WIF private key. Importing a known key changes nothing.
+    pub fn record_ct_coin(
+        &mut self,
+        outpoint: OutPoint,
+        script: ScriptBuf,
+        info: CtCoinInfo,
+    ) -> Result<(), WalletError> {
+        self.check_unlocked()?;
+        let entry = self.coins.entry(outpoint).or_insert_with(|| Coin {
+            txout: TxOut::new(0, script),
+            height: None,
+            is_coinbase: false,
+            spent_by: None,
+            ct: None,
+        });
+        entry.ct = Some(info);
+        self.save()
+    }
+
+    /// Builds a hybrid shielding spend: a mature plaintext wallet coin is
+    /// spent into a confidential output owned by a fresh wallet key.
+    /// Returns the built+sign transaction and the blinding/key that spend
+    /// it (record the latter with `record_ct_coin` after broadcast).
+    pub fn create_hybrid_ct(
+        &mut self,
+        tip_height: u32,
+        amount: u64,
+        fee: i64,
+    ) -> Result<(Tx, CtCoinInfo, OutPoint), WalletError> {
+        self.check_unlocked()?;
+        if amount == 0 {
+            return Err(WalletError::Build("CT amount must be positive".into()));
+        }
+        let required = amount as i64 + fee;
+        let mut candidates: Vec<(OutPoint, TxOut)> = self
+            .coins
+            .iter()
+            .filter(|(op, coin)| {
+                coin.ct.is_none()
+                    && self.is_spendable(op, coin, tip_height)
+                    // Hybrid inputs must be P2PKH: the ECDSA signature goes
+                    // in scriptSig so the witness stays free for the CT
+                    // balance proof trailer.
+                    && matches!(
+                        self.keys.is_mine(&coin.txout.script_pubkey),
+                        Some((_, ScriptKind::P2pkh))
+                    )
+            })
+            .map(|(op, coin)| (*op, coin.txout.clone()))
+            .filter(|(_, txout)| txout.value >= required)
+            .collect();
+        candidates.sort_by_key(|(_, txout)| txout.value);
+        let (spend_outpoint, spent) =
+            candidates.into_iter().next().ok_or(WalletError::InsufficientFunds {
+                required,
+                available: self.balance(tip_height, 0),
+            })?;
+
+        // Fresh owner key for the CT output.
+        let owner_script = self.new_script(ScriptKind::P2wpkh)?;
+        let (owner_id, _) = self
+            .script_index
+            .get(&owner_script)
+            .cloned()
+            .ok_or(WalletError::NotMine)?;
+        let owner_key = self
+            .keys
+            .private_key(&owner_id)
+            .ok_or(WalletError::Locked)?;
+        let owner_secret = owner_key.inner.secret_bytes();
+        let pubkey_hash: [u8; 20] = bitcoin::PubkeyHash::from(owner_id.clone()).to_byte_array();
+        let mut r_out = [0u8; 32];
+        getrandom::getrandom(&mut r_out)
+            .map_err(|_| WalletError::Build("ct output blinding failed".into()))?;
+        let ct = btc_chain::confidential::create_commitment(amount, r_out)
+            .map_err(|_| WalletError::Build("ct commitment failed".into()))?;
+        let out_data = btc_chain::confidential::CtOutputData {
+            commitment: ct.commitment,
+            pubkey_hash,
+            proof: ct.proof,
+        };
+        let ct_script = btc_chain::confidential::encode_ct_script(&out_data)
+            .map_err(|_| WalletError::Build("ct script failed".into()))?;
+
+        let mut r_in = [0u8; 32];
+        getrandom::getrandom(&mut r_in)
+            .map_err(|_| WalletError::Build("ct input blinding failed".into()))?;
+        let ct_fee = spent.value - amount as i64;
+        let mut vout = vec![TxOut::new(0, ct_script)];
+        // Shielding marker: OP_RETURN PUSHDATA2(0x51 | r_in | balance).
+        // The balance bytes are zero-filled first; `ct_context` zeroes
+        // them too, so the proof computed over the placeholder still
+        // verifies once the real proof is embedded.
+        let marker = btc_chain::confidential::encode_shield_marker(&r_in, &[0u8; 73]);
+        vout.push(TxOut::new(0, ScriptBuf::from_bytes(marker)));
+
+        let input = TxIn::new(spend_outpoint);
+        let mut tx = Tx::new(2, vec![input], vout, 0);
+        let context = btc_chain::confidential::ct_context(&tx);
+        let (proof, _) =
+            btc_chain::confidential::create_balance_proof(&[r_in], &[r_out], 0, &context)
+                .map_err(|_| WalletError::Build("ct balance failed".into()))?;
+        let balance_bytes = btc_chain::confidential::with_fee(
+            btc_chain::confidential::serialize_balance_proof(&proof),
+            ct_fee as u64,
+        );
+        tx.vout[1] = TxOut::new(
+            0,
+            ScriptBuf::from_bytes(btc_chain::confidential::encode_shield_marker(
+                &r_in,
+                &balance_bytes,
+            )),
+        );
+        // Sign the plaintext input (legacy P2PKH: signature in scriptSig,
+        // witness stays empty so consensus lets the input through).
+        crate::signer::sign_transaction(&mut tx, &[spent.clone()], &self.keys)
+            .map_err(|e| WalletError::Build(e.to_string()))?;
+        let info = CtCoinInfo {
+            value: amount,
+            blinding: r_out,
+            secret: owner_secret,
+            pubkey_hash,
+        };
+        let txid = tx.txid();
+        Ok((tx, info, OutPoint::new(txid, 0)))
     }
 
     /// Imports a WIF private key. Importing a known key changes nothing.
@@ -555,7 +694,20 @@ impl Wallet {
 
         let mut received = 0i64;
         for (n, out) in tx.vout.iter().enumerate() {
-            if !self.script_index.contains_key(&out.script_pubkey) {
+            // Confidential outputs are adopted when their embedded
+            // pubkey_hash belongs to one of our keys (the fresh key the
+            // output was committed to). The amount is hidden: value stays
+            // 0 in the ledger until the owner re-derives it locally.
+            let ct_ours = btc_chain::confidential::decode_ct_script(
+                out.script_pubkey.as_bytes(),
+            )
+            .map(|data| {
+                self.keys
+                    .key_ids()
+                    .any(|id| id.to_byte_array() == data.pubkey_hash)
+            })
+            .unwrap_or(false);
+            if !self.script_index.contains_key(&out.script_pubkey) && !ct_ours {
                 continue;
             }
             received += out.value;
@@ -567,6 +719,10 @@ impl Wallet {
                     height: None,
                     is_coinbase,
                     spent_by: None,
+                    // Blinding is known only to the wallet that created the
+                    // output (recorded via `record_ct_coin`); blindings of
+                    // incoming CT outputs are not recoverable here.
+                    ct: None,
                 });
             coin.height = conf.height;
         }
@@ -896,6 +1052,12 @@ impl Wallet {
                     height: coin.height,
                     is_coinbase: coin.is_coinbase,
                     spent_by: coin.spent_by.map(|t| t.to_string()),
+                    ct: coin.ct.as_ref().map(|info| CtFile {
+                        value: info.value,
+                        blinding: info.blinding.to_lower_hex_string(),
+                        secret: info.secret.to_lower_hex_string(),
+                        pubkey_hash: info.pubkey_hash.to_lower_hex_string(),
+                    }),
                 })
                 .collect(),
             transactions: self
@@ -997,6 +1159,17 @@ impl Wallet {
 
         for cf in file.coins {
             let outpoint = OutPoint::new(parse_txid(&cf.txid)?, cf.vout);
+            let ct = cf
+                .ct
+                .map(|entry| -> Result<CtCoinInfo, WalletError> {
+                    Ok(CtCoinInfo {
+                        value: entry.value,
+                        blinding: fixed::<32>(&hex_bytes(&entry.blinding)?)?,
+                        secret: fixed::<32>(&hex_bytes(&entry.secret)?)?,
+                        pubkey_hash: fixed::<20>(&hex_bytes(&entry.pubkey_hash)?)?,
+                    })
+                })
+                .transpose()?;
             let coin = Coin {
                 txout: TxOut::new(
                     cf.value,
@@ -1005,6 +1178,7 @@ impl Wallet {
                 height: cf.height,
                 is_coinbase: cf.is_coinbase,
                 spent_by: cf.spent_by.as_deref().map(parse_txid).transpose()?,
+                ct,
             };
             wallet.coins.insert(outpoint, coin);
         }
@@ -1091,6 +1265,16 @@ struct CoinFile {
     height: Option<u32>,
     is_coinbase: bool,
     spent_by: Option<String>,
+    #[serde(default)]
+    ct: Option<CtFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CtFile {
+    value: u64,
+    blinding: String,
+    secret: String,
+    pubkey_hash: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1281,6 +1465,39 @@ mod tests {
         assert_eq!(wallet.best_block(), best);
         assert_eq!(wallet.transactions().len(), 1);
         assert_eq!(wallet.transactions()[0].category, Category::Generate);
+    }
+
+    #[test]
+    fn hybrid_ct_creation_is_chain_verifiable() {
+        let file = TestFile::new("ct-hybrid");
+        let mut wallet = Wallet::create(&file.0).unwrap();
+        let script = wallet.new_script(ScriptKind::P2pkh).unwrap();
+        connect(&mut wallet, 1, vec![coinbase(1, script.clone())]);
+        fill(&mut wallet, 2, 101);
+
+        let (tx, info, outpoint) = wallet.create_hybrid_ct(101, 40_00000000, 10_000).unwrap();
+        wallet.record_ct_coin(outpoint, tx.vout[0].script_pubkey.clone(), info.clone()).unwrap();
+        drop(wallet);
+
+        // The blinding survives a save/reopen.
+        let wallet = Wallet::open(&file.0).unwrap();
+        let coin = wallet.coins.get(&outpoint).expect("ct coin recorded");
+        assert_eq!(coin.ct.as_ref().unwrap().blinding, info.blinding);
+        assert_eq!(coin.ct.as_ref().unwrap().value, info.value);
+        drop(wallet);
+
+        // And the produced tx is acceptable to chain CT verification.
+        let spent = [TxOut::new(SUBSIDY, script)];
+        let check = |tx: &Tx, spent: &[TxOut], indices: &[usize]| {
+            btc_chain::inputs::check_input_indices(
+                tx,
+                spent,
+                btc_script::ScriptVerifyFlags::P2SH | btc_script::ScriptVerifyFlags::WITNESS,
+                indices,
+            )
+        };
+        btc_chain::confidential::verify_ct_tx_block(&tx, &spent, &check)
+            .expect("hybrid CT tx must verify at chain level");
     }
 
     #[test]
