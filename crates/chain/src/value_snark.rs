@@ -70,8 +70,21 @@ fn h_val(x: Option<Fr>) -> Option<Fr> {
     x.map(|x| x * x * x + x)
 }
 
-/// Value commitment: `C = value + h(rcm)`, `rcm` read big-endian.
-pub fn value_commitment(value: u64, rcm: &[u8; 32]) -> Fr {
+/// Value commitment bound to the note's `cmu` (used for `C_old`):
+/// `C = value + h(rcm) + cmu_field`, where `cmu_field` is the on-chain
+/// `cmu` read as a field element. The verifier derives it from the
+/// spent pool output, so a proof for a different note (different
+/// `cmu`) cannot verify — the SNARK is bound to the funded note by
+/// construction, on top of the `cmu` hash and Pedersen bindings.
+/// Hiding comes from the secret `rcm`.
+pub fn value_commitment(value: u64, rcm: &[u8; 32], cmu: &[u8; 32]) -> Fr {
+    Fr::from(value)
+        + hash_field(Fr::from_be_bytes_mod_order(rcm))
+        + Fr::from_be_bytes_mod_order(cmu)
+}
+
+/// Unbound value commitment (used for new-note slots `C_new`).
+pub fn new_commitment(value: u64, rcm: &[u8; 32]) -> Fr {
     Fr::from(value) + hash_field(Fr::from_be_bytes_mod_order(rcm))
 }
 
@@ -82,6 +95,8 @@ pub struct ValueTranscript {
     pub fee: u64,
     /// Funding cap of the spent note (sats, public from the ledger).
     pub cap: u64,
+    /// On-chain note commitment (from the spent pool output).
+    pub cmu: Fr,
     /// Commitment of the spent note.
     pub c_old: Fr,
     /// Commitments of the two new notes.
@@ -121,6 +136,7 @@ impl ConstraintSynthesizer<Fr> for ValueCircuit {
         // Public inputs, in verification order.
         let fee = cs.new_input_variable(|| ok(t.map(|t| Fr::from(t.fee))))?;
         let cap = cs.new_input_variable(|| ok(t.map(|t| Fr::from(t.cap))))?;
+        let cmu = cs.new_input_variable(|| ok(t.map(|t| t.cmu)))?;
         let c_old = cs.new_input_variable(|| ok(t.map(|t| t.c_old)))?;
         let mut c_new = [Variable::One; NEW_NOTES];
         for i in 0..NEW_NOTES {
@@ -146,7 +162,7 @@ impl ConstraintSynthesizer<Fr> for ValueCircuit {
         cs.enforce_constraint(
             lc_var(c_old),
             one_lc(),
-            lc_var(v_old) + lc_var(h_old),
+            lc_var(v_old) + lc_var(h_old) + lc_var(cmu),
         )?;
         // Every new commitment opens; values decompose.
         let mut allocated = LinearCombination::<Fr>::default();
@@ -258,6 +274,7 @@ pub fn verify(transcript: ValueTranscript, proof: &Proof<Bn254>) -> bool {
     let public = [
         Fr::from(transcript.fee),
         Fr::from(transcript.cap),
+        transcript.cmu,
         transcript.c_old,
         transcript.c_new[0],
         transcript.c_new[1],
@@ -276,6 +293,11 @@ pub fn field_to_bytes(f: &Fr) -> [u8; 32] {
     f.serialize_compressed(&mut out.as_mut_slice())
         .expect("field element fits");
     out
+}
+
+/// The `cmu` as a field element (public input).
+pub fn cmu_field(cmu: &[u8; 32]) -> Fr {
+    Fr::from_be_bytes_mod_order(cmu)
 }
 
 /// Decodes a field element from canonical compressed form.
@@ -307,11 +329,11 @@ pub fn deserialize_proof(bytes: &[u8]) -> Option<Proof<Bn254>> {
 }
 
 /// Transcript for a pool-note spend paid to transparent outputs:
-/// the single new "note" slot carries the outputs total. Bound to the
-/// spent note via `C_old = value_commitment(value, rcm)` (the same
-/// `(value, rcm)` the `cmu` hash pins).
+/// the single new "note" slot carries the outputs total. `C_old`
+/// binds the spent note's `cmu` plus `(value, rcm)`.
 pub fn transcript_for_spend(
     note: &crate::notes::Note,
+    cmu: &[u8; 32],
     outputs_total: u64,
     fee: u64,
     cap: u64,
@@ -320,10 +342,11 @@ pub fn transcript_for_spend(
     ValueTranscript {
         fee,
         cap,
-        c_old: value_commitment(note.value, &note.rcm),
+        cmu: Fr::from_be_bytes_mod_order(cmu),
+        c_old: value_commitment(note.value, &note.rcm, cmu),
         c_new: [
-            value_commitment(outputs_total, &DUMMY_RCM),
-            value_commitment(0, &DUMMY_RCM),
+            new_commitment(outputs_total, &DUMMY_RCM),
+            new_commitment(0, &DUMMY_RCM),
         ],
     }
 }
@@ -338,13 +361,15 @@ mod tests {
         let v_old = 100_000_000u64;
         let v_new = [60_000_000u64, 39_999_000u64];
         let fee = 1_000u64;
+        let cmu = [11u8; 32];
         let transcript = ValueTranscript {
             fee,
             cap: v_old,
-            c_old: value_commitment(v_old, &rcm_old),
+            cmu: Fr::from_be_bytes_mod_order(&cmu),
+            c_old: value_commitment(v_old, &rcm_old, &cmu),
             c_new: [
-                value_commitment(v_new[0], &rcm_new[0]),
-                value_commitment(v_new[1], &rcm_new[1]),
+                new_commitment(v_new[0], &rcm_new[0]),
+                new_commitment(v_new[1], &rcm_new[1]),
             ],
         };
         let witness = ValueWitness {
@@ -378,8 +403,18 @@ mod tests {
         let (mut transcript, mut witness) = transcript_and_witness();
         // Claim the new notes are worth more than v_old covers.
         witness.v_new[0] += 50_000_000;
-        transcript.c_new[0] = value_commitment(witness.v_new[0], &witness.rcm_new[0]);
+        transcript.c_new[0] = new_commitment(witness.v_new[0], &witness.rcm_new[0]);
         assert!(!is_statement_satisfiable(transcript, witness));
+    }
+
+    #[test]
+    fn foreign_cmu_rejected() {
+        let (transcript, witness) = transcript_and_witness();
+        let proof = prove(transcript, witness).expect("valid witness proves");
+        // A proof for a different note commitment must not verify.
+        let mut bad = transcript;
+        bad.cmu = Fr::from_be_bytes_mod_order(&[99u8; 32]);
+        assert!(!verify(bad, &proof));
     }
 
     #[test]
@@ -393,16 +428,19 @@ mod tests {
     #[test]
     fn commitment_is_nonlinear_and_binding() {
         let rcm = [7u8; 32];
-        let c = value_commitment(1_000_000, &rcm);
+        let cmu = [11u8; 32];
+        let c = value_commitment(1_000_000, &rcm, &cmu);
         // Not an affine commitment: C != value + rcm.
         let linear = Fr::from(1_000_000u64) + Fr::from_be_bytes_mod_order(&rcm);
         assert_ne!(c, linear);
         // A different opening for the same C cannot exist with the
         // same value: shifting rcm changes C.
-        let c2 = value_commitment(1_000_003, &rcm);
+        let c2 = value_commitment(1_000_003, &rcm, &cmu);
         assert_ne!(c, c2);
         let rcm2 = [8u8; 32];
-        assert_ne!(c, value_commitment(1_000_000, &rcm2));
+        assert_ne!(c, value_commitment(1_000_000, &rcm2, &cmu));
+        // A different note commitment changes C.
+        assert_ne!(c, value_commitment(1_000_000, &rcm, &[12u8; 32]));
     }
 
     #[test]
