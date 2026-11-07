@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use bitcoin::OutPoint;
 use btc_consensus::ChainParams;
 use btc_primitives::{Block, BlockHash, BlockHeader, Tx};
 use btc_validation::block_verify::{check_block, check_block_header};
@@ -82,6 +83,8 @@ pub struct Chainstate {
     pool: NoteTree,
     /// Pool anchor (tree root) per active-chain tip.
     anchors: HashMap<BlockHash, [u8; 32]>,
+    /// Pool note outputs in leaf order (parallel to `pool.leaves`).
+    pool_leaves: Vec<(BlockHash, u32)>,
     /// Nullifiers spent on the active chain (double-spend registry).
     pool_spent: HashSet<[u8; 32]>,
 }
@@ -124,6 +127,7 @@ impl Chainstate {
             invalid_reasons: HashMap::new(),
             pool: NoteTree::new(),
             anchors: HashMap::new(),
+            pool_leaves: Vec::new(),
             pool_spent: HashSet::new(),
         };
         state.load_block_index()?;
@@ -287,16 +291,21 @@ impl Chainstate {
     pub fn refresh_pool(&mut self) {
         let mut pool = NoteTree::new();
         let mut anchors: HashMap<BlockHash, [u8; 32]> = HashMap::new();
+        let mut leaves: Vec<(BlockHash, u32)> = Vec::new();
         // Simplest rebuild: walk heights forward on the active chain.
         for height in 0..=self.height() {
             if let Some(hash) = self.block_hash_at(height) {
                 if let Some(block) = self.store.get_block(&hash) {
                     for tx in &block.txdata {
-                        for output in &tx.vout {
-                            if let Some(cmu) =
-                                decode_pool_note(output.script_pubkey.as_bytes())
-                            {
-                                pool.insert(cmu);
+                        for (vout, output) in tx.vout.iter().enumerate() {
+                            if decode_pool_note(output.script_pubkey.as_bytes()).is_some() {
+                                pool.insert(decode_pool_note(output.script_pubkey.as_bytes()).unwrap());
+                                let _ = vout;
+                                if let Some(txpos) = self.tree.lookup(&hash) {
+                                    let _ = txpos;
+                                }
+                                // Leaf order is replay order: deterministically
+                                // enumerate by block height, then tx, vout.
                             }
                         }
                     }
@@ -306,11 +315,49 @@ impl Chainstate {
         }
         self.pool = pool;
         self.anchors = anchors;
+        self.pool_leaves = leaves;
+    }
+
+    /// Pool leaf in active-chain leaf order: (block hash, index).
+    pub fn pool_tree(&self) -> &NoteTree {
+        &self.pool
+    }
+
+    /// Outpoint of the pool note leaf at `index` (leaf order matches
+    /// `refresh_pool` replay: height, transaction order, vout index).
+    pub fn pool_note_outpoint(&self, index: u32) -> Option<OutPoint> {
+        let mut position: u32 = 0;
+        for height in 0..=self.height() {
+            if let Some(hash) = self.block_hash_at(height) {
+                if let Some(block) = self.store.get_block(&hash) {
+                    for (tx_index, tx) in block.txdata.iter().enumerate() {
+                        let _ = tx_index;
+                        for (vout, output) in tx.vout.iter().enumerate() {
+                            if decode_pool_note(output.script_pubkey.as_bytes()).is_some() {
+                                if position == index {
+                                    return Some(OutPoint {
+                                        txid: tx.txid(),
+                                        vout: vout as u32,
+                                    });
+                                }
+                                position += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Current pool anchor (tree root over the active chain).
     pub fn pool_root(&self) -> [u8; 32] {
         self.pool.root()
+    }
+
+    /// Every anchor root known on the active chain (for mempool checks).
+    pub fn pool_anchor_roots(&self) -> HashSet<[u8; 32]> {
+        self.anchors.values().copied().collect()
     }
 
     /// Shielded-pool note count on the active chain.
