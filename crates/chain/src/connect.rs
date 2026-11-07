@@ -24,11 +24,17 @@ pub struct ConnectOptions {
     pub check_scripts: bool,
     /// Worker threads for script checks (<=1 = serial).
     pub script_threads: usize,
+    /// Pool anchor considered fresh for note spends (chain tip root).
+    pub pool_root: Option<[u8; 32]>,
 }
 
 impl Default for ConnectOptions {
     fn default() -> Self {
-        Self { check_scripts: true, script_threads: 1 }
+        Self {
+            check_scripts: true,
+            script_threads: 1,
+            pool_root: None,
+        }
     }
 }
 
@@ -85,18 +91,36 @@ pub fn connect_block(
         let is_coinbase = tx.is_coin_base();
         let mut spent_outs: Vec<TxOut> = Vec::new();
         if !is_coinbase {
-            let fee = check_tx_inputs(tx, coins, height)?;
-            fees += fee;
-            if !(0..=MAX_MONEY).contains(&fees) {
-                return Err(ValidationError::AccumulatedFeeOutOfRange);
-            }
-
+            // Fetch the inputs first so note spends (ledger replaced by
+            // note values) and plain spends share the same structure.
             let spent: Vec<Coin> = tx
                 .vin
                 .iter()
                 .map(|input| coins.get_coin(&input.prevout).ok_or(TxCheckError::MissingInputs))
                 .collect::<Result<_, _>>()?;
             spent_outs = spent.iter().map(|coin| coin.txout.clone()).collect();
+
+            let has_note_input = spent_outs
+                .iter()
+                .any(|o| crate::notes::is_pool_script(o.script_pubkey.as_bytes()));
+            if has_note_input {
+                let fee_note = crate::notes::verify_note_tx_block(
+                    tx,
+                    &spent_outs,
+                    opts.pool_root,
+                )
+                .map_err(|_| ValidationError::BadCt)?;
+                fees += fee_note;
+                if !(0..=MAX_MONEY).contains(&fees) {
+                    return Err(ValidationError::AccumulatedFeeOutOfRange);
+                }
+            } else {
+                let fee = check_tx_inputs(tx, coins, height)?;
+                fees += fee;
+                if !(0..=MAX_MONEY).contains(&fees) {
+                    return Err(ValidationError::AccumulatedFeeOutOfRange);
+                }
+            }
 
             if enforce_bip68 {
                 let mut prev_heights: Vec<i32> = spent.iter().map(|coin| coin.height as i32).collect();
@@ -135,7 +159,13 @@ pub fn connect_block(
         }
 
         if !is_coinbase && opts.check_scripts && !is_ct {
-            check_input_scripts_parallel(tx, &spent_outs, flags, opts.script_threads)?;
+            let plain_indices: Vec<usize> = spent_outs
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| !crate::notes::is_pool_script(o.script_pubkey.as_bytes()))
+                .map(|(i, _)| i)
+                .collect();
+            crate::inputs::check_input_indices(tx, &spent_outs, flags, &plain_indices)?;
         }
 
         update_coins(tx, coins, &mut undo, height)?;
@@ -477,9 +507,77 @@ mod tests {
         assert!(connect(&mut f.base, &f.tree, &f.params, id, &block).is_ok());
     }
 
+    #[test]
+    fn note_spend_connects() {
+        use crate::notes::{
+            authorize_spend, decode_pool_note, encode_note, encode_path, encode_pool_note,
+            encode_spend_auth, Note, NoteTree, NOTE_DEPTH,
+        };
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        use bitcoin::Witness;
+
+        let mut f = Fixture::new(100);
+        let secp = Secp256k1::new();
+        let mut secret = [0u8; 32];
+        secret[0] = 42;
+        secret[31] = 3;
+        let pubkey = PublicKey::from_secret_key(
+            &secp,
+            &SecretKey::from_slice(&secret).unwrap(),
+        )
+        .serialize();
+        let note = Note {
+            spending_pub: pubkey,
+            value: 25_00000000,
+            rcm: [9u8; 32],
+        };
+        let cmu = crate::notes::note_commitment(&note);
+        let pool_script = encode_pool_note(&cmu);
+        assert_eq!(decode_pool_note(&pool_script), Some(cmu));
+
+        let mut tree = NoteTree::new();
+        assert_eq!(tree.insert(cmu), 0);
+        let root = tree.root();
+
+        // Block 1 spends a mature coinbase and appends the note output.
+        let pool_outpoint_input = f.first_outpoint();
+        let append_input = TxIn::new(pool_outpoint_input);
+        let append_tx = Tx::new(2, vec![append_input], vec![TxOut::new(f.subsidy(101) - FEE, op_true()), TxOut::new(0, ScriptBuf::from_bytes(pool_script.clone()))], 0);
+        let height1 = f.tree.get(f.tip).height + 1;
+        let cb1 = coinbase_tx(height1, f.params.block_subsidy(height1));
+        let (id1, block1) = next_block(&mut f.tree, f.tip, vec![cb1, append_tx.clone()], height1);
+        connect(&mut f.base, &f.tree, &f.params, id1, &block1).unwrap();
+        assert!(f.base.get_coin(&pool_outpoint_input).is_none());
+        let note_outpoint = OutPoint {
+            txid: append_tx.txid(),
+            vout: 1,
+        };
+
+        // Block 2 spends the note.
+        let anchor = root;
+        let path = tree.path(0);
+        let mut tx = Tx::new(2, vec![TxIn::new(note_outpoint)], vec![TxOut::new(24_99000000 / 1000, op_true())], 0);
+        let context = crate::confidential::ct_context(&tx);
+        let sig = authorize_spend(&note, &secret, &anchor, &context).unwrap();
+        tx.vin[0].witness = Witness::from_slice(&[
+            encode_note(&note),
+            encode_spend_auth(&anchor, 0, &sig),
+            encode_path(&path),
+        ]);
+
+        let height = f.tree.get(f.tip).height + 1;
+        let fee_note: i64 = note.value as i64 - 24_99000000 / 1000;
+        let cb = coinbase_tx(height, f.params.block_subsidy(height) + fee_note);
+        let (id, block) = next_block(&mut f.tree, f.tip, vec![cb, tx], 1000);
+        let mut opts = ConnectOptions::default();
+        opts.pool_root = Some(root);
+        match connect_block(&block, &f.tree, id, &mut CoinsViewCache::new(&mut f.base), &f.params, opts) {
+            Ok(_) => {}
+            Err(e) => panic!("note block rejected: {e:?}"),
+        }
+    }
+
     /// Builds a confidential 1-in-1-out transaction spending `prevout`.
-    /// The caller supplies the ring (own key at `signer`) and blindings;
-    /// `tamper` flips the balance proof to forge a failure.
     fn ct_tx(
         prevout: OutPoint,
         ring: &[[u8; 33]],
