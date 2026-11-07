@@ -69,8 +69,18 @@ impl fmt::Display for CoinsError {
 impl std::error::Error for CoinsError {}
 
 /// True if a scriptPubKey can never be spent (Core `CScript::IsUnspendable`).
+/// Confidential outputs (`OP_RETURN 0x01 ...`, see
+/// `btc_consensus::CT_SCRIPT_VERSION`) are spendable by ring signatures,
+/// so they are not unspendable even though they start with OP_RETURN.
 pub fn is_unspendable(script_pubkey: &Script) -> bool {
-    script_pubkey.len() > MAX_SCRIPT_SIZE || script_pubkey.as_bytes().first() == Some(&OP_RETURN)
+    if script_pubkey.len() > MAX_SCRIPT_SIZE {
+        return true;
+    }
+    let bytes = script_pubkey.as_bytes();
+    if bytes.first() != Some(&OP_RETURN) {
+        return false;
+    }
+    !matches!(bytes.get(1), Some(&btc_consensus::CT_SCRIPT_VERSION))
 }
 
 /// In-memory UTXO set backed by a `HashMap`.
@@ -326,14 +336,17 @@ mod tests {
         let mut base = CoinsViewMemory::new();
         let mut cache = CoinsViewCache::new(&mut base);
 
-        // OP_RETURN outputs are skipped and never become visible.
+        // OP_RETURN outputs are skipped and never become visible (except
+        // CT scripts `OP_RETURN 0x01 ...`, which are spendable).
         let op_return = Coin {
-            txout: TxOut::new(0, ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x00])),
+            txout: TxOut::new(0, ScriptBuf::from_bytes(vec![0x6a, 0x02, 0x00])),
             height: 1,
             is_coinbase: false,
         };
         cache.add_coin(op(0), op_return, false).unwrap();
         assert!(!cache.have_coin(&op(0)));
+        // CT script prefix: spendable ring-signature output.
+        assert!(!is_unspendable(&ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x00])));
 
         // Oversized scripts are unspendable; a script of exactly MAX_SCRIPT_SIZE is not.
         assert!(is_unspendable(&ScriptBuf::from_bytes(vec![0x51; MAX_SCRIPT_SIZE + 1])));
