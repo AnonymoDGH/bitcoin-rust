@@ -520,6 +520,19 @@ impl WalletRpc for NodeRpc {
         self.with_node(|n| n.wallet_send_ct(amount.max(0) as u64, fee))
     }
 
+    fn create_pool_note(&self, amount: i64, fee: i64) -> Result<String, String> {
+        self.with_node(|n| n.wallet_create_pool_note(amount.max(0) as u64, fee))
+    }
+
+    fn spend_note(&self, cmu_hex: String, amount: i64) -> Result<Txid, String> {
+        use bitcoin::hex::FromHex;
+        let bytes: [u8; 32] = Vec::<u8>::from_hex(&cmu_hex)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or("Invalid note commitment: expected 32 bytes as hex".to_string())?;
+        self.with_node(|n| n.wallet_spend_note(bytes, amount))
+    }
+
     fn dump_privkey(&self, script: &ScriptBuf) -> Result<String, String> {
         self.with_wallet(|w, _| w.dump_wif(script).map_err(wallet_error_message))
             .unwrap_or_else(|| Err("wallet disabled".into()))

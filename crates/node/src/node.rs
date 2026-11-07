@@ -204,6 +204,88 @@ impl Node {
         Ok(txid)
     }
 
+    /// `createpoolnote`: shields plaintext into a pool note.
+    pub fn wallet_create_pool_note(&mut self, amount: u64, fee: i64) -> Result<String, String> {
+        if amount == 0 {
+            return Err("Invalid amount for send".to_string());
+        }
+        let tip = self.chainstate.height();
+        let wallet = self.wallet.as_mut().ok_or("wallet disabled")?;
+        let (tx, info, outpoint) = wallet
+            .create_pool_note(tip, amount, fee)
+            .map_err(wallet_error_message)?;
+        let cmu_hex = bitcoin::hex::DisplayHex::to_lower_hex_string(&btc_chain::notes::note_commitment(&btc_chain::notes::Note {
+            spending_pub: {
+                let secp = bitcoin::secp256k1::Secp256k1::new();
+                let secret = info.secret;
+                bitcoin::secp256k1::PublicKey::from_secret_key(
+                    &secp,
+                    &bitcoin::secp256k1::SecretKey::from_slice(&secret)
+                        .map_err(|_| "note secret invalid".to_string())?,
+                )
+                .serialize()
+            },
+            value: amount,
+            rcm: info.rcm,
+        }));
+        let txid = self.submit_tx(tx.clone()).map_err(|e| format!("transaction rejected: {e:?}"))?;
+        if let Some(w) = self.wallet.as_mut() {
+            w.commit_transaction(&tx).map_err(wallet_error_message)?;
+            w.record_note_coin(outpoint, tx.vout[0].script_pubkey.clone(), info)
+                .map_err(wallet_error_message)?;
+        }
+        let _ = txid;
+        Ok(cmu_hex)
+    }
+
+    /// `spendnote`: spends a shielded note by its commitment hex.
+    pub fn wallet_spend_note(&mut self, cmu: [u8; 32], amount: i64) -> Result<Txid, String> {
+        use btc_chain::notes::{note_commitment, Note};
+        let wallet = self.wallet.as_mut().ok_or("wallet disabled")?;
+        // Find the pool position + outpoint.
+        let position = self
+            .chainstate
+            .pool_tree()
+            .position_of(&cmu)
+            .ok_or("note commitment unknown to the chain".to_string())?;
+        let outpoint = self
+            .chainstate
+            .pool_note_outpoint(position)
+            .ok_or("note outpoint not found".to_string())?;
+        let Some(record) = wallet
+            .coins_snapshot()
+            .get(&outpoint)
+            .and_then(|coin| coin.note.clone())
+        else {
+            return Err("note not held by this wallet".to_string());
+        };
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let note = Note {
+            spending_pub: bitcoin::secp256k1::PublicKey::from_secret_key(
+                &secp,
+                &bitcoin::secp256k1::SecretKey::from_slice(&record.secret)
+                    .map_err(|_| "note secret invalid".to_string())?,
+            )
+            .serialize(),
+            value: record.value,
+            rcm: record.rcm,
+        };
+        debug_assert_eq!(note_commitment(&note), cmu);
+        let anchor = self.chainstate.pool_root();
+        let path = self.chainstate.pool_tree().path(position);
+        let recipient = wallet
+            .new_script(btc_wallet::ScriptKind::P2wpkh)
+            .map_err(wallet_error_message)?;
+        let tx = wallet
+            .create_note_spend(outpoint, note.clone(), &record.secret, anchor, position, path, recipient, amount)
+            .map_err(wallet_error_message)?;
+        let txid = self.submit_tx(tx.clone()).map_err(|e| format!("transaction rejected: {e:?}"))?;
+        if let Some(w) = self.wallet.as_mut() {
+            w.commit_transaction(&tx).map_err(wallet_error_message)?;
+        }
+        Ok(txid)
+    }
+
     /// `ProcessNewBlock` + mempool/fee updates. Ok(true) if new.
     pub fn submit_block(&mut self, block: &Block) -> Result<bool, ValidationError> {
         let result = self.chainstate.process_new_block(block, now_secs());
