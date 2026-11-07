@@ -1,0 +1,21 @@
+{
+  "name": "satoshibtc",
+  "magic": "c2e4a9f1",
+  "default_port": 18557,
+  "rpc_port": 18558,
+  "genesis_timestamp": "btc-rust satoshibtc genesis",
+  "genesis_output_script": "6a",
+  "genesis_time": 1767225600,
+  "genesis_bits": "1d00ffff",
+  "genesis_reward": 5000000000,
+  "halving_interval": 210000,
+  "target_spacing": 600,
+  "target_timespan": 1209600,
+  "pow_limit": "00000000ffff0000000000000000000000000000000000000000000000000000",
+  "allow_min_difficulty_blocks": false,
+  "no_retargeting": false,
+  "bech32_hrp": "sb",
+  "pubkey_address_prefix": 66,
+  "script_address_prefix": 11,
+  "seeds": []
+}
