@@ -69,9 +69,9 @@ impl fmt::Display for CoinsError {
 impl std::error::Error for CoinsError {}
 
 /// True if a scriptPubKey can never be spent (Core `CScript::IsUnspendable`).
-/// Confidential outputs (`OP_RETURN 0x01 ...`, see
-/// `btc_consensus::CT_SCRIPT_VERSION`) are spendable by ring signatures,
-/// so they are not unspendable even though they start with OP_RETURN.
+/// Confidential outputs (`OP_RETURN 0x01 ...`) and shielded pool scripts are spendable by
+/// ring/note proofs respectively, so they are not unspendable even though
+/// they start with OP_RETURN.
 pub fn is_unspendable(script_pubkey: &Script) -> bool {
     if script_pubkey.len() > MAX_SCRIPT_SIZE {
         return true;
@@ -80,7 +80,8 @@ pub fn is_unspendable(script_pubkey: &Script) -> bool {
     if bytes.first() != Some(&OP_RETURN) {
         return false;
     }
-    !matches!(bytes.get(1), Some(&btc_consensus::CT_SCRIPT_VERSION))
+    let version = bytes.get(1);
+    !matches!(version, Some(&btc_consensus::CT_SCRIPT_VERSION) | Some(&0x02))
 }
 
 /// In-memory UTXO set backed by a `HashMap`.
@@ -336,10 +337,11 @@ mod tests {
         let mut base = CoinsViewMemory::new();
         let mut cache = CoinsViewCache::new(&mut base);
 
-        // OP_RETURN outputs are skipped and never become visible (except
-        // CT scripts `OP_RETURN 0x01 ...`, which are spendable).
+        // Plain OP_RETURN outputs are skipped and never become visible
+        // (except CT scripts `OP_RETURN 0x01 ...` and pool scripts
+        // `OP_RETURN 0x02 ...`, which are spendable).
         let op_return = Coin {
-            txout: TxOut::new(0, ScriptBuf::from_bytes(vec![0x6a, 0x02, 0x00])),
+            txout: TxOut::new(0, ScriptBuf::from_bytes(vec![0x6a, 0x03, 0x00])),
             height: 1,
             is_coinbase: false,
         };
@@ -347,6 +349,7 @@ mod tests {
         assert!(!cache.have_coin(&op(0)));
         // CT script prefix: spendable ring-signature output.
         assert!(!is_unspendable(&ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x00])));
+        assert!(!is_unspendable(&ScriptBuf::from_bytes(vec![0x6a, 0x02, 0x00])));
 
         // Oversized scripts are unspendable; a script of exactly MAX_SCRIPT_SIZE is not.
         assert!(is_unspendable(&ScriptBuf::from_bytes(vec![0x51; MAX_SCRIPT_SIZE + 1])));
