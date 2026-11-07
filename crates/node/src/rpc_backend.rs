@@ -516,6 +516,12 @@ impl WalletRpc for NodeRpc {
         self.with_node(|n| n.wallet_send_stealth(address, amount, fee_rate))
     }
 
+    fn send_to_confidential(&self, amount: i64, fee: i64) -> Result<Txid, String> {
+        self.with_node(|n| {
+            n.wallet_send_ct(amount.max(0) as u64, fee)
+        })
+    }
+
     fn dump_privkey(&self, script: &ScriptBuf) -> Result<String, String> {
         self.with_wallet(|w, _| w.dump_wif(script).map_err(wallet_error_message))
             .unwrap_or_else(|| Err("wallet disabled".into()))
