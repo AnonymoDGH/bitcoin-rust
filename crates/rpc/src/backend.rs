@@ -120,6 +120,12 @@ pub trait WalletRpc: Send + Sync {
     /// output (hybrid spend: P2PKH input, CT output, public fee).
     fn send_to_confidential(&self, amount: i64, fee: i64) -> Result<Txid, String>;
 
+    /// Shields plaintext into a pool note; returns the note commitment hex.
+    fn create_pool_note(&self, amount: i64, fee: i64) -> Result<String, String>;
+
+    /// Spends a shielded note by its commitment hex.
+    fn spend_note(&self, cmu_hex: String, amount: i64) -> Result<Txid, String>;
+
     fn dump_privkey(&self, script: &ScriptBuf) -> Result<String, String>;
     fn import_privkey(&self, wif: &str) -> Result<(), String>;
     fn wallet_info(&self) -> WalletInfo;

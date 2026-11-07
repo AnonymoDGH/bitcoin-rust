@@ -74,6 +74,34 @@ pub(crate) fn call(backend: &dyn RpcBackend, method: &str, args: &Args) -> RpcRe
                 .map_err(wallet_error)?;
             Ok(json!(txid.to_string()))
         }
+        "createpoolnote" => {
+            let sats = args.amount_req(0, "amount")?;
+            if sats <= 0 {
+                return Err(RpcError::new(RPC_TYPE_ERROR, "Invalid amount for send"));
+            }
+            let fee = match args.scaled(1, 8)? {
+                Some(sats) => sats,
+                None => 10_000,
+            };
+            if fee < 0 {
+                return Err(RpcError::new(RPC_TYPE_ERROR, "Invalid fee for send"));
+            }
+            let cmu = wallet
+                .create_pool_note(sats, fee)
+                .map_err(wallet_error)?;
+            Ok(json!(cmu))
+        }
+        "spendnote" => {
+            let commitment = args.str_req(0, "commitment")?;
+            let sats = args.amount_req(1, "amount")?;
+            if sats <= 0 {
+                return Err(RpcError::new(RPC_TYPE_ERROR, "Invalid amount for send"));
+            }
+            let txid = wallet
+                .spend_note(commitment.to_owned(), sats)
+                .map_err(wallet_error)?;
+            Ok(json!(txid.to_string()))
+        }
         "liststealthutxos" => {
             let minconf = args.u32(0)?.unwrap_or(0);
             let max_blocks = args.u32(1)?.unwrap_or(2000);

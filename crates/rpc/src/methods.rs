@@ -198,6 +198,14 @@ const WALLET_METHODS: &[Method] = &[
         name: "shieldtoct",
         params: &[("amount", true), ("fee", false)],
     },
+    Method {
+        name: "createpoolnote",
+        params: &[("amount", true), ("fee", false)],
+    },
+    Method {
+        name: "spendnote",
+        params: &[("commitment", true), ("amount", true)],
+    },
 ];
 
 /// Finds a method. Wallet methods are reported as missing when there is no wallet.
