@@ -141,6 +141,14 @@ impl RpcBackend for MockBackend {
         })
     }
 
+    fn pool_anchor(&self) -> [u8; 32] {
+        [0u8; 32]
+    }
+
+    fn pool_len(&self) -> usize {
+        0
+    }
+
     fn get_raw_mempool(&self) -> Vec<Txid> {
         self.with(|c| c.mempool.iter().map(Tx::txid).collect())
     }
