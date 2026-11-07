@@ -2,7 +2,7 @@
 //! `AcceptBlockHeader`, `AcceptBlock`, `ActivateBestChain`,
 //! `ConnectTip`/`DisconnectTip`, `InvalidateBlock` (validation.cpp).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use btc_consensus::ChainParams;
 use btc_primitives::{Block, BlockHash, BlockHeader, Tx};
@@ -12,6 +12,7 @@ use btc_validation::undo::BlockUndo;
 
 use crate::connect::{connect_block, disconnect_block, ConnectOptions, DisconnectResult};
 use crate::contextual::{contextual_check_block, contextual_check_block_header};
+use crate::notes::{decode_pool_note, NoteTree};
 use crate::{ActiveChain, BlockStatus, BlockTree, IndexId, ValidationError};
 
 /// Block + undo storage. `MemBlockStore` keeps everything in RAM; the node
@@ -76,6 +77,13 @@ pub struct Chainstate {
     /// Reason each block was marked `FAILED_VALID` (blocks failed by hand or
     /// as a side effect of a failed descendant are absent).
     invalid_reasons: HashMap<IndexId, ValidationError>,
+    /// Shielded pool: commitment tree over the active chain, refreshed by
+    /// replaying blocks after each successful `activate_best_chain`.
+    pool: NoteTree,
+    /// Pool anchor (tree root) per active-chain tip.
+    anchors: HashMap<BlockHash, [u8; 32]>,
+    /// Nullifiers spent on the active chain (double-spend registry).
+    pool_spent: HashSet<[u8; 32]>,
 }
 
 impl Chainstate {
@@ -114,8 +122,12 @@ impl Chainstate {
             best_header: id,
             events: Vec::new(),
             invalid_reasons: HashMap::new(),
+            pool: NoteTree::new(),
+            anchors: HashMap::new(),
+            pool_spent: HashSet::new(),
         };
         state.load_block_index()?;
+        state.refresh_pool();
         Ok(state)
     }
 
@@ -229,6 +241,7 @@ impl Chainstate {
         entry.status.raise_validity(BlockStatus::VALID_TRANSACTIONS);
 
         self.activate_best_chain()?;
+        self.refresh_pool();
         if self.tree.get(id).status.is_failed() {
             return Err(self.invalid_reason(id));
         }
@@ -266,6 +279,55 @@ impl Chainstate {
         }
         Ok(())
     }
+    /// Rebuilds the shielded pool from the active chain: replays pool note
+    /// outputs (`OP_RETURN 0x02 <cmu>`) in block order and records the
+    /// anchor for the tip. Also refreshes on startup after the block index
+    /// is loaded, which gives the pool by construction without separate
+    /// storage. Reorgs are handled implicitly by the replay.
+    pub fn refresh_pool(&mut self) {
+        let mut pool = NoteTree::new();
+        let mut anchors: HashMap<BlockHash, [u8; 32]> = HashMap::new();
+        // Simplest rebuild: walk heights forward on the active chain.
+        for height in 0..=self.height() {
+            if let Some(hash) = self.block_hash_at(height) {
+                if let Some(block) = self.store.get_block(&hash) {
+                    for tx in &block.txdata {
+                        for output in &tx.vout {
+                            if let Some(cmu) =
+                                decode_pool_note(output.script_pubkey.as_bytes())
+                            {
+                                pool.insert(cmu);
+                            }
+                        }
+                    }
+                }
+                anchors.insert(hash, pool.root());
+            }
+        }
+        self.pool = pool;
+        self.anchors = anchors;
+    }
+
+    /// Current pool anchor (tree root over the active chain).
+    pub fn pool_root(&self) -> [u8; 32] {
+        self.pool.root()
+    }
+
+    /// Shielded-pool note count on the active chain.
+    pub fn pool_len(&self) -> usize {
+        self.pool.len()
+    }
+
+    /// Anchors recorded per active-chain tip.
+    pub fn pool_anchor_at(&self, hash: &BlockHash) -> Option<[u8; 32]> {
+        self.anchors.get(hash).copied()
+    }
+
+    /// Registers a spent nullifier; returns false on double spend.
+    pub fn register_nullifier(&mut self, nullifier: [u8; 32]) -> bool {
+        self.pool_spent.insert(nullifier)
+    }
+
     /// `InvalidateBlock`: mark failed, disconnect if in the active chain, reactivate.
     pub fn invalidate_block(&mut self, hash: &BlockHash) -> Result<(), ValidationError> {
         let id = self.tree.lookup(hash).ok_or(ValidationError::Other("block-not-found"))?;
@@ -762,5 +824,29 @@ mod tests {
             cs.process_new_block_headers(&[no_work], NOW),
             Err(ValidationError::Block(BlockError::HighHash))
         );
+    }
+
+    #[test]
+    fn pool_inserts_note_commitments_and_keeps_anchor() {
+        let mut cs = new_chain();
+        assert_eq!(cs.pool_len(), 0);
+        let anchor_empty = cs.pool_root();
+        let main = extend(&mut cs, genesis_hash(), 100, 0);
+        assert_eq!(cs.pool_len(), 0, "plain coinbases carry no pool notes");
+
+        // Block with a pool note output paid from a mature spend.
+        let prevout = coinbase_outpoint(&main[0]);
+        let note_tx = Tx::new(1, vec![TxIn::new(prevout)], vec![TxOut::new(0, ScriptBuf::from_bytes(crate::notes::encode_pool_note(&[7u8; 32])))], 0);
+        let (tip_header, tip_height) = cs.header_of(&cs.tip_hash()).unwrap();
+        let block = mine(&tip_header, tip_height, vec![note_tx], subsidy(101), 3);
+        assert_eq!(cs.process_new_block(&block, NOW), Ok(true));
+        assert_eq!(cs.pool_len(), 1);
+        let anchor = cs.pool_root();
+        assert_ne!(anchor, anchor_empty);
+        assert_eq!(cs.pool_anchor_at(&cs.tip_hash()), Some(anchor));
+
+        // Nullifier registry: first registration wins, second fails.
+        assert!(cs.register_nullifier([9u8; 32]));
+        assert!(!cs.register_nullifier([9u8; 32]));
     }
 }
