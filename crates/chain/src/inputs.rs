@@ -82,6 +82,21 @@ fn check_one(
     .map_err(|error| ValidationError::Script { input: n_in, error })
 }
 
+/// Verifies only `indices` of a transaction (for confidential transactions,
+/// whose remaining inputs are authorised by ring signatures, not scripts).
+pub fn check_input_indices(
+    tx: &Tx,
+    spent: &[TxOut],
+    flags: ScriptVerifyFlags,
+    indices: &[usize],
+) -> Result<(), ValidationError> {
+    check_spent_len(tx, spent)?;
+    for &n_in in indices {
+        check_one(tx, spent, flags, n_in)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
