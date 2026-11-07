@@ -105,15 +105,19 @@ protects the middle; the edges must be designed for too.
   proof in a shield marker (`OP_RETURN 0x51 | r_in | balance`, 106-byte
   payload; the CT context zeroes its balance bytes, breaking the
   fixed-point), and runs script checks only for plaintext inputs.
-  Wallet CT spends (`create_ct_spend`) are authorised by 16-key ring
+  wallet `create_ct_spend`) are authorised by 16-key ring
   signatures over the on-chain keys. First CT liquidity therefore
   enters via the wallet shield itself.
-- **Ring signatures** (Monero-style, fixed ring size 16): 1-out-of-16
-  Schnorr ring (`crates/chain/src/ringsig.rs`), tested. Spending
-  authorisation through rings is enforced by chain validation as
-  part of CT transactions.
-- **Fungibility**: identical-looking outputs; no tainted-coin
-  signalling at the protocol level.
+- **Shielded pool active in consensus** (`crates/chain/src/notes.rs` +
+  `Chainstate`): pool note outputs (`OP_RETURN 0x02 <cmu>`) are inserted
+  into the commitment tree by `refresh_pool()` on every activation and
+  startup; per-tip anchors and the nullifier double-spend registry are
+  live. Note spends in `ConnectBlock` verify membership, spend
+  authorisation and fee accounting through `verify_note_tx_block`
+  (witness layouts: note, auth+anchor+index, path).
+- **TODO before lane-ready:** SNARKs over the same note definition to
+  prove no inflation (utmost limitation of hash-based notes), view keys,
+  insertion of pool notes through the wallet and on-chain CT mining.
 
 ### Phase 3 — shielded pool
 **Implemented now (pre-zk milestone):** `crates/chain/src/notes.rs` —
