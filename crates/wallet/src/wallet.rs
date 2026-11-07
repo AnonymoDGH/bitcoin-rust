@@ -21,7 +21,7 @@ use btc_primitives::{Block, Tx, TxOut};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::builder::{build_transaction, BuildError};
+use crate::builder::{build_transaction, build_transaction_with_extras, BuildError};
 use crate::crypter::{
     decrypt_secret, encrypt_secret, Crypter, DEFAULT_DERIVE_ITERATIONS, KEY_SIZE, SALT_SIZE,
 };
@@ -135,6 +135,8 @@ pub struct Wallet {
     /// Plaintext keys. Empty while an encrypted wallet is locked.
     keys: KeyStore,
     key_records: BTreeMap<KeyId, KeyRecord>,
+    /// The first key ever added; anchors the stealth address derivation.
+    first_key: Option<KeyId>,
     script_index: HashMap<ScriptBuf, (KeyId, ScriptKind)>,
     coins: BTreeMap<OutPoint, Coin>,
     txs: Vec<WalletTxRecord>,
@@ -169,6 +171,7 @@ impl Wallet {
             path,
             keys: KeyStore::new(),
             key_records: BTreeMap::new(),
+            first_key: None,
             script_index: HashMap::new(),
             coins: BTreeMap::new(),
             txs: Vec::new(),
@@ -210,12 +213,13 @@ impl Wallet {
     /// The stealth keypair behind `stealth_address`.
     pub fn stealth_keys(&self) -> Result<crate::stealth::StealthKeys, WalletError> {
         use bitcoin_hashes::{sha256, Hash as _};
+        // Anchor to the first key ever added: generating later keys must
+        // not change the invitation address.
         let id = self
-            .keys
-            .key_ids()
-            .next()
+            .first_key
+            .or_else(|| self.keys.key_ids().next().copied())
             .ok_or(WalletError::Locked)?;
-        let key = self.keys.private_key(id).ok_or(WalletError::Locked)?;
+        let key = self.keys.private_key(&id).ok_or(WalletError::Locked)?;
         let secret = key.inner.secret_bytes();
         let derive = |label: &[u8]| -> Result<[u8; 32], WalletError> {
             let mut buf = secret.to_vec();
@@ -291,6 +295,9 @@ impl Wallet {
                 secret,
             },
         );
+        if self.first_key.is_none() {
+            self.first_key = Some(id);
+        }
         Ok(id)
     }
 
@@ -760,6 +767,44 @@ impl Wallet {
         Ok(tx)
     }
 
+    /// Builds and signs a stealth payment: a fresh one-time output paid to
+    /// `address`, plus an `OP_RETURN` marker publishing the ephemeral public
+    /// key so the recipient can scan for it. Change goes to a fresh P2WPKH
+    /// script. The result is not recorded; call `commit_transaction` to do that.
+    pub fn create_stealth_transaction(
+        &mut self,
+        tip_height: u32,
+        address: crate::stealth::StealthAddress,
+        amount: i64,
+        fee_rate_sat_per_kvb: i64,
+    ) -> Result<Tx, WalletError> {
+        self.check_unlocked()?;
+        let ephemeral = crate::stealth::ephemeral_secret()?;
+        let payment = address.payment(&ephemeral)?;
+        let marker = crate::stealth::marker_script(&payment.ephemeral_pub);
+        let utxos: Vec<(OutPoint, TxOut)> = self
+            .coins
+            .iter()
+            .filter(|(op, coin)| self.is_spendable(op, coin, tip_height))
+            .map(|(op, coin)| (*op, coin.txout.clone()))
+            .collect();
+        let change = self.new_script(ScriptKind::P2wpkh)?;
+        build_transaction_with_extras(
+            &utxos,
+            &[(payment.script_pubkey.clone(), amount)],
+            &[marker],
+            change,
+            fee_rate_sat_per_kvb,
+            &self.keys,
+        )
+        .map_err(|e| match e {
+            BuildError::InsufficientFunds { required, available } => {
+                WalletError::InsufficientFunds { required, available }
+            }
+            other => WalletError::Build(other.to_string()),
+        })
+    }
+
     fn build(
         &self,
         utxos: &[(OutPoint, TxOut)],
@@ -866,6 +911,9 @@ impl Wallet {
                     category: category_name(t.category).to_string(),
                 })
                 .collect(),
+            first_key: self
+                .first_key
+                .map(|id| id.to_byte_array().to_lower_hex_string()),
             best_block: self.best_block.map(|(hash, height)| BestBlockFile {
                 hash: hash.to_string(),
                 height,
@@ -926,6 +974,17 @@ impl Wallet {
                 },
             );
         }
+
+        wallet.first_key = match &file.first_key {
+            Some(hex) => {
+                let bytes = hex_bytes(hex)?;
+                Some(
+                    bitcoin::PubkeyHash::from_slice(&bytes)
+                        .map_err(|e| corrupt(format!("first key: {e}")))?,
+                )
+            }
+            None => wallet.keys.key_ids().next().copied(),
+        };
 
         if let Some(mf) = file.master {
             wallet.master = Some(MasterKey {
@@ -988,6 +1047,8 @@ struct WalletFile {
     master: Option<MasterFile>,
     coins: Vec<CoinFile>,
     transactions: Vec<TxFile>,
+    #[serde(default)]
+    first_key: Option<String>,
     best_block: Option<BestBlockFile>,
 }
 
@@ -1227,6 +1288,11 @@ mod tests {
         let file = TestFile::new("stealth");
         let mut wallet = Wallet::create(&file.0).unwrap();
         let first = wallet.stealth_address().unwrap();
+        assert_eq!(wallet.stealth_address().unwrap(), first);
+        // Generating more keys must not move the invitation address.
+        for _ in 0..5 {
+            wallet.new_script(ScriptKind::P2wpkh).unwrap();
+        }
         assert_eq!(wallet.stealth_address().unwrap(), first);
         drop(wallet);
         let wallet = Wallet::open(&file.0).unwrap();
