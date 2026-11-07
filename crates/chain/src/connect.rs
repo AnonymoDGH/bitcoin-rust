@@ -118,7 +118,24 @@ pub fn connect_block(
             return Err(ValidationError::BadBlkSigops);
         }
 
-        if !is_coinbase && opts.check_scripts {
+        // Confidential transactions are authorised by ring signatures and
+        // CT balance/range proofs, not by scriptPubKey execution.
+        let mut is_ct = false;
+        if params.ct_enabled && !is_coinbase {
+            is_ct = tx.vout.iter().any(|o| crate::confidential::is_ct_script(o.script_pubkey.as_bytes()))
+                || spent_outs.iter().any(|o| crate::confidential::is_ct_script(o.script_pubkey.as_bytes()));
+            if is_ct {
+                let spent_scripts: Vec<btc_primitives::ScriptBuf> = spent_outs
+                    .iter()
+                    .map(|o| o.script_pubkey.clone())
+                    .collect();
+                if crate::confidential::verify_ct_tx_block(tx, &spent_scripts).is_err() {
+                    return Err(ValidationError::BadCt);
+                }
+            }
+        }
+
+        if !is_coinbase && opts.check_scripts && !is_ct {
             check_input_scripts_parallel(tx, &spent_outs, flags, opts.script_threads)?;
         }
 
@@ -237,7 +254,7 @@ mod tests {
     use bitcoin::{ScriptBuf, Sequence, Txid, TxMerkleNode};
     use bitcoin_hashes::Hash;
     use btc_primitives::{BlockHash, BlockHeader, TxIn};
-    use btc_validation::coins::{CoinsView, CoinsViewMemory};
+    use btc_validation::coins::{CoinsView, CoinsViewMemory, CoinsViewWrite};
 
     const BASE_TIME: u32 = 1_600_000_000;
     const FEE: i64 = 1_000;
@@ -459,5 +476,181 @@ mod tests {
         let cb = coinbase_tx(101, f.subsidy(101) + FEE);
         let (id, block) = next_block(&mut f.tree, f.tip, vec![cb, spend], 102);
         assert!(connect(&mut f.base, &f.tree, &f.params, id, &block).is_ok());
+    }
+
+    /// Builds a confidential 1-in-1-out transaction spending `prevout`.
+    /// The caller supplies the ring (own key at `signer`) and blindings;
+    /// `tamper` flips the balance proof to forge a failure.
+    fn ct_tx(
+        prevout: OutPoint,
+        ring: &[[u8; 33]],
+        signer: usize,
+        secret: &[u8; 32],
+        r_in: [u8; 32],
+        r_out: [u8; 32],
+        value_in: u64,
+        value_out: u64,
+        tamper: bool,
+    ) -> Tx {
+        use crate::confidential::{
+            create_balance_proof, create_commitment, ct_context, encode_ct_script,
+            serialize_balance_proof, serialize_ring_sig, with_fee, CtOutputData,
+        };
+        use bitcoin::Witness;
+        use bitcoin_hashes::Hash as _;
+        let in_c = create_commitment(value_in, r_in).unwrap();
+        let out_c = create_commitment(value_out, r_out).unwrap();
+        let out_data = CtOutputData {
+            commitment: out_c.commitment,
+            pubkey_hash: [7u8; 20],
+            proof: out_c.proof,
+        };
+        let out_script = encode_ct_script(&out_data).unwrap();
+        let mut input = TxIn::new(prevout);
+        input.sequence = Sequence(Sequence::MAX.0);
+        let mut tx = Tx::new(2, vec![input], vec![TxOut::new(0, out_script)], 0);
+        let context = ct_context(&tx);
+        let (proof, _) = create_balance_proof(&[r_in], &[r_out], 10_000, &context).unwrap();
+        let mut proof_bytes = with_fee(serialize_balance_proof(&proof), 10_000);
+        if tamper {
+            proof_bytes[10] ^= 1;
+        }
+        let sig = crate::ringsig::sign_ring(&context, ring, signer, secret).unwrap();
+        let mut ring_keys_bytes = Vec::new();
+        for key in ring {
+            ring_keys_bytes.extend_from_slice(key);
+        }
+        let witness = Witness::from_slice(&[proof_bytes, serialize_ring_sig(&sig), ring_keys_bytes]);
+        tx.vin[0].witness = witness;
+        let _ = in_c;
+        tx
+    }
+
+    #[test]
+    fn ct_tx_connects_with_valid_proofs() {
+        use crate::confidential::{create_commitment, encode_ct_script, CtOutputData};
+        use btc_validation::coins::Coin;
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let mut f = Fixture::new(1);
+        let mut params = f.params.clone();
+        params.ct_enabled = true;
+
+        let secp = Secp256k1::new();
+        let mut secrets = Vec::new();
+        let mut pubs: Vec<[u8; 33]> = Vec::new();
+        for i in 1..=16u8 {
+            let mut buf = [0u8; 32];
+            buf[0] = i;
+            buf[31] = 5;
+            let sk = SecretKey::from_slice(&buf).unwrap();
+            secrets.push(buf);
+            pubs.push(PublicKey::from_secret_key(&secp, &sk).serialize());
+        }
+        let own = 3usize;
+        let r_in = [11u8; 32];
+        let r_out = [22u8; 32];
+        let in_c = create_commitment(5_00000000u64, r_in).unwrap();
+        let own_hash = bitcoin_hashes::hash160::Hash::hash(&pubs[own]).to_byte_array();
+        let mut own_hash20 = [0u8; 20];
+        own_hash20.copy_from_slice(&own_hash[..20]);
+        let in_data = CtOutputData {
+            commitment: in_c.commitment,
+            pubkey_hash: own_hash20,
+            proof: in_c.proof,
+        };
+        let coin_outpoint = OutPoint {
+            txid: bitcoin::Txid::from_slice(&[99u8; 32]).unwrap(),
+            vout: 0,
+        };
+        f.base.batch_write(vec![(
+            coin_outpoint,
+            Some(Coin {
+                txout: TxOut::new(0, encode_ct_script(&in_data).unwrap()),
+                height: 1,
+                is_coinbase: false,
+            }),
+        )]);
+
+        let tx = ct_tx(
+            coin_outpoint,
+            &pubs,
+            own,
+            &secrets[own],
+            r_in,
+            r_out,
+            5_00000000,
+            4_99990000,
+            false,
+        );
+        let height = f.tree.get(f.tip).height + 1;
+        let cb = coinbase_tx(height, f.params.block_subsidy(height));
+        let (id, block) = next_block(&mut f.tree, f.tip, vec![cb, tx], height);
+        let summary = connect(&mut f.base, &f.tree, &params, id, &block).unwrap();
+        assert_eq!(summary.fees, 0);
+        assert!(f.base.get_coin(&coin_outpoint).is_none());
+    }
+
+    #[test]
+    fn ct_tx_with_forged_balance_proof_is_rejected() {
+        use crate::confidential::{create_commitment, encode_ct_script, CtOutputData};
+        use btc_validation::coins::Coin;
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let mut f = Fixture::new(1);
+        let mut params = f.params.clone();
+        params.ct_enabled = true;
+
+        let secp = Secp256k1::new();
+        let mut secrets = Vec::new();
+        let mut pubs: Vec<[u8; 33]> = Vec::new();
+        for i in 1..=16u8 {
+            let mut buf = [0u8; 32];
+            buf[0] = i;
+            buf[31] = 5;
+            let sk = SecretKey::from_slice(&buf).unwrap();
+            secrets.push(buf);
+            pubs.push(PublicKey::from_secret_key(&secp, &sk).serialize());
+        }
+        let own = 1usize;
+        let r_in = [31u8; 32];
+        let in_c = create_commitment(5_00000000u64, r_in).unwrap();
+        let own_hash = bitcoin_hashes::hash160::Hash::hash(&pubs[own]).to_byte_array();
+        let mut own_hash20 = [0u8; 20];
+        own_hash20.copy_from_slice(&own_hash[..20]);
+        let in_data = CtOutputData {
+            commitment: in_c.commitment,
+            pubkey_hash: own_hash20,
+            proof: in_c.proof,
+        };
+        let coin_outpoint = OutPoint {
+            txid: bitcoin::Txid::from_slice(&[88u8; 32]).unwrap(),
+            vout: 0,
+        };
+        f.base.batch_write(vec![(
+            coin_outpoint,
+            Some(Coin {
+                txout: TxOut::new(0, encode_ct_script(&in_data).unwrap()),
+                height: 1,
+                is_coinbase: false,
+            }),
+        )]);
+
+        let tx = ct_tx(
+            coin_outpoint,
+            &pubs,
+            own,
+            &secrets[own],
+            r_in,
+            [44u8; 32],
+            5_00000000,
+            4_99990000,
+            true,
+        );
+        let height = f.tree.get(f.tip).height + 1;
+        let cb = coinbase_tx(height, f.params.block_subsidy(height));
+        let (id, block) = next_block(&mut f.tree, f.tip, vec![cb, tx], height);
+        assert_eq!(
+            connect(&mut f.base, &f.tree, &params, id, &block).unwrap_err(),
+            ValidationError::BadCt
+        );
     }
 }
