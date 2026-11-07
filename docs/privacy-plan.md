@@ -167,6 +167,11 @@ protects the middle; the edges must be designed for too.
   `cmu`, the Pedersen opening, the funding cap and `C_old`
   simultaneously; the test
   `commitment_is_nonlinear_and_binding` locks the non-linearity.
+  Moreover `C_old` now binds the on-chain `cmu` itself as a public
+  input (`C = v + h(rcm) + cmu_field`): a proof issued for a
+  different note cannot verify against this transcript. The full
+  preimage-in-circuit binding (Poseidon over `cmu`) remains future
+  work.
   Wallet generation is wired too: `create_note_spend` takes the
   on-chain funding cap, proves the spend and attaches `witness[3]`
   (RPC `spendnote` supplies the cap from the ledger). **Shielded
