@@ -85,6 +85,10 @@ pub struct Chainstate {
     anchors: HashMap<BlockHash, [u8; 32]>,
     /// Pool note outputs in leaf order (parallel to `pool.leaves`).
     pool_leaves: Vec<(BlockHash, u32)>,
+    /// Anti-inflation funding ledger: `cmu -> max spendable sats`,
+    /// locked at issuance (`inputs - non-pool outputs`, split evenly
+    /// across pool notes created by the same tx). Rebuilt by replay.
+    pool_funded: HashMap<[u8; 32], u64>,
     /// Nullifiers spent on the active chain (double-spend registry).
     pool_spent: HashSet<[u8; 32]>,
 }
@@ -128,6 +132,7 @@ impl Chainstate {
             pool: NoteTree::new(),
             anchors: HashMap::new(),
             pool_leaves: Vec::new(),
+            pool_funded: HashMap::new(),
             pool_spent: HashSet::new(),
         };
         state.load_block_index()?;
@@ -292,12 +297,30 @@ impl Chainstate {
         let mut pool = NoteTree::new();
         let mut anchors: HashMap<BlockHash, [u8; 32]> = HashMap::new();
         let mut leaves: Vec<(BlockHash, u32)> = Vec::new();
+        let mut funded: HashMap<[u8; 32], u64> = HashMap::new();
+        // Output values created so far on the active chain, used to
+        // compute issuance funding: `inputs - non-pool outputs`.
+        let mut values: HashMap<OutPoint, i64> = HashMap::new();
         // Simplest rebuild: walk heights forward on the active chain.
         for height in 0..=self.height() {
             if let Some(hash) = self.block_hash_at(height) {
                 if let Some(block) = self.store.get_block(&hash) {
                     for tx in &block.txdata {
+                        let input_values: Vec<i64> = tx
+                            .vin
+                            .iter()
+                            .map(|vin| values.get(&vin.prevout).copied().unwrap_or(0))
+                            .collect();
+                        for (cmu, cap) in
+                            crate::notes::funding_caps_for_block(tx, &input_values)
+                        {
+                            funded.insert(cmu, cap);
+                        }
                         for (vout, output) in tx.vout.iter().enumerate() {
+                            values.insert(
+                                OutPoint::new(tx.txid(), vout as u32),
+                                output.value,
+                            );
                             if decode_pool_note(output.script_pubkey.as_bytes()).is_some() {
                                 pool.insert(decode_pool_note(output.script_pubkey.as_bytes()).unwrap());
                                 let _ = vout;
@@ -316,6 +339,12 @@ impl Chainstate {
         self.pool = pool;
         self.anchors = anchors;
         self.pool_leaves = leaves;
+        self.pool_funded = funded;
+    }
+
+    /// Anti-inflation funding ledger (`cmu -> max spendable sats`).
+    pub fn pool_funding(&self) -> &HashMap<[u8; 32], u64> {
+        &self.pool_funded
     }
 
     /// Pool leaf in active-chain leaf order: (block hash, index).
@@ -432,9 +461,10 @@ impl Chainstate {
 
         let summary = {
             let mut cache = CoinsViewCache::new(&mut *self.coins);
-            let mut opts = self.connect_opts;
+            let mut opts = self.connect_opts.clone();
             // Note spends reference the anchor of the chain they extend.
             opts.pool_root = Some(self.pool.root());
+            opts.pool_funding = Some(self.pool_funded.clone());
             let summary = connect_block(&block, &self.tree, id, &mut cache, &self.params, opts)?;
             // Undo must be on disk before the UTXO set points at this block.
             self.store.put_undo(&hash, &summary.undo);
