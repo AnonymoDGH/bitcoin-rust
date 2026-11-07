@@ -44,6 +44,29 @@ pub(crate) fn call(backend: &dyn RpcBackend, method: &str, args: &Args) -> RpcRe
             wallet.wallet_lock().map_err(wallet_error)?;
             Ok(Value::Null)
         }
+        "getnewstealthaddress" => Ok(json!(wallet.get_stealth_address().map_err(wallet_error)?)),
+        "liststealthutxos" => {
+            let minconf = args.u32(0)?.unwrap_or(0);
+            let max_blocks = args.u32(1)?.unwrap_or(2000);
+            let utxos = wallet.list_stealth_utxos(minconf, max_blocks);
+            let rows = utxos
+                .iter()
+                .map(|u| {
+                    json!({
+                        "txid": u.outpoint.txid.to_string(),
+                        "vout": u.outpoint.vout,
+                        "address": encode(&params, &u.script_pubkey).unwrap_or_default(),
+                        "amount": amount(u.amount),
+                        "confirmations": u.confirmations,
+                        "spendable": u.spendable,
+                        "solvable": true,
+                        "safe": true,
+                        "scriptPubKey": script_hex(&u.script_pubkey),
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(Value::Array(rows))
+        }
         _ => Err(RpcError::new(RPC_METHOD_NOT_FOUND, "Method not found")),
     }
 }
