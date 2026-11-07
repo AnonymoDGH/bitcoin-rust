@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bitcoin::{PubkeyHash, ScriptHash, WPubkeyHash};
 use bitcoin_hashes::{sha256, Hash};
 use btc_primitives::{BlockHash, OutPoint, ScriptBuf, Tx, TxIn, TxOut, Txid};
-use btc_rpc::{WalletInfo, WalletRpc, WalletTx, WalletUtxo};
+use btc_rpc::{NoteEntry, WalletInfo, WalletRpc, WalletTx, WalletUtxo};
 
 use super::p2wpkh_script;
 
@@ -309,5 +309,13 @@ impl WalletRpc for MockWallet {
 
     fn spend_note(&self, _cmu_hex: String, _amount: i64) -> Result<Txid, String> {
         Ok(Txid::from_byte_array([9u8; 32]))
+    }
+
+    fn list_notes(&self) -> Vec<NoteEntry> {
+        Vec::new()
+    }
+
+    fn export_view_key(&self) -> Result<String, String> {
+        Ok("00".repeat(32))
     }
 }
