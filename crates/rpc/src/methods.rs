@@ -178,6 +178,14 @@ const WALLET_METHODS: &[Method] = &[
         name: "walletlock",
         params: &[],
     },
+    Method {
+        name: "getnewstealthaddress",
+        params: &[],
+    },
+    Method {
+        name: "liststealthutxos",
+        params: &[("minconf", false), ("max_blocks", false)],
+    },
 ];
 
 /// Finds a method. Wallet methods are reported as missing when there is no wallet.
