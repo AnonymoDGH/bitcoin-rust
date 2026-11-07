@@ -311,6 +311,10 @@ impl WalletRpc for MockWallet {
         Ok(Txid::from_byte_array([9u8; 32]))
     }
 
+    fn spend_note_shielded(&self, _cmu_hex: String, _fee: i64) -> Result<Txid, String> {
+        Ok(Txid::from_byte_array([10u8; 32]))
+    }
+
     fn list_notes(&self) -> Vec<NoteEntry> {
         Vec::new()
     }
