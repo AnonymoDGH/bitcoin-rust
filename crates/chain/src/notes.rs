@@ -130,6 +130,10 @@ pub fn decode_pool_note_full(script: &[u8]) -> Option<([u8; 32], Option<[u8; 33]
 /// multi-note creations: every note's cap is `locked / count`).
 /// This is the anti-inflation ledger: issuance locks real UTXO value
 /// behind each `cmu`, and a spend may claim at most its cap.
+///
+/// SNARK shielded spends (pool input + `witness[4]` public fee):
+/// the locked value is the spent note's value minus the public fee
+/// — the new note is funded by the proof, not by ledger values.
 pub fn funding_caps_for_block(
     tx: &btc_primitives::Tx,
     input_values: &[i64],
@@ -148,12 +152,54 @@ pub fn funding_caps_for_block(
         .filter(|o| !is_pool_script(o.script_pubkey.as_bytes()))
         .map(|o| o.value)
         .sum();
-    let locked: i64 = input_values.iter().sum::<i64>() - non_pool_out;
+    // Shielded spend: fund from the revealed spent-note value minus
+    // the public fee carried in witness[4].
+    let spent_note_value: i64 = tx
+        .vin
+        .iter()
+        .filter_map(|input| {
+            input
+                .witness
+                .iter()
+                .next()
+                .and_then(|b| decode_note(b))
+                .map(|n| n.value as i64)
+        })
+        .sum();
+    let shield_fee = tx
+        .vin
+        .first()
+        .and_then(|input| input.witness.iter().nth(4))
+        .and_then(|b| decode_shield_fee(b));
+    let locked: i64 = match shield_fee {
+        Some(fee) if spent_note_value > 0 => spent_note_value - fee as i64 - non_pool_out,
+        _ => input_values.iter().sum::<i64>() - non_pool_out,
+    };
     if locked <= 0 {
         return Vec::new();
     }
     let cap = (locked as u64) / pool_outs.len() as u64;
     pool_outs.into_iter().map(|cmu| (cmu, cap)).collect()
+}
+
+/// Decodes witness[4] of a shielded spend: `fee(8 LE) || C_new0(32)
+/// || C_new1(32)` with field-encoded commitments.
+pub fn decode_shield_witness(
+    bytes: &[u8],
+) -> Option<(u64, crate::value_snark::Field, crate::value_snark::Field)> {
+    use ark_ff::PrimeField;
+    if bytes.len() != 72 {
+        return None;
+    }
+    let fee = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+    let c0 = crate::value_snark::bytes_to_field(&bytes[8..40]);
+    let c1 = crate::value_snark::bytes_to_field(&bytes[40..72]);
+    Some((fee, c0, c1))
+}
+
+/// Extracts the public fee from a shield witness (witness[4]).
+pub fn decode_shield_fee(bytes: &[u8]) -> Option<u64> {
+    decode_shield_witness(bytes).map(|(fee, _, _)| fee)
 }
 
 /// Spend authorisation: Schnorr signature (RFC6979 via secp256k1 ECDSA)
@@ -269,6 +315,7 @@ pub fn verify_note_tx_block_with_caps(
     let anchor = pool_root.ok_or(NoteError::UnknownAnchor)?;
     let anchors = [anchor].into_iter().collect();
     let mut total_value: i64 = 0;
+    let mut spent_fee: i64 = -1;
     for (i, (input, spent_out)) in tx.vin.iter().zip(spent_outs).enumerate() {
         if crate::confidential::is_ct_script(spent_out.script_pubkey.as_bytes()) {
             continue; // CT spends are checked elsewhere
@@ -326,8 +373,10 @@ pub fn verify_note_tx_block_with_caps(
         total_value += note.value as i64;
         // Optional Groth16 value-hiding proof (witness[3]). Bound to
         // this note's opening (`C_old` from `(value, rcm)`) and to the
-        // funding cap; outputs stay transparent in this integration
-        // mode, so the proof re-proves conservation + cap on chain.
+        // funding cap. With `witness[4]` (fee + new commitments) the
+        // spend is shielded: the single pool output becomes a new
+        // hidden note funded by `note.value - fee`, and the returned
+        // fee is the public one. Without it outputs stay transparent.
         // Present-but-invalid proofs are rejected (never ignored).
         if let Some(proof_bytes) = input.witness.iter().nth(3) {
             if tx.vin.len() != 1 {
@@ -340,20 +389,51 @@ pub fn verify_note_tx_block_with_caps(
                 None => note.value,
             };
             let value_out: i64 = tx.vout.iter().map(|o| o.value).sum();
-            let fee_u64 = (note.value as i64 - value_out).max(0) as u64;
-            let transcript = crate::value_snark::transcript_for_spend(
-                &note,
-                value_out.max(0) as u64,
-                fee_u64,
-                cap,
-            );
-            if !crate::value_snark::verify(transcript, &proof) {
-                return Err(NoteError::Invalid);
+            if let Some(shield_bytes) = input.witness.iter().nth(4) {
+                // Shielded mode: one pool output, no plaintext value.
+                let (fee_u64, c_new0, c_new1) =
+                    decode_shield_witness(shield_bytes).ok_or(NoteError::Invalid)?;
+                if value_out != 0 || fee_u64 > note.value {
+                    return Err(NoteError::Invalid);
+                }
+                let pool_out_count = tx
+                    .vout
+                    .iter()
+                    .filter(|o| is_pool_script(o.script_pubkey.as_bytes()))
+                    .count();
+                if pool_out_count != 1 {
+                    return Err(NoteError::Invalid);
+                }
+                let transcript = crate::value_snark::ValueTranscript {
+                    fee: fee_u64,
+                    cap,
+                    c_old: crate::value_snark::value_commitment(note.value, &note.rcm),
+                    c_new: [c_new0, c_new1],
+                };
+                if !crate::value_snark::verify(transcript, &proof) {
+                    return Err(NoteError::Invalid);
+                }
+                spent_fee = fee_u64 as i64;
+            } else {
+                let fee_u64 = (note.value as i64 - value_out).max(0) as u64;
+                let transcript = crate::value_snark::transcript_for_spend(
+                    &note,
+                    value_out.max(0) as u64,
+                    fee_u64,
+                    cap,
+                );
+                if !crate::value_snark::verify(transcript, &proof) {
+                    return Err(NoteError::Invalid);
+                }
             }
         }
     }
     let value_out: i64 = tx.vout.iter().map(|o| o.value).sum();
-    let fee = total_value - value_out;
+    let fee = if spent_fee >= 0 {
+        spent_fee
+    } else {
+        total_value - value_out
+    };
     if fee < 0 || fee > 21_000_000 * 100_000_000 {
         return Err(NoteError::Invalid);
     }
@@ -772,5 +852,83 @@ mod tests {
         )
         .is_err());
         let _ = fee;
+    }
+
+    #[test]
+    fn shielded_note_spend_verifies_and_funds_new_note() {
+        use std::collections::HashMap;
+        use btc_primitives::{ScriptBuf, TxIn, TxOut};
+        use bitcoin::Witness;
+
+        let n = note(5);
+        let cmu = note_commitment(&n);
+        let mut tree = NoteTree::new();
+        tree.insert(cmu);
+        let anchor = tree.root();
+        let path = tree.path(0);
+        let spent_out = TxOut::new(0, ScriptBuf::from_bytes(encode_pool_note(&cmu)));
+        let fee: u64 = 10_000;
+        let new_value: u64 = n.value - fee;
+        // New note + script.
+        let new_note = Note {
+            spending_pub: n.spending_pub,
+            value: new_value,
+            rcm: [3u8; 32],
+        };
+        let new_cmu = note_commitment(&new_note);
+        let new_script = ScriptBuf::from_bytes(encode_pool_note(&new_cmu));
+        let mut secret = [0u8; 32];
+        secret[0] = 5;
+        secret[31] = 9;
+        let mut tx = btc_primitives::Tx::new(
+            2,
+            vec![TxIn::new(bitcoin::OutPoint::null())],
+            vec![TxOut::new(0, new_script)],
+            0,
+        );
+        let context = crate::confidential::ct_context(&tx);
+        let sig = authorize_spend(&n, &secret, &anchor, &context).unwrap();
+        let dummy = [0u8; 32];
+        let transcript = crate::value_snark::ValueTranscript {
+            fee,
+            cap: n.value,
+            c_old: crate::value_snark::value_commitment(n.value, &n.rcm),
+            c_new: [
+                crate::value_snark::value_commitment(new_value, &new_note.rcm),
+                crate::value_snark::value_commitment(0, &dummy),
+            ],
+        };
+        let witness = crate::value_snark::ValueWitness {
+            v_old: n.value,
+            rcm_old: n.rcm,
+            v_new: [new_value, 0],
+            rcm_new: [new_note.rcm, dummy],
+        };
+        let proof = crate::value_snark::prove(transcript, witness).expect("proves");
+        assert!(crate::value_snark::verify(transcript, &proof), "direct verify");
+        let mut shield = Vec::with_capacity(72);
+        shield.extend_from_slice(&fee.to_le_bytes());
+        shield.extend_from_slice(&crate::value_snark::field_to_bytes(&transcript.c_new[0]));
+        shield.extend_from_slice(&crate::value_snark::field_to_bytes(&transcript.c_new[1]));
+        tx.vin[0].witness = Witness::from_slice(&[
+            encode_note(&n),
+            encode_spend_auth(&anchor, 0, &sig),
+            encode_path(&path),
+            crate::value_snark::serialize_proof(&proof),
+            shield,
+        ]);
+        let mut caps = HashMap::new();
+        caps.insert(cmu, n.value);
+        let got_fee = verify_note_tx_block_with_caps(
+            &tx,
+            std::slice::from_ref(&spent_out),
+            Some(anchor),
+            Some(&caps),
+        )
+        .expect("shielded spend verifies");
+        assert_eq!(got_fee, fee as i64, "miner fee is the public fee");
+        // Funding ledger records the new note with (value).
+        let caps_out = funding_caps_for_block(&tx, &[0]);
+        assert_eq!(caps_out, vec![(new_cmu, new_value)]);
     }
 }

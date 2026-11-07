@@ -240,6 +240,19 @@ pub fn verify(transcript: ValueTranscript, proof: &Proof<Bn254>) -> bool {
         .unwrap_or(false)
 }
 
+/// Encodes a field element in canonical compressed form (32 bytes).
+pub fn field_to_bytes(f: &Fr) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    f.serialize_compressed(&mut out.as_mut_slice())
+        .expect("field element fits");
+    out
+}
+
+/// Decodes a field element from canonical compressed form.
+pub fn bytes_to_field(bytes: &[u8]) -> Fr {
+    Fr::deserialize_compressed(bytes).unwrap_or(Fr::default())
+}
+
 /// Witness proof encoding: `a (32) || b (64) || c (32)` compressed
 /// affine coordinates (x-coordinate only) — 128 bytes total.
 pub fn serialize_proof(proof: &Proof<Bn254>) -> Vec<u8> {
