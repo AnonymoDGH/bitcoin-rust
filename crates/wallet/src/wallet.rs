@@ -695,6 +695,45 @@ impl Wallet {
         self.keys.export_wif(id).ok_or(WalletError::Locked)
     }
 
+    /// Export the internal view key (hex) for audit scans.
+    pub fn export_view_key(&mut self) -> Result<String, WalletError> {
+        self.check_unlocked()?;
+        let keys = self.stealth_keys()?;
+        Ok(keys
+            .view_key()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>())
+    }
+
+    /// Notes created by this wallet: commitment, value, spent status.
+    pub fn list_notes(&self) -> Vec<crate::shielded::NoteSummary> {
+        let secp = Secp256k1::new();
+        self.coins
+            .values()
+            .filter_map(|coin| {
+                let info = coin.note.as_ref()?;
+                let pubkey = bitcoin::secp256k1::PublicKey::from_secret_key(
+                    &secp,
+                    &bitcoin::secp256k1::SecretKey::from_slice(&info.secret)
+                        .map_err(|_| WalletError::Build("note secret invalid".into()))
+                        .ok()?,
+                )
+                .serialize();
+                let note = btc_chain::notes::Note {
+                    spending_pub: pubkey,
+                    value: info.value,
+                    rcm: info.rcm,
+                };
+                Some(crate::shielded::NoteSummary {
+                    commitment: btc_chain::notes::note_commitment(&note),
+                    value: info.value,
+                    spent: coin.spent_by.is_some(),
+                })
+            })
+            .collect()
+    }
+
     pub fn is_mine(&self, script: &ScriptBuf) -> bool {
         self.script_index.contains_key(script)
     }
