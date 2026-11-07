@@ -51,6 +51,8 @@ pub enum ValidationError {
     Duplicate,
     #[error("undo data mismatch")]
     BadUndo,
+    #[error("confidential transaction check failed")]
+    BadCt,
     #[error("{0}")]
     Other(&'static str),
 }
@@ -80,6 +82,7 @@ impl ValidationError {
             Self::BipThirty => "bad-txns-BIP30",
             Self::AccumulatedFeeOutOfRange => "bad-txns-accumulated-fee-outofrange",
             Self::Duplicate => "duplicate",
+            Self::BadCt => "bad-ct-tx",
             Self::BadUndo => "bad-undo",
             Self::Other(r) => r,
         }
