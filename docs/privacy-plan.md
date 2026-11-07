@@ -138,12 +138,18 @@ protects the middle; the edges must be designed for too.
   (funding cap), it is not coinbase revenue. Without that
   subtraction the note value would be minted twice (as fee and as
   later spend). Covered by `miner_includes_mempool_note_spend_and_pays_its_fee`.
+- **Miner fee for CT (fixed).** The only sound miner fee for CT txs is
+  the balance-proof public fee prefix (`ct_public_fee`): the proof
+  ties `inputs - hidden_outputs - fee = 0`, while the plaintext ledger
+  fee overstates by the hidden amounts (paying it would mint shielded
+  values twice — the same double-mint class as pool creation).
+  ConnectBlock, mempool entry fees and the block assembler all use
+  the prefix fee. Covered end to end by
+  `miner_includes_ct_spend_and_pays_public_fee` (shield at 102,
+  all-CT ring spend at 103, coinbase = subsidy + prefix fee).
 - **Remaining limits (honest):** spent note values are transparent
-  at spend (a SNARK/Orchard-style upgrade would hide them); CT miner
-  fee inclusion (CT fees are proven by balance proofs; currently
-  assembled fees treat CT txs at mempool-recorded fees) and on-chain
-  CT mining remain TODO; onion inbound P2P is not supported
-  (outbound SOCKS5 only).
+  at spend (a SNARK/Orchard-style upgrade would hide them); onion
+  inbound P2P is not supported (outbound SOCKS5 only).
 
 ### Phase 3 — shielded pool
 **Implemented now (pre-zk milestone):** `crates/chain/src/notes.rs` —
