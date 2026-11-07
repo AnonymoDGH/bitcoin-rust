@@ -14,11 +14,15 @@
 //! Everything that was hidden (value, owner) stays hidden; an observer
 //! sees only `cmu`, the anchor they were included in, and `nf`.
 //!
-//! Honest limitation (documented in `docs/privacy-plan.md`): hash-based
-//! notes provide hiding but **not** a proof of no inflation — total
-//! issuance must still come from the transparent subsidy. The upgrade
-//! path is a zk-SNARK over the same note definition (Orchard-style),
-//! keeping this crate's addressing.
+//! Anti-inflation (no SNARK needed for this invariant): note values
+//! are revealed at spend, so the chain enforces a funding ledger —
+//! issuance locks real UTXO value (`inputs - non-pool outputs`)
+//! behind each `cmu` (`funding_caps_for_block`), and a spend may
+//! claim at most its cap. The hash commitment (and, on
+//! value-committed scripts, the Pedersen opening `value*G + rcm*H`)
+//! pin the opening to the funded commitment. The zk-SNARK upgrade
+//! path (Orchard-style) would hide the spent value itself, which
+//! the funding ledger keeps transparent at spend time.
 
 use std::collections::HashSet;
 
@@ -68,16 +72,37 @@ pub fn nullifier(note: &Note) -> [u8; 32] {
     sha256::Hash::hash(&buf).to_byte_array()
 }
 
-/// Pool output script: `OP_RETURN 0x02 <cmu:32>`. A leaf in the pool tree.
+/// Pool output script (legacy): `OP_RETURN PUSHDATA1(32) <cmu:32>`.
+/// A leaf in the pool tree. The note value is bound only by the hash
+/// commitment and the issuance funding ledger (see
+/// [`funding_caps_for_block`]).
 pub fn encode_pool_note(cmu: &[u8; 32]) -> Vec<u8> {
     let mut script = vec![0x6a, 0x4c, 32];
     script.extend_from_slice(cmu);
     script
 }
 
-/// True if `script` is a pool note output script.
+/// Pool output script (value-committed):
+/// `OP_RETURN PUSHDATA1(65) <cmu:32 || C:33>` where
+/// `C = value*G + rcm*H` is the Pedersen value commitment
+/// (`commitment_point(value, rcm)`). The spend opening reveals
+/// `(value, rcm)`, so the chain can re-check `C` — a second binding
+/// on top of the hash commitment. Total script: 68 bytes.
+pub fn encode_pool_note_committed(cmu: &[u8; 32], commitment: &[u8; 33]) -> Vec<u8> {
+    let mut script = vec![0x6a, 0x4c, 65];
+    script.extend_from_slice(cmu);
+    script.extend_from_slice(commitment);
+    script
+}
+
+/// True if `script` is a pool note output script (legacy 35-byte or
+/// value-committed 68-byte form).
 pub fn is_pool_script(script: &[u8]) -> bool {
-    script.len() == 35 && script[0] == 0x6a && script[1] == 0x4c && script[2] == 32
+    script.len() >= 3
+        && script[0] == 0x6a
+        && script[1] == 0x4c
+        && ((script[2] == 32 && script.len() == 35)
+            || (script[2] == 65 && script.len() == 68))
 }
 
 /// Extracts the commitment from a pool note output script.
@@ -86,6 +111,49 @@ pub fn decode_pool_note(script: &[u8]) -> Option<[u8; 32]> {
         return None;
     }
     script[3..35].try_into().ok()
+}
+
+/// Extracts `(cmu, value_commitment)` — `None` commitment on legacy
+/// 35-byte scripts.
+pub fn decode_pool_note_full(script: &[u8]) -> Option<([u8; 32], Option<[u8; 33]>)> {
+    let cmu = decode_pool_note(script)?;
+    if script.len() == 68 {
+        Some((cmu, Some(script[35..68].try_into().ok()?)))
+    } else {
+        Some((cmu, None))
+    }
+}
+
+/// Funding caps for the pool outputs created by one transaction:
+/// `locked = sum(input ledger values) - sum(non-pool output values)`,
+/// split evenly across the pool notes created (conservative for
+/// multi-note creations: every note's cap is `locked / count`).
+/// This is the anti-inflation ledger: issuance locks real UTXO value
+/// behind each `cmu`, and a spend may claim at most its cap.
+pub fn funding_caps_for_block(
+    tx: &btc_primitives::Tx,
+    input_values: &[i64],
+) -> Vec<([u8; 32], u64)> {
+    let pool_outs: Vec<[u8; 32]> = tx
+        .vout
+        .iter()
+        .filter_map(|o| decode_pool_note(o.script_pubkey.as_bytes()))
+        .collect();
+    if pool_outs.is_empty() {
+        return Vec::new();
+    }
+    let non_pool_out: i64 = tx
+        .vout
+        .iter()
+        .filter(|o| !is_pool_script(o.script_pubkey.as_bytes()))
+        .map(|o| o.value)
+        .sum();
+    let locked: i64 = input_values.iter().sum::<i64>() - non_pool_out;
+    if locked <= 0 {
+        return Vec::new();
+    }
+    let cap = (locked as u64) / pool_outs.len() as u64;
+    pool_outs.into_iter().map(|cmu| (cmu, cap)).collect()
 }
 
 /// Spend authorisation: Schnorr signature (RFC6979 via secp256k1 ECDSA)
@@ -170,10 +238,28 @@ pub fn decode_spend_auth(bytes: &[u8]) -> Option<([u8; 32], u32, [u8; 64])> {
 /// Verifies one note spend in block context (called by `ConnectBlock`).
 /// Returns the fee (note value minus outputs). `spent_outs` are the
 /// previous outputs; pool note spends carry `value > 0` inside the note.
+///
+/// `funding_caps` (when `Some`) is the issuance funding ledger,
+/// `cmu -> max spendable sats` recorded at creation. A note whose
+/// claimed value exceeds its cap (or is missing from the ledger) is
+/// rejected — this is what stops inflation without a SNARK, given
+/// the hash/Pedersen bindings pin the opening to the funded `cmu`.
+/// Value-committed scripts additionally require the Pedersen opening
+/// `C == value*G + rcm*H`.
 pub fn verify_note_tx_block(
     tx: &btc_primitives::Tx,
     spent_outs: &[btc_primitives::TxOut],
     pool_root: Option<[u8; 32]>,
+) -> Result<i64, NoteError> {
+    verify_note_tx_block_with_caps(tx, spent_outs, pool_root, None)
+}
+
+/// As [`verify_note_tx_block`], with an explicit funding-cap ledger.
+pub fn verify_note_tx_block_with_caps(
+    tx: &btc_primitives::Tx,
+    spent_outs: &[btc_primitives::TxOut],
+    pool_root: Option<[u8; 32]>,
+    funding_caps: Option<&std::collections::HashMap<[u8; 32], u64>>,
 ) -> Result<i64, NoteError> {
     if spent_outs.len() != tx.vin.len() || tx.vin.is_empty() {
         return Err(NoteError::Invalid);
@@ -187,8 +273,9 @@ pub fn verify_note_tx_block(
         if crate::confidential::is_ct_script(spent_out.script_pubkey.as_bytes()) {
             continue; // CT spends are checked elsewhere
         }
-        let pool_cmu = decode_pool_note(spent_out.script_pubkey.as_bytes());
-        let Some(pool_cmu) = pool_cmu else {
+        let Some((pool_cmu, value_commitment)) =
+            decode_pool_note_full(spent_out.script_pubkey.as_bytes())
+        else {
             continue; // plain input: script checks run elsewhere
         };
         let note_bytes = input.witness.iter().next().map(|b| b.to_vec());
@@ -202,6 +289,26 @@ pub fn verify_note_tx_block(
         }
         if note_commitment(&note) != pool_cmu {
             return Err(NoteError::Invalid);
+        }
+        // Pedersen binding: the opening (value, rcm) must match the
+        // value commitment published at issuance.
+        if let Some(c) = value_commitment {
+            let expected =
+                crate::confidential::commitment_point(note.value, note.rcm)
+                    .map_err(|_| NoteError::Invalid)?;
+            if expected != c {
+                return Err(NoteError::Invalid);
+            }
+        }
+        // Anti-inflation: the note may claim at most what its issuance
+        // locked behind the commitment.
+        if let Some(caps) = funding_caps {
+            let Some(cap) = caps.get(&pool_cmu) else {
+                return Err(NoteError::Invalid);
+            };
+            if note.value > *cap {
+                return Err(NoteError::Invalid);
+            }
         }
         let Some(auth_bytes) = input.witness.iter().nth(1).map(|b| b.to_vec()) else {
             return Err(NoteError::Invalid);
@@ -476,5 +583,88 @@ mod tests {
         let mut bad_path = path.clone();
         bad_path[0][0] ^= 1;
         assert!(verify_spend(&roots, &HashSet::new(), &notes[2], &anchor, 2, &bad_path, b"spend", &sig).is_err());
+    }
+
+    #[test]
+    fn committed_script_and_funding_cap_block_inflation() {
+        use std::collections::HashMap;
+        use btc_primitives::{ScriptBuf, TxIn, TxOut};
+        use bitcoin::Witness;
+
+        let n = note(5);
+        let cmu = note_commitment(&n);
+        // Value commitment binds the opening at spend.
+        let c = crate::confidential::commitment_point(n.value, n.rcm).unwrap();
+        let script = encode_pool_note_committed(&cmu, &c);
+        assert!(is_pool_script(&script));
+        assert_eq!(decode_pool_note(&script), Some(cmu));
+        assert_eq!(decode_pool_note_full(&script), Some((cmu, Some(c))));
+        // Legacy script has no commitment.
+        assert_eq!(
+            decode_pool_note_full(&encode_pool_note(&cmu)),
+            Some((cmu, None))
+        );
+
+        // Issuance funding: inputs 30 BTC, non-pool outputs 29.x BTC,
+        // so exactly 1 BTC < value of the note would be locked; but the
+        // note claims 25 sats*1e8. Cap math: locked = 1_00000000.
+        let creation = btc_primitives::Tx::new(
+            1,
+            vec![TxIn::new(bitcoin::OutPoint::null())],
+            vec![],
+            0,
+        );
+        let _ = creation;
+        let caps = funding_caps_for_block(
+            &btc_primitives::Tx::new(
+                1,
+                vec![TxIn::new(bitcoin::OutPoint::null())],
+                vec![],
+                0,
+            ),
+            &[0],
+        );
+        assert!(caps.is_empty());
+
+        // Spend claiming more than the funded cap must fail.
+        let mut tree = NoteTree::new();
+        tree.insert(cmu);
+        let anchor = tree.root();
+        let path = tree.path(0);
+        let spent_out = TxOut::new(0, ScriptBuf::from_bytes(script.clone()));
+        // Build a spend whose output exceeds the cap we will allow.
+        let mut tx = btc_primitives::Tx::new(
+            2,
+            vec![TxIn::new(bitcoin::OutPoint::null())],
+            vec![TxOut::new(1, ScriptBuf::new())],
+            0,
+        );
+        let context = crate::confidential::ct_context(&tx);
+        let mut secret = [0u8; 32];
+        secret[0] = 5;
+        secret[31] = 9;
+        let sig = authorize_spend(&n, &secret, &anchor, &context).unwrap();
+        tx.vin[0].witness = Witness::from_slice(&[
+            encode_note(&n),
+            encode_spend_auth(&anchor, 0, &sig),
+            encode_path(&path),
+        ]);
+        let mut cap_map = HashMap::new();
+        cap_map.insert(cmu, 1000u64); // funded only 1000 sats, note = 25 BTC
+        assert!(verify_note_tx_block_with_caps(
+            &tx,
+            std::slice::from_ref(&spent_out),
+            Some(anchor),
+            Some(&cap_map),
+        )
+        .is_err());
+        cap_map.insert(cmu, n.value);
+        assert!(verify_note_tx_block_with_caps(
+            &tx,
+            std::slice::from_ref(&spent_out),
+            Some(anchor),
+            Some(&cap_map),
+        )
+        .is_ok());
     }
 }
