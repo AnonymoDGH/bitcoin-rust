@@ -686,6 +686,7 @@ impl Wallet {
         let fee = note.value - amount as u64;
         let transcript = btc_chain::value_snark::transcript_for_spend(
             &note,
+            &btc_chain::notes::note_commitment(&note),
             amount as u64,
             fee,
             cap,
@@ -770,13 +771,15 @@ impl Wallet {
         let sig = authorize_spend(&note, secret, &anchor, &context)
             .map_err(|_| WalletError::Build("note authorize failed".into()))?;
         let dummy = [0u8; 32];
+        let cmu = btc_chain::notes::note_commitment(&note);
         let transcript = btc_chain::value_snark::ValueTranscript {
             fee,
             cap,
-            c_old: btc_chain::value_snark::value_commitment(note.value, &note.rcm),
+            cmu: btc_chain::value_snark::cmu_field(&cmu),
+            c_old: btc_chain::value_snark::value_commitment(note.value, &note.rcm, &cmu),
             c_new: [
-                btc_chain::value_snark::value_commitment(new_value, &rcm),
-                btc_chain::value_snark::value_commitment(0, &dummy),
+                btc_chain::value_snark::new_commitment(new_value, &rcm),
+                btc_chain::value_snark::new_commitment(0, &dummy),
             ],
         };
         let snark_witness = btc_chain::value_snark::ValueWitness {
