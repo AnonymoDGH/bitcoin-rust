@@ -144,6 +144,7 @@ dependencies = [
  "btc-primitives",
  "btc-script",
  "btc-validation",
+ "getrandom 0.2.17",
  "primitive-types",
  "thiserror",
 ]
@@ -264,6 +265,7 @@ dependencies = [
  "aes",
  "bitcoin",
  "bitcoin_hashes",
+ "btc-chain",
  "btc-consensus",
  "btc-primitives",
  "btc-script",
