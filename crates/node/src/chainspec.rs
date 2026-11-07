@@ -44,6 +44,7 @@ struct SpecFile {
     pow_limit: Option<String>,
     allow_min_difficulty_blocks: Option<bool>,
     no_retargeting: Option<bool>,
+    ct_enabled: Option<bool>,
     bech32_hrp: Option<String>,
     pubkey_address_prefix: Option<u8>,
     script_address_prefix: Option<u8>,
@@ -125,6 +126,9 @@ pub fn parse_chain_spec(json: &str) -> Result<CustomChainSpec, ChainSpecError> {
     if let Some(flag) = file.no_retargeting {
         spec.no_retargeting = flag;
     }
+    if let Some(flag) = file.ct_enabled {
+        spec.ct_enabled = flag;
+    }
     if let Some(hrp) = file.bech32_hrp {
         spec.bech32_hrp = hrp;
     }
@@ -164,6 +168,7 @@ pub fn example_spec_json() -> String {
         "pow_limit": spec.pow_limit.to_big_endian().to_lower_hex_string(),
         "allow_min_difficulty_blocks": spec.allow_min_difficulty_blocks,
         "no_retargeting": spec.no_retargeting,
+        "ct_enabled": spec.ct_enabled,
         "bech32_hrp": spec.bech32_hrp,
         "pubkey_address_prefix": spec.pubkey_address_prefix,
         "script_address_prefix": spec.script_address_prefix,
