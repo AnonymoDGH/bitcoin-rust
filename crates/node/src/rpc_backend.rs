@@ -541,6 +541,29 @@ impl WalletRpc for NodeRpc {
         self.with_node(|n| n.wallet_spend_note(bytes, amount))
     }
 
+    fn list_notes(&self) -> Vec<btc_rpc::NoteEntry> {
+        self.with_wallet(|w, _| {
+            w.list_notes()
+                .into_iter()
+                .map(|n| btc_rpc::NoteEntry {
+                    commitment: n
+                        .commitment
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect(),
+                    value: n.value,
+                    spent: n.spent,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    fn export_view_key(&self) -> Result<String, String> {
+        self.with_wallet(|w, _| w.export_view_key().map_err(wallet_error_message))
+            .unwrap_or_else(|| Err("wallet disabled".into()))
+    }
+
     fn dump_privkey(&self, script: &ScriptBuf) -> Result<String, String> {
         self.with_wallet(|w, _| w.dump_wif(script).map_err(wallet_error_message))
             .unwrap_or_else(|| Err("wallet disabled".into()))
