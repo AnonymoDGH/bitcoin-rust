@@ -184,6 +184,26 @@ impl Node {
         Ok(txid)
     }
 
+    /// `shieldtoct`: shield an amount of plaintext balance into a
+    /// confidential output owned by this wallet.
+    pub fn wallet_send_ct(&mut self, amount: u64, fee: i64) -> Result<Txid, String> {
+        if amount == 0 {
+            return Err("Invalid amount for send".to_string());
+        }
+        let tip = self.chainstate.height();
+        let wallet = self.wallet.as_mut().ok_or("wallet disabled")?;
+        let (tx, info, outpoint) = wallet
+            .create_hybrid_ct(tip, amount, fee)
+            .map_err(wallet_error_message)?;
+        let txid = self.submit_tx(tx.clone()).map_err(|e| format!("transaction rejected: {e:?}"))?;
+        if let Some(w) = self.wallet.as_mut() {
+            w.commit_transaction(&tx).map_err(wallet_error_message)?;
+            w.record_ct_coin(outpoint, tx.vout[0].script_pubkey.clone(), info)
+                .map_err(wallet_error_message)?;
+        }
+        Ok(txid)
+    }
+
     /// `ProcessNewBlock` + mempool/fee updates. Ok(true) if new.
     pub fn submit_block(&mut self, block: &Block) -> Result<bool, ValidationError> {
         let result = self.chainstate.process_new_block(block, now_secs());
