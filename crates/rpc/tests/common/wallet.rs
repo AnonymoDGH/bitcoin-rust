@@ -294,4 +294,8 @@ impl WalletRpc for MockWallet {
     fn list_stealth_utxos(&self, _minconf: u32, _max_blocks: u32) -> Vec<WalletUtxo> {
         Vec::new()
     }
+
+    fn send_to_stealth(&self, _address_hex: String, _amount: i64, _fee_rate: Option<i64>) -> Result<Txid, String> {
+        Ok(Txid::from_byte_array([7u8; 32]))
+    }
 }
