@@ -339,6 +339,65 @@ mod tests {
     }
 
     #[test]
+    fn stealth_payment_is_found_by_recipient_scan() {
+        let mut node = Node::new(
+            ChainParams::regtest(),
+            regtest_genesis_block(),
+            Box::new(CoinsViewMemory::new()),
+            Box::<MemBlockStore>::default(),
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("btc-node-wallet-stealth-pay-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let wallet = Wallet::create(&dir).unwrap();
+        node.attach_wallet(wallet).unwrap();
+        let shutdown = Arc::new(Notify::new());
+        let rpc = NodeRpc::new(node.shared(), shutdown);
+
+        // Fund the wallet with mature coinbase outputs.
+        let funded = result(&call(&rpc, "getnewaddress", json!([]))).clone();
+        let funded_addr = funded.as_str().unwrap().to_owned();
+        let hashes: Vec<String> = serde_json::from_value(
+            result(&call(&rpc, "generatetoaddress", json!([101, funded_addr])))
+                .clone(),
+        )
+        .unwrap();
+        assert_eq!(hashes.len(), 101);
+
+        // Pay 1 coin to our own stealth address (exercises sender side).
+        let stealth_addr = result(&call(&rpc, "getnewstealthaddress", json!([]))).clone();
+        let reply = call(
+            &rpc,
+            "sendtostealthaddress",
+            json!([stealth_addr.as_str().unwrap(), 1.0]),
+        );
+        let txid = result(&reply);
+        assert!(!txid.as_str().unwrap().is_empty());
+
+        // Mine the stealth transaction into a block and rescan.
+        let mempool = result(&call(&rpc, "getrawmempool", json!([]))).clone();
+        assert!(!mempool.as_array().unwrap().is_empty());
+        let mined: Vec<String> = serde_json::from_value(
+            result(&call(
+                &rpc,
+                "generatetoaddress",
+                json!([1, result(&call(&rpc, "getnewaddress", json!([]))).as_str().unwrap()]),
+            ))
+            .clone(),
+        )
+        .unwrap();
+        assert_eq!(mined.len(), 1);
+
+        let utxos = result(&call(&rpc, "liststealthutxos", json!([]))).clone();
+        let arr = utxos.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "recipient scan finds the stealth payment: {arr:?}");
+        assert!((arr[0]["amount"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+        assert!(arr[0]["confirmations"].as_u64().unwrap() >= 1);
+
+        std::fs::remove_file(&dir).unwrap();
+    }
+
+    #[test]
     fn gettxout_and_raw_transaction_for_block_one_coinbase() {
         let (rpc, _) = regtest_backend();
         let hashes: Vec<String> = serde_json::from_value(
@@ -446,6 +505,15 @@ impl WalletRpc for NodeRpc {
 
     fn send_to(&self, script: ScriptBuf, amount: i64, fee_rate: Option<i64>, subtract_fee: bool) -> Result<Txid, String> {
         self.with_node(|n| n.wallet_send(script, amount, fee_rate, subtract_fee))
+    }
+
+    fn send_to_stealth(&self, address_hex: String, amount: i64, fee_rate: Option<i64>) -> Result<Txid, String> {
+        use bitcoin::hex::FromHex;
+        let bytes = Vec::<u8>::from_hex(&address_hex)
+            .map_err(|_| "Invalid stealth address: expected 66 bytes as hex".to_string())?;
+        let address = btc_wallet::stealth::StealthAddress::from_bytes(&bytes)
+            .map_err(|_| "Invalid stealth address: expected 66 bytes as hex".to_string())?;
+        self.with_node(|n| n.wallet_send_stealth(address, amount, fee_rate))
     }
 
     fn dump_privkey(&self, script: &ScriptBuf) -> Result<String, String> {
