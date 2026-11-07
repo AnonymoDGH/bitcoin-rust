@@ -24,7 +24,7 @@ pub use genesis::{
     create_genesis_block, mainnet_genesis_block, mine_genesis, regtest_genesis_block,
     testnet_genesis_block,
 };
-pub use params::{ChainParams, ChainType, CustomChainSpec, Deployments};
+pub use params::{ChainParams, ChainType, CustomChainSpec, Deployments, CT_SCRIPT_VERSION};
 pub use pow::{
     calculate_next_work_required, chain_work, next_work_required, work_from_bits, RetargetInput,
 };

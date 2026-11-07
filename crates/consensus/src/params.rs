@@ -36,6 +36,11 @@ pub const MAINNET_POW_LIMIT: &str =
 pub const REGTEST_POW_LIMIT: &str =
     "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
+/// Version byte marking a confidential output script (see
+/// `btc-chain::confidential`): scripts starting `OP_RETURN 0x01 ...`
+/// carry a Pedersen commitment plus a range proof.
+pub const CT_SCRIPT_VERSION: u8 = 0x01;
+
 /// The chains for which parameters are provided.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -98,6 +103,10 @@ pub struct ChainParams {
     pub allow_min_difficulty_blocks: bool,
     /// `fPowNoRetargeting` (regtest).
     pub no_retargeting: bool,
+    /// Whether confidential outputs/transactions (Pedersen commitments +
+    /// range and balance proofs, see `btc-chain::confidential`) are valid
+    /// on this chain. Off for mainnet/testnet/regtest; on for AnonCoin.
+    pub ct_enabled: bool,
     /// `enforce_BIP94` (testnet4 timewarp mitigation; off for these chains).
     pub enforce_bip94: bool,
     /// `bech32_hrp`: human-readable part for segwit/taproot addresses.
@@ -153,6 +162,7 @@ impl ChainParams {
             target_timespan: 14 * 24 * 60 * 60,
             allow_min_difficulty_blocks: false,
             no_retargeting: false,
+            ct_enabled: false,
             enforce_bip94: false,
             deployments: Deployments {
                 bip34_height: 227_931,
@@ -201,6 +211,7 @@ impl ChainParams {
             target_timespan: 14 * 24 * 60 * 60,
             allow_min_difficulty_blocks: true,
             no_retargeting: false,
+            ct_enabled: false,
             enforce_bip94: false,
             deployments: Deployments {
                 bip34_height: 21_111,
@@ -243,6 +254,7 @@ impl ChainParams {
             target_timespan: 24 * 60 * 60,
             allow_min_difficulty_blocks: true,
             no_retargeting: true,
+            ct_enabled: false,
             enforce_bip94: false,
             deployments: Deployments::all_active(),
             bech32_hrp: "bcrt".to_string(),
@@ -289,6 +301,7 @@ impl ChainParams {
             target_timespan: spec.target_timespan,
             allow_min_difficulty_blocks: spec.allow_min_difficulty_blocks,
             no_retargeting: spec.no_retargeting,
+            ct_enabled: spec.ct_enabled,
             enforce_bip94: false,
             deployments: Deployments::all_active(),
             bech32_hrp: spec.bech32_hrp.clone(),
@@ -369,6 +382,8 @@ pub struct CustomChainSpec {
     pub allow_min_difficulty_blocks: bool,
     /// `fPowNoRetargeting`.
     pub no_retargeting: bool,
+    /// Whether confidential outputs/transactions are valid on this chain.
+    pub ct_enabled: bool,
     /// `bech32_hrp`.
     pub bech32_hrp: String,
     /// `base58Prefixes[PUBKEY_ADDRESS]`.
@@ -405,6 +420,7 @@ impl Default for CustomChainSpec {
             pow_limit: decode_compact(genesis_bits).expect("hard-coded bits are valid"),
             allow_min_difficulty_blocks: false,
             no_retargeting: false,
+            ct_enabled: true,
             bech32_hrp: "an".to_string(),
             pubkey_address_prefix: 65,
             script_address_prefix: 10,
@@ -496,6 +512,7 @@ mod tests {
         assert_eq!(spec.target_timespan / spec.target_spacing, 2016);
         assert!(!spec.allow_min_difficulty_blocks);
         assert!(!spec.no_retargeting);
+        assert!(spec.ct_enabled);
     }
 
     #[test]
