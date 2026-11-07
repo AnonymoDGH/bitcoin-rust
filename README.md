@@ -52,8 +52,12 @@ curl -u u:p -d '{"method":"sendtoaddress","params":["<other address>", 12.5]}' h
 
 Wallet RPCs: `getnewaddress`, `getbalance`, `getbalances`, `listunspent`, `sendtoaddress`, `getwalletinfo`,
 `listtransactions`, `dumpprivkey`, `importprivkey`, `encryptwallet`, `walletpassphrase`, `walletlock`,
-`validateaddress`. Flags: `-wallet=<file>`, `-disablewallet`, `-seednode`, `-addnode`, `-dnsseed`,
-`-externalip`, `-maxconnections`. Add `"seeds": ["host:port", ...]` to the chain spec for discovery.
+`validateaddress`, `getnewstealthaddress`, `liststealthutxos`, `sendtostealthaddress`. Flags: `-wallet=<file>`, `-disablewallet`, `-seednode`, `-addnode`, `-dnsseed`,
+`-externalip`, `-maxconnections`, `-proxy`. Add `"seeds": ["host:port", ...]` to the chain spec for discovery.
+
+Privacy (AnonCoin): stealth addresses, coordinator-free CoinJoin, SOCKS5 proxy + relay jitter,
+and primitives-level confidential transactions + 16-key ring signatures — see
+`docs/privacy-plan.md` for the threat model and the phased design.
 
 Mining: `generatetoaddress <n> <address>` for explicit blocks, or `-gen -genaddress=<address|script hex>`
 to mine in the background. `-gen` hashes until a block is found and immediately starts the next template;
