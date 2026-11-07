@@ -116,19 +116,28 @@ pub fn connect_block(
                 // miner revenue. Subtract the caps so the coinbase can
                 // only claim real fees — otherwise the note value is
                 // minted twice (fee + later spend).
-                let fee = check_tx_inputs(tx, coins, height)?;
-                let fee = if tx.vout.iter().any(|o| {
+                let ledger_fee = check_tx_inputs(tx, coins, height)?;
+                let pool_locked = if tx.vout.iter().any(|o| {
                     crate::notes::is_pool_script(o.script_pubkey.as_bytes())
                 }) {
                     let input_values: Vec<i64> =
                         spent_outs.iter().map(|o| o.value).collect();
                     let caps =
                         crate::notes::funding_caps_for_block(tx, &input_values);
-                    let locked: i64 =
-                        caps.iter().map(|(_, cap)| *cap as i64).sum();
-                    fee - locked
+                    caps.iter().map(|(_, cap)| *cap as i64).sum::<i64>()
                 } else {
-                    fee
+                    0
+                };
+                // CT txs hide value from the ledger: the only sound
+                // miner fee is the balance-proof public fee prefix
+                // (proven on chain). The ledger fee would overstate
+                // by the hidden amounts and mint them twice.
+                let fee = if params.ct_enabled
+                    && crate::confidential::is_ct_tx(tx, &spent_outs)
+                {
+                    crate::confidential::ct_public_fee(tx) as i64
+                } else {
+                    ledger_fee - pool_locked
                 };
                 if fee < 0 {
                     return Err(ValidationError::AccumulatedFeeOutOfRange);
@@ -706,10 +715,10 @@ mod tests {
             false,
         );
         let height = f.tree.get(f.tip).height + 1;
-        let cb = coinbase_tx(height, f.params.block_subsidy(height));
+        let cb = coinbase_tx(height, f.params.block_subsidy(height) + 10_000);
         let (id, block) = next_block(&mut f.tree, f.tip, vec![cb, tx], height);
         let summary = connect(&mut f.base, &f.tree, &params, id, &block).unwrap();
-        assert_eq!(summary.fees, 0);
+        assert_eq!(summary.fees, 10_000, "miner fee is the balance-proof public fee");
         assert!(f.base.get_coin(&coin_outpoint).is_none());
     }
 
