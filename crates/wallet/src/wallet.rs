@@ -655,7 +655,9 @@ impl Wallet {
 
     /// Builds a note spend: spends the pool output at `prevout` with the
     /// note opening, anchor authorisation and membership path, to the
-    /// given recipient script.
+    /// given recipient script. `cap` is the note's on-chain funding
+    /// cap (from the funding ledger); a Groth16 value-hiding proof is
+    /// generated and attached as `witness[3]`.
     pub fn create_note_spend(
         &mut self,
         prevout: OutPoint,
@@ -666,6 +668,7 @@ impl Wallet {
         path: Vec<[u8; 32]>,
         recipient_script: ScriptBuf,
         amount: i64,
+        cap: u64,
     ) -> Result<Tx, WalletError> {
         use btc_chain::notes::{
             authorize_spend, encode_note, encode_path, encode_spend_auth,
@@ -673,14 +676,34 @@ impl Wallet {
         if note.value == 0 || amount <= 0 || amount as u64 > note.value {
             return Err(WalletError::Build("note spend amount out of range".into()));
         }
+        if note.value > cap {
+            return Err(WalletError::Build("note value exceeds funding cap".into()));
+        }
         let mut tx = Tx::new(2, vec![TxIn::new(prevout)], vec![TxOut::new(amount, recipient_script)], 0);
         let context = btc_chain::confidential::ct_context(&tx);
         let sig = authorize_spend(&note, secret, &anchor, &context)
             .map_err(|_| WalletError::Build("note authorize failed".into()))?;
+        let fee = note.value - amount as u64;
+        let transcript = btc_chain::value_snark::transcript_for_spend(
+            &note,
+            amount as u64,
+            fee,
+            cap,
+        );
+        let dummy = [0u8; 32];
+        let snark_witness = btc_chain::value_snark::ValueWitness {
+            v_old: note.value,
+            rcm_old: note.rcm,
+            v_new: [amount as u64, 0],
+            rcm_new: [dummy, dummy],
+        };
+        let proof = btc_chain::value_snark::prove(transcript, snark_witness)
+            .map_err(|_| WalletError::Build("note value proof failed".into()))?;
         tx.vin[0].witness = bitcoin::Witness::from_slice(&[
             encode_note(&note),
             encode_spend_auth(&anchor, index, &sig),
             encode_path(&path),
+            btc_chain::value_snark::serialize_proof(&proof),
         ]);
         Ok(tx)
     }
@@ -1953,7 +1976,7 @@ mod tests {
         let spendscript = ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([0x42; 20]));
         let spent_tx = Wallet::open(&file.0)
             .unwrap()
-            .create_note_spend(note_op, note.clone(), &note_coin.secret, anchor, 0, path, spendscript, 99_990000)
+            .create_note_spend(note_op, note.clone(), &note_coin.secret, anchor, 0, path, spendscript, 99_990000, note.value)
             .unwrap();
         let spent_outs = [btc_primitives::TxOut::new(0, note_tx.vout[0].script_pubkey.clone())];
         btc_chain::notes::verify_note_tx_block(
