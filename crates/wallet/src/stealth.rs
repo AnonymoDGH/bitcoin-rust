@@ -163,6 +163,39 @@ pub struct StealthPayment {
     pub script_pubkey: ScriptBuf,
 }
 
+/// BIP47-style marker output: `OP_RETURN <ephemeral_pub>`.
+/// Senders include this output (value 0) in the same transaction as the
+/// stealth payment so the recipient's scanner can find the ephemeral key
+/// and derive the one-time address to look for.
+pub fn marker_script(ephemeral_pub: &PublicKey) -> ScriptBuf {
+    let mut buf = vec![0x6a, 0x21];
+    buf.extend_from_slice(&ephemeral_pub.serialize());
+    ScriptBuf::from_bytes(buf)
+}
+
+/// Parses a marker output back to the ephemeral public key.
+pub fn parse_marker(script: &ScriptBuf) -> Option<PublicKey> {
+    let bytes = script.as_bytes();
+    if bytes.len() == 35 && bytes[0] == 0x6a && bytes[1] == 0x21 {
+        PublicKey::from_slice(&bytes[2..]).ok()
+    } else {
+        None
+    }
+}
+
+/// Extracts the 20-byte HASH160 from a P2PKH or P2WPKH script,
+/// which is what stealth one-time keys are compared against.
+pub fn extract_hash160(script: &ScriptBuf) -> Option<PubkeyHash> {
+    let b = script.as_bytes();
+    if script.is_p2pkh() {
+        PubkeyHash::from_slice(&b[3..23]).ok()
+    } else if script.is_p2wpkh() {
+        PubkeyHash::from_slice(&b[2..22]).ok()
+    } else {
+        None
+    }
+}
+
 fn shared_tweak(shared: [u8; 32]) -> Scalar {
     // SHA256 of the ECDH secret; the chance of it exceeding the curve
     // order (and Scalar::from_be_bytes failing) is negligible, but fall
@@ -249,6 +282,17 @@ mod tests {
         let addr = keys.address();
         assert_eq!(StealthAddress::from_bytes(&addr.to_bytes()).unwrap(), addr);
         assert!(StealthAddress::from_bytes(&[1u8; 65]).is_err());
+    }
+
+    #[test]
+    fn marker_round_trips() {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[4u8; 32]).unwrap();
+        let pk = PublicKey::from_secret_key(&secp, &sk);
+        let marker = marker_script(&pk);
+        assert_eq!(parse_marker(&marker), Some(pk));
+        assert!(parse_marker(&ScriptBuf::from_bytes(vec![0x6a])).is_none());
+        assert_eq!(extract_hash160(&ScriptBuf::from_bytes(vec![0x6a])), None);
     }
 
     #[test]

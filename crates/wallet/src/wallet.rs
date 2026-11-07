@@ -61,6 +61,8 @@ pub enum WalletError {
     Conflict(Txid),
     #[error(transparent)]
     Key(#[from] KeyError),
+    #[error(transparent)]
+    Stealth(#[from] crate::stealth::StealthError),
 }
 
 /// How a wallet transaction affects the wallet, as `listtransactions` categorizes it.
@@ -187,6 +189,47 @@ impl Wallet {
         let id = self.add_key(key)?;
         self.save()?;
         self.script_of_kind(&id, kind)
+    }
+
+    /// Derives the wallet's reusable stealth invitation address.
+    ///
+    /// Deterministically derived from the first wallet key (spending and
+    /// scan secrets are domain-separated hashes of the key secret), so no
+    /// new secret material is stored and encrypted wallets keep the
+    /// protection of the existing crypter. Creates a key if the wallet is
+    /// empty, like `new_script`. Requires the wallet to be unlocked.
+    pub fn stealth_address(&mut self) -> Result<crate::stealth::StealthAddress, WalletError> {
+        self.check_unlocked()?;
+        if self.keys.is_empty() {
+            // Ensure at least one wallet key exists to derive from.
+            self.new_script(ScriptKind::P2wpkh)?;
+        }
+        Ok(self.stealth_keys()?.address())
+    }
+
+    /// The stealth keypair behind `stealth_address`.
+    pub fn stealth_keys(&self) -> Result<crate::stealth::StealthKeys, WalletError> {
+        use bitcoin_hashes::{sha256, Hash as _};
+        let id = self
+            .keys
+            .key_ids()
+            .next()
+            .ok_or(WalletError::Locked)?;
+        let key = self.keys.private_key(id).ok_or(WalletError::Locked)?;
+        let secret = key.inner.secret_bytes();
+        let derive = |label: &[u8]| -> Result<[u8; 32], WalletError> {
+            let mut buf = secret.to_vec();
+            buf.extend_from_slice(label);
+            let hash = sha256::Hash::hash(&buf);
+            let mut out = [0u8; 32];
+            out.copy_from_slice(hash.as_ref());
+            Ok(out)
+        };
+        crate::stealth::StealthKeys::from_secrets(
+            &derive(b"anoncoin-stealth-spending")?,
+            &derive(b"anoncoin-stealth-scan")?,
+        )
+        .map_err(WalletError::Stealth)
     }
 
     /// Imports a WIF private key. Importing a known key changes nothing.
@@ -1177,6 +1220,17 @@ mod tests {
         assert_eq!(wallet.best_block(), best);
         assert_eq!(wallet.transactions().len(), 1);
         assert_eq!(wallet.transactions()[0].category, Category::Generate);
+    }
+
+    #[test]
+    fn stealth_address_is_deterministic_across_reopen() {
+        let file = TestFile::new("stealth");
+        let mut wallet = Wallet::create(&file.0).unwrap();
+        let first = wallet.stealth_address().unwrap();
+        assert_eq!(wallet.stealth_address().unwrap(), first);
+        drop(wallet);
+        let wallet = Wallet::open(&file.0).unwrap();
+        assert_eq!(wallet.stealth_keys().unwrap().address(), first);
     }
 
     #[test]
