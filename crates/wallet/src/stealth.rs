@@ -213,6 +213,11 @@ fn shared_tweak(shared: [u8; 32]) -> Scalar {
     })
 }
 
+/// Generates a fresh ephemeral secret for one stealth payment.
+pub fn ephemeral_secret() -> Result<SecretKey, StealthError> {
+    random_secret()
+}
+
 fn random_secret() -> Result<SecretKey, StealthError> {
     loop {
         let mut bytes = [0u8; 32];
