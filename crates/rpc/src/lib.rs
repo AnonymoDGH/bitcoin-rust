@@ -13,7 +13,8 @@ mod params;
 mod wallet;
 
 pub use backend::{
-    BlockchainInfo, MempoolInfo, RpcBackend, WalletInfo, WalletRpc, WalletTx, WalletUtxo,
+    BlockchainInfo, MempoolInfo, NoteEntry, RpcBackend, WalletInfo, WalletRpc, WalletTx,
+    WalletUtxo,
 };
 pub use cookie::write_cookie;
 pub use dispatch::dispatch;

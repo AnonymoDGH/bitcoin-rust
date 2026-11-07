@@ -210,6 +210,14 @@ const WALLET_METHODS: &[Method] = &[
         name: "spendnote",
         params: &[("commitment", true), ("amount", true)],
     },
+    Method {
+        name: "listnotes",
+        params: &[],
+    },
+    Method {
+        name: "exportviewkey",
+        params: &[],
+    },
 ];
 
 /// Finds a method. Wallet methods are reported as missing when there is no wallet.

@@ -76,6 +76,14 @@ pub struct WalletUtxo {
     pub spendable: bool,
 }
 
+/// One note owned by the wallet (`listnotes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteEntry {
+    pub commitment: String,
+    pub value: u64,
+    pub spent: bool,
+}
+
 /// `getwalletinfo` fields.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WalletInfo {
@@ -129,6 +137,14 @@ pub trait WalletRpc: Send + Sync {
 
     /// Spends a shielded note by its commitment hex.
     fn spend_note(&self, cmu_hex: String, amount: i64) -> Result<Txid, String>;
+
+    /// Notes created by this wallet: commitment hex, value, spent status.
+    fn list_notes(&self) -> Vec<NoteEntry>;
+
+    /// Export the wallet's view key (hex): the value-detecting material
+    /// that lets an auditor scan for incoming payments without the
+    /// spending key.
+    fn export_view_key(&self) -> Result<String, String>;
 
     fn dump_privkey(&self, script: &ScriptBuf) -> Result<String, String>;
     fn import_privkey(&self, wif: &str) -> Result<(), String>;

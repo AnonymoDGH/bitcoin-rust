@@ -91,6 +91,21 @@ pub(crate) fn call(backend: &dyn RpcBackend, method: &str, args: &Args) -> RpcRe
                 .map_err(wallet_error)?;
             Ok(json!(cmu))
         }
+        "listnotes" => {
+            let notes = wallet.list_notes();
+            let rows = notes
+                .iter()
+                .map(|n| {
+                    json!({
+                        "commitment": n.commitment,
+                        "value": amount(n.value as i64),
+                        "spent": n.spent,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(Value::Array(rows))
+        }
+        "exportviewkey" => Ok(json!(wallet.export_view_key().map_err(wallet_error)?)),
         "spendnote" => {
             let commitment = args.str_req(0, "commitment")?;
             let sats = args.amount_req(1, "amount")?;
