@@ -116,11 +116,18 @@ protects the middle; the edges must be designed for too.
   signalling at the protocol level.
 
 ### Phase 3 — shielded pool
-- zk-SNARK notes (Orchard/Halo2-style, no trusted setup): sender,
-  receiver and amount hidden with a balance proof.
-- **View keys** for selective audit: prove a payment to a third
-  party without opening the rest.
-- Mobile-friendly proving (recursive/aggregated proofs later).
+**Implemented now (pre-zk milestone):** `crates/chain/src/notes.rs` —
+notes with `cmu = SHA256("AnonCoin-NOTE-v1" || pub || value || rcm)`,
+32-level Merkle anchors, hashed nullifiers (`nf = SHA256("AnonCoin-NF-v1"
+|| rcm)`), and Schnorr spend authorisation bound to the note's own
+spending key. `Chainstate` keeps the active pool state: `refresh_pool`
+replays the active chain to rebuild the commitment tree and per-tip
+anchors on every activation and at startup, and `pool_spent`/
+`register_nullifier` form the double-spend registry. `btc-wallet`
+creates, recovers (by spending secret) and authorises note spends.
+**TODO before lane-ready:** SNARKs over the same note definition to
+prove no inflation (utmost limitation of hash-based notes), on-chain
+shielded spends, and view keys.
 
 ## 4. Threat model (explicit)
 
