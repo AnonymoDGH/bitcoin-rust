@@ -162,9 +162,10 @@ pub fn accept_to_mempool(chainstate: &Chainstate, mempool: &mut Mempool, tx: Tx)
         && (tx.vout.iter().any(|o| crate::confidential::is_ct_script(o.script_pubkey.as_bytes()))
             || spent_outs.iter().any(|o| crate::confidential::is_ct_script(o.script_pubkey.as_bytes())));
     if is_ct {
-        let spent_scripts: Vec<btc_primitives::ScriptBuf> =
-            spent_outs.iter().map(|o| o.script_pubkey.clone()).collect();
-        if crate::confidential::verify_ct_tx_block(&tx, &spent_scripts).is_err() {
+        let check = |tx: &Tx, spent: &[TxOut], indices: &[usize]| {
+            crate::inputs::check_input_indices(tx, spent, standard_script_flags(), indices)
+        };
+        if crate::confidential::verify_ct_tx_block(&tx, &spent_outs, &check).is_err() {
             return Err(MempoolReject::Consensus("bad-ct-tx".into()));
         }
     }
