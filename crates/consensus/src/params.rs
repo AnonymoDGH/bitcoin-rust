@@ -381,9 +381,12 @@ pub struct CustomChainSpec {
 
 impl Default for CustomChainSpec {
     fn default() -> Self {
-        // 0x1f00ffff: easy enough that mining the genesis takes about 2^16
-        // hashes, and a 2.5 minute target spacing.
-        let genesis_bits = 0x1f00_ffff;
+        // 0x1e00ffff: ~16.7M expected hashes per block (256x harder than the
+        // old 0x1f00ffff placeholder). At ~150k-440k H/s on one CPU core this
+        // is roughly 40-110 s per block, and retargeting every 2016 blocks
+        // towards 600 s spacing with pow_limit == genesis target means the
+        // difficulty can only ever get harder than this, never easier.
+        let genesis_bits = 0x1e00_ffff;
         Self {
             name: "customnet".to_string(),
             magic: [0x5f, 0x4c, 0x7e, 0xa1],
@@ -397,7 +400,7 @@ impl Default for CustomChainSpec {
             genesis_bits,
             genesis_reward: 50 * COIN,
             halving_interval: 210_000,
-            target_spacing: 150,
+            target_spacing: 10 * 60,
             target_timespan: 14 * 24 * 60 * 60,
             pow_limit: decode_compact(genesis_bits).expect("hard-coded bits are valid"),
             allow_min_difficulty_blocks: false,
@@ -481,9 +484,29 @@ mod tests {
         );
     }
 
+    /// Difficulty of the default custom chain, without mining: ~16.7M
+    /// expected hashes per block, 600 s spacing, retarget every 2016 blocks.
+    #[test]
+    fn default_spec_is_hard_by_default() {
+        let spec = CustomChainSpec::default();
+        assert_eq!(spec.genesis_bits, 0x1e00_ffff);
+        assert_eq!(spec.pow_limit, decode_compact(0x1e00_ffff).unwrap());
+        assert_eq!(spec.target_spacing, 600);
+        assert_eq!(spec.target_timespan, 14 * 24 * 60 * 60);
+        assert_eq!(spec.target_timespan / spec.target_spacing, 2016);
+        assert!(!spec.allow_min_difficulty_blocks);
+        assert!(!spec.no_retargeting);
+    }
+
     #[test]
     fn custom_params_match_returned_genesis() {
-        let spec = CustomChainSpec::default();
+        // Easy bits so the test does not mine the (now hard) default genesis.
+        let regtest_limit = decode_compact(0x207f_ffff).unwrap();
+        let spec = CustomChainSpec {
+            genesis_bits: 0x207f_ffff,
+            pow_limit: regtest_limit,
+            ..CustomChainSpec::default()
+        };
         let (params, block) = ChainParams::custom(&spec);
 
         assert_eq!(params.genesis_hash, block.block_hash());
@@ -495,10 +518,10 @@ mod tests {
             (spec.default_port, spec.rpc_port)
         );
         assert_eq!(params.pow_limit, spec.pow_limit);
-        assert_eq!(params.pow_limit_bits(), 0x1f00_ffff);
+        assert_eq!(params.pow_limit_bits(), 0x207f_ffff);
         assert_eq!(params.halving_interval, spec.halving_interval);
-        assert_eq!(params.target_spacing, 150);
-        assert_eq!(params.difficulty_adjustment_interval(), 8064);
+        assert_eq!(params.target_spacing, 600);
+        assert_eq!(params.difficulty_adjustment_interval(), 2016);
         assert_eq!(params.bech32_hrp, spec.bech32_hrp);
         assert_eq!(params.pubkey_address_prefix, spec.pubkey_address_prefix);
         assert_eq!(params.script_address_prefix, spec.script_address_prefix);
