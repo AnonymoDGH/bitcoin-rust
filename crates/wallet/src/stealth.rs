@@ -63,6 +63,15 @@ impl StealthKeys {
         PublicKey::from_secret_key(&Secp256k1::new(), &self.scan)
     }
 
+    /// Internal view key for audit: `SHA256(scan_secret || "anon-view")`.
+    /// It detects payments without the spending key.
+    pub fn view_key(&self) -> [u8; 32] {
+        let mut buf = Vec::with_capacity(32 + 9);
+        buf.extend_from_slice(&self.scan.secret_bytes());
+        buf.extend_from_slice(b"anon-view");
+        sha256::Hash::hash(&buf).to_byte_array()
+    }
+
     /// The reusable invitation address shown to senders.
     pub fn address(&self) -> StealthAddress {
         StealthAddress {
