@@ -385,7 +385,10 @@ impl Chainstate {
 
         let summary = {
             let mut cache = CoinsViewCache::new(&mut *self.coins);
-            let summary = connect_block(&block, &self.tree, id, &mut cache, &self.params, self.connect_opts)?;
+            let mut opts = self.connect_opts;
+            // Note spends reference the anchor of the chain they extend.
+            opts.pool_root = Some(self.pool.root());
+            let summary = connect_block(&block, &self.tree, id, &mut cache, &self.params, opts)?;
             // Undo must be on disk before the UTXO set points at this block.
             self.store.put_undo(&hash, &summary.undo);
             cache.flush_with_best(hash);
