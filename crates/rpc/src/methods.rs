@@ -186,6 +186,14 @@ const WALLET_METHODS: &[Method] = &[
         name: "liststealthutxos",
         params: &[("minconf", false), ("max_blocks", false)],
     },
+    Method {
+        name: "sendtostealthaddress",
+        params: &[
+            ("stealth_address", true),
+            ("amount", true),
+            ("fee_rate", false),
+        ],
+    },
 ];
 
 /// Finds a method. Wallet methods are reported as missing when there is no wallet.
