@@ -93,6 +93,13 @@ pub struct P2pConfig {
     pub datadir: Option<PathBuf>,
     /// Keep loopback and private addresses in the table (regtest and tests).
     pub accept_local: bool,
+    /// SOCKS5 proxy for outbound connections (`-proxy=`, e.g. Tor's SOCKS
+    /// port). When set, inbound listening should be disabled: the proxy
+    /// carries clearnet IPs only, onion peers are not supported yet.
+    pub proxy: Option<SocketAddr>,
+    /// Maximum random delay before relaying a new transaction inventory
+    /// to a peer (relay jitter, Dandelion-style). Zero disables jitter.
+    pub relay_jitter: Duration,
     /// Interval between checks for free automatic outbound slots.
     pub outbound_interval: Duration,
     /// Interval between `peers.dat` writes.
@@ -115,6 +122,8 @@ impl Default for P2pConfig {
             advertise: None,
             datadir: None,
             accept_local: false,
+            proxy: None,
+            relay_jitter: Duration::ZERO,
             outbound_interval: Duration::from_millis(500),
             dump_interval: Duration::from_secs(15 * 60),
             seed_timeout: Duration::from_secs(30),
@@ -168,6 +177,8 @@ async fn run_with_listener(
         next_id: AtomicU64::new(1),
         inbound: Arc::new(Semaphore::new(config.max_inbound)),
         advertise: config.advertise.filter(|_| listener.is_some()),
+        proxy: config.proxy,
+        relay_jitter: config.relay_jitter,
     });
 
     let mut tasks = JoinSet::new();
@@ -195,6 +206,10 @@ struct Ctx {
     inbound: Arc<Semaphore>,
     /// Our address as peers should see it, when listening.
     advertise: Option<SocketAddr>,
+    /// SOCKS5 proxy for outbound dials (`-proxy=`).
+    proxy: Option<SocketAddr>,
+    /// Max delay before relaying a transaction inventory.
+    relay_jitter: Duration,
 }
 
 impl Ctx {
@@ -248,7 +263,7 @@ async fn dial_loop(addr: SocketAddr, ctx: Arc<Ctx>, link: Link) {
 /// One outbound attempt, then serve the connection until it ends.
 async fn dial_once(addr: SocketAddr, ctx: &Ctx, link: Link) {
     let limit = if link == Link::Auto { DIAL_TIMEOUT } else { CONNECT_TIMEOUT };
-    match timeout(limit, Peer::connect(addr, &ctx.params)).await {
+    match timeout(limit, Peer::connect_via_proxy(addr, ctx.proxy, &ctx.params)).await {
         Ok(Ok(peer)) => serve_connection(peer, ctx, addr, link).await,
         _ => {
             let _ = ctx.events.send(Event::DialFailed { addr, link }).await;
@@ -351,6 +366,28 @@ struct Manager {
     started: Instant,
     /// A block arrived: request more right away instead of waiting a tick.
     refill: bool,
+}
+
+/// Random relay delay in [0, max]. Uses system-time entropy mixed with a
+/// process counter instead of pulling a `rand` dependency into the node.
+fn relay_delay(max: Duration) -> Duration {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut x = now ^ (n.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    // xorshift64*
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    let max_nanos = max.as_nanos() as u64;
+    if max_nanos == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_nanos(x % max_nanos)
 }
 
 impl Manager {
@@ -745,9 +782,22 @@ impl Manager {
                 messages.push(to_wire(self.magic, &NetworkMessage::Inv(chunk.to_vec())));
             }
         }
+        // Relay jitter: inventory is a network fingerprint, so each peer
+        // gets it after its own random delay in [0, relay_jitter]. This
+        // flattens the arrival pattern a network observer sees.
         for message in messages {
             for peer in self.peers.values() {
-                let _ = peer.outbound.try_send(message.clone());
+                let jitter = self.config.relay_jitter;
+                let outbound = peer.outbound.clone();
+                if jitter.is_zero() {
+                    let _ = outbound.try_send(message.clone());
+                } else {
+                    let message = message.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(relay_delay(jitter)).await;
+                        let _ = outbound.try_send(message);
+                    });
+                }
             }
         }
     }
