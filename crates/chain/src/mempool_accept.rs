@@ -173,10 +173,13 @@ pub fn accept_to_mempool(chainstate: &Chainstate, mempool: &mut Mempool, tx: Tx)
         .iter()
         .any(|o| crate::notes::is_pool_script(o.script_pubkey.as_bytes()));
     if has_note_input {
-        // Note spends are authorised by pool verification; the spent
-        // record's tip anchor must be fresh (checked against the root map).
+        // Note spends are authorised by pool verification against the
+        // fresh tip anchor and the issuance funding ledger.
         let root = chainstate.pool_root();
-        if crate::notes::verify_note_tx_block(&tx, &spent_outs, Some(root)).is_err() {
+        let caps = chainstate.pool_funding();
+        if crate::notes::verify_note_tx_block_with_caps(&tx, &spent_outs, Some(root), Some(caps))
+            .is_err()
+        {
             return Err(MempoolReject::Consensus("bad-note-tx".into()));
         }
     }
@@ -450,6 +453,56 @@ mod tests {
     }
 
     #[test]
+    fn pool_note_append_is_accepted_and_inserts_leaf() {
+        use crate::notes::{encode_pool_note, note_commitment, Note};
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+
+        let (mut cs, main) = chain_with_mature_coinbases();
+        let secp = Secp256k1::new();
+        let mut secret = [0u8; 32];
+        secret[0] = 77;
+        secret[31] = 4;
+        let note = Note {
+            spending_pub: PublicKey::from_secret_key(
+                &secp,
+                &SecretKey::from_slice(&secret).unwrap(),
+            )
+            .serialize(),
+            value: 1_00000000,
+            rcm: [4u8; 32],
+        };
+        let cmu = note_commitment(&note);
+        // Note-creating tx: spends a mature plaintext coinbase and
+        // locks `note.value + fee` behind the pool note output.
+        let tx = Tx::new(
+            1,
+            vec![TxIn::new(coinbase_outpoint(&main[0]))],
+            vec![
+                TxOut::new(subsidy(1) - note.value as i64 - FEE, p2wsh_true()),
+                TxOut::new(0, ScriptBuf::from_bytes(encode_pool_note(&cmu))),
+            ],
+            0,
+        );
+        let mut pool = Mempool::new(100);
+        let txid = accept_to_mempool(&cs, &mut pool, tx.clone())
+            .expect("note append must enter mempool");
+        assert!(pool.contains(&txid));
+        assert_eq!(cs.pool_len(), 0, "mempool does not imply chain leaf yet");
+
+        // Mine it: the commitment becomes a pool leaf on the active chain.
+        let (tip_header, tip_height) = cs.header_of(&cs.tip_hash()).unwrap();
+        let block = mine(&tip_header, tip_height, vec![tx], subsidy(102), 7);
+        assert_eq!(cs.process_new_block(&block, NOW), Ok(true));
+        assert_eq!(cs.pool_len(), 1);
+        assert_eq!(
+            cs.pool_tree().position_of(&cmu),
+            Some(0),
+            "note commitment must be leaf 0"
+        );
+        assert_eq!(cs.pool_root(), cs.pool_anchor_at(&cs.tip_hash()).unwrap());
+    }
+
+    #[test]
     fn note_spend_is_accepted_to_mempool_and_mined() {
         use crate::notes::{
             authorize_spend, encode_note, encode_path, encode_pool_note, encode_spend_auth,
@@ -475,12 +528,12 @@ mod tests {
         };
         let cmu = note_commitment(&note);
 
-        // Block 102 appends the note output.
+        // Block 102 appends the note output, locking note.value + fee.
         let append_tx = Tx::new(
             1,
             vec![TxIn::new(coinbase_outpoint(&main[0]))],
             vec![
-                TxOut::new(subsidy(1) - FEE, op_true()),
+                TxOut::new(subsidy(1) - note.value as i64 - FEE, op_true()),
                 TxOut::new(0, ScriptBuf::from_bytes(encode_pool_note(&cmu))),
             ],
             0,
