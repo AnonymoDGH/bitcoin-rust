@@ -160,10 +160,14 @@ protects the middle; the edges must be designed for too.
   and the funding cap; present-but-invalid proofs are rejected.
   Wallet generation is wired too: `create_note_spend` takes the
   on-chain funding cap, proves the spend and attaches `witness[3]`
-  (RPC `spendnote` supplies the cap from the ledger). Prototype
-  limits: linear stand-in commitment hash (bind to `cmu`/Pedersen
-  next); outputs transparent in this mode. The hash-note pool with the
-  funding ledger remains the active scheme.
+  (RPC `spendnote` supplies the cap from the ledger). **Shielded
+  outputs are wired**: `create_note_spend_shielded` (RPC
+  `shieldspendnote`) spends a note into a single new pool note —
+  public fee + new commitments travel in `witness[4]`, the miner
+  fee is the public one, and the funding ledger records the new
+  note with `spent value - fee` (hidden values flow through the
+  proof, not the ledger). Prototype limits: linear stand-in
+  commitment hash (bind to `cmu`/Pedersen next).
 - **Remaining limits (honest):** spent note values are transparent
   at spend under the active (hash-note) scheme; onion inbound P2P
   is not supported (outbound SOCKS5 only).
