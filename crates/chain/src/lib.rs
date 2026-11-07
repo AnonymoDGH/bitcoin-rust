@@ -20,6 +20,7 @@ pub mod miner;
 pub mod mempool_accept;
 pub mod notes;
 pub mod ringsig;
+pub mod value_snark;
 
 pub use error::ValidationError;
 pub use index::{ActiveChain, BlockIndex, BlockStatus, BlockTree, IndexId};
