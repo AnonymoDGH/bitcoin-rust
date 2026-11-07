@@ -698,6 +698,42 @@ pub fn encode_shield_marker(r_in: &[u8; 32], balance_proof_bytes: &[u8]) -> Vec<
     script
 }
 
+/// Public miner fee of a CT transaction, taken from the balance-proof
+/// fee prefix. This is the ONLY sound fee for CT txs: hybrid spends
+/// hide `amount` in the CT outputs, so the plaintext ledger fee
+/// (`inputs - outputs`) overstates the true fee by exactly the
+/// shielded value — paying that to the coinbase would mint the
+/// hidden amounts twice. The balance proof ties
+/// `inputs - hidden_outputs - fee = 0`, so the prefix fee is proven
+/// on chain; the hidden value locked is `inputs - plain_outputs - fee`.
+pub fn ct_public_fee(tx: &btc_primitives::Tx) -> u64 {
+    let shield = shield_markers(tx);
+    let bytes: &[u8] = if !shield.is_empty() {
+        &shield[0].1
+    } else {
+        match tx.vin.first().and_then(|i| i.witness.iter().next()) {
+            Some(b) => b,
+            None => return 0,
+        }
+    };
+    proof_fee(bytes)
+}
+
+/// True if the transaction is a confidential (CT) transaction:
+/// CT input/output scripts or a shield marker present.
+pub fn is_ct_tx(
+    tx: &btc_primitives::Tx,
+    spent_outs: &[btc_primitives::TxOut],
+) -> bool {
+    spent_outs
+        .iter()
+        .any(|o| is_ct_script(o.script_pubkey.as_bytes()))
+        || tx.vout
+            .iter()
+            .any(|o| is_ct_script(o.script_pubkey.as_bytes()))
+        || !shield_markers(tx).is_empty()
+}
+
 /// Full chain-level CT verification for one transaction.
 ///
 /// Rules:
@@ -834,10 +870,6 @@ pub fn verify_ct_tx_block(
     };
     let balance = deserialize_balance_proof(balance_bytes).ok_or(CtError::BalanceProof)?;
     let fee = proof_fee(balance_bytes);
-    {
-        let left = scalar_mul(h_generator(), &balance.z);
-        eprintln!("ct dbg: fee={fee} left={left:?}");
-    }
     verify_ct_transaction(&all_inputs, &outputs, fee, &balance, &context)
 }
 
