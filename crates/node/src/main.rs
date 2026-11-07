@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use bitcoin::hex::FromHex;
 use btc_consensus::{
-    mainnet_genesis_block, regtest_genesis_block, testnet_genesis_block, ChainParams, ChainType,
+    mainnet_genesis_block, regtest_genesis_block, testnet_genesis_block, work_from_bits,
+    ChainParams, ChainType,
 };
 use btc_node::chainspec::example_spec_json;
 use btc_node::config::{parse_args, NodeConfig};
@@ -58,7 +59,15 @@ async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
 
     let (params, genesis) = match &config.custom_chain {
         Some(spec) => {
-            println!("mining genesis block for {}", spec.name);
+            // Genesis mining is synchronous and single-threaded at startup;
+            // at hard difficulty it takes a human-observable amount of time,
+            // so say what to expect instead of a silent hang.
+            let expected = work_from_bits(spec.genesis_bits).unwrap_or(primitive_types::U256::zero());
+            let interval = spec.target_timespan / spec.target_spacing;
+            println!(
+                "mining genesis block for {} (bits 0x{:08x}, expected ~{} hashes, retarget every {} blocks, spacing {} s)",
+                spec.name, spec.genesis_bits, expected, interval, spec.target_spacing
+            );
             ChainParams::custom(spec)
         }
         None => (
