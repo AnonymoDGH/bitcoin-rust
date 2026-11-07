@@ -273,11 +273,17 @@ impl Node {
         debug_assert_eq!(note_commitment(&note), cmu);
         let anchor = self.chainstate.pool_root();
         let path = self.chainstate.pool_tree().path(position);
+        let cap = self
+            .chainstate
+            .pool_funding()
+            .get(&cmu)
+            .copied()
+            .ok_or("note commitment unknown to the chain".to_string())?;
         let recipient = wallet
             .new_script(btc_wallet::ScriptKind::P2wpkh)
             .map_err(wallet_error_message)?;
         let tx = wallet
-            .create_note_spend(outpoint, note.clone(), &record.secret, anchor, position, path, recipient, amount)
+            .create_note_spend(outpoint, note.clone(), &record.secret, anchor, position, path, recipient, amount, cap)
             .map_err(wallet_error_message)?;
         let txid = self.submit_tx(tx.clone()).map_err(|e| format!("transaction rejected: {e:?}"))?;
         if let Some(w) = self.wallet.as_mut() {
