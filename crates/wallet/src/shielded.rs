@@ -22,6 +22,14 @@ pub enum ShieldError {
     InvalidSecret,
 }
 
+/// Note summary for listing (no secrets in the listing itself).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoteSummary {
+    pub commitment: [u8; 32],
+    pub value: u64,
+    pub spent: bool,
+}
+
 /// Creates a note: fresh owner key, random `rcm`, hidden amount.
 pub fn create_note(value: u64) -> Result<(Note, [u8; 32]), ShieldError> {
     let secp = Secp256k1::new();
