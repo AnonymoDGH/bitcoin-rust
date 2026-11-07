@@ -56,8 +56,10 @@ Wallet RPCs: `getnewaddress`, `getbalance`, `getbalances`, `listunspent`, `sendt
 `-externalip`, `-maxconnections`, `-proxy`. Add `"seeds": ["host:port", ...]` to the chain spec for discovery.
 
 Privacy (AnonCoin): stealth addresses, coordinator-free CoinJoin, SOCKS5 proxy + relay jitter,
-and primitives-level confidential transactions + 16-key ring signatures — see
-`docs/privacy-plan.md` for the threat model and the phased design.
+and consensus-active confidential transactions (CT outputs `OP_RETURN 0x01` with
+commitments + range proofs, transactions checked by `ConnectBlock`/`AcceptToMemoryPool`
+with balance proofs and 16-key ring signatures) — see `docs/privacy-plan.md`
+for the threat model and the phased design.
 
 Mining: `generatetoaddress <n> <address>` for explicit blocks, or `-gen -genaddress=<address|script hex>`
 to mine in the background. `-gen` hashes until a block is found and immediately starts the next template;

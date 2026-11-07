@@ -85,17 +85,28 @@ protects the middle; the edges must be designed for too.
 - Amounts remain visible in this phase (documented limitation);
   the address graph is already broken.
 
-### Phase 2 - hidden amounts and ambiguous sender (implemented, primitives-level)
+### Phase 2 - hidden amounts and ambiguous sender (implemented, consensus-active)
 - **Confidential Transactions**: Pedersen commitments `C(v,r) = v*G + r*H`
   (`H = SHA256("AnonCoin-H-v1")*G`) with 64-bit range proofs (binary
-  Schnorr OR-proofs) and Schnorr balance proofs proving
-  `sum_in - sum_out - fee = 0` without revealing amounts. Implemented
-  and tested in `crates/chain/src/confidential.rs`; wallet helpers in
-  `crates/wallet/src/privpay.rs`. Consensus activation (new output
-  type in `ConnectBlock`) is the next step.
+  Schnorr disjunctions) and Schnorr balance proofs proving
+  `sum_in - sum_out - fee` consistent without revealing amounts.
+  Activated in consensus behind the `ct_enabled` chain parameter
+  (`-chainspec` field, on for AnonCoin): `ConnectBlock` and
+  `AcceptToMemoryPool` verify CT transactions (range proofs, balance
+  proof, per-input ring signatures), CT outputs are spendable UTXOs
+  (value 0 in the ledger), and the CT output script
+  `OP_RETURN 0x01 <commitment> <pubkey_hash> <range_proof>` is defined
+  in `crates/chain/src/confidential.rs`.
+  Bootstrap note: CT transactions must be all-CT (all inputs and
+  outputs confidential) — mixing plaintext inputs/outputs is rejected
+  by the value ledger (`InputsBelowOutputs`, 0 vs >0). Wallet coin
+  bookkeeping must retain CT blindings to spend them; that is the
+  wallet-spend phase. First CT liquidity therefore enters via chain
+  construction in tests, not via the wallet yet.
 - **Ring signatures** (Monero-style, fixed ring size 16): 1-out-of-16
   Schnorr ring (`crates/chain/src/ringsig.rs`), tested. Spending
-  authorisation through rings is the next step.
+  authorisation through rings is enforced by chain validation as
+  part of CT transactions.
 - **Fungibility**: identical-looking outputs; no tainted-coin
   signalling at the protocol level.
 
