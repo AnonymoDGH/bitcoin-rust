@@ -708,6 +708,106 @@ impl Wallet {
         Ok(tx)
     }
 
+    /// Shielded note spend: spends the pool output at `prevout` into a
+    /// single new pool note (hidden value), with a public fee proven by
+    /// a Groth16 proof (`witness[3]`) and the fee + new commitments in
+    /// `witness[4]`. `cap` is the spent note's funding cap (sats);
+    /// `fee` is the public miner fee in sats.
+    pub fn create_note_spend_shielded(
+        &mut self,
+        prevout: OutPoint,
+        note: btc_chain::notes::Note,
+        secret: &[u8; 32],
+        anchor: [u8; 32],
+        index: u32,
+        path: Vec<[u8; 32]>,
+        cap: u64,
+        fee: u64,
+    ) -> Result<(Tx, NoteCoinInfo, OutPoint), WalletError> {
+        use btc_chain::notes::{
+            authorize_spend, encode_note, encode_path, encode_spend_auth,
+        };
+        if note.value == 0 || fee >= note.value {
+            return Err(WalletError::Build("shielded note spend needs fee < value".into()));
+        }
+        if note.value > cap {
+            return Err(WalletError::Build("note value exceeds funding cap".into()));
+        }
+        let new_value = note.value - fee;
+        // Fresh owner key for the new note.
+        let owner_script = self.new_script(ScriptKind::P2wpkh)?;
+        let (owner_id, _) = self
+            .script_index
+            .get(&owner_script)
+            .cloned()
+            .ok_or(WalletError::NotMine)?;
+        let owner_key = self
+            .keys
+            .private_key(&owner_id)
+            .ok_or(WalletError::Locked)?;
+        let owner_secret = owner_key.inner.secret_bytes();
+        let secp = Secp256k1::new();
+        let pubkey_bytes = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&owner_secret).map_err(|_| WalletError::Build("note key invalid".into()))?).serialize();
+        let mut rcm = [0u8; 32];
+        getrandom::getrandom(&mut rcm)
+            .map_err(|_| WalletError::Build("note rcm failed".into()))?;
+        let new_note = btc_chain::notes::Note {
+            spending_pub: pubkey_bytes,
+            value: new_value,
+            rcm,
+        };
+        let value_commitment =
+            btc_chain::confidential::commitment_point(new_value, rcm)
+                .map_err(|_| WalletError::Build("note value commitment failed".into()))?;
+        let pool_script = ScriptBuf::from_bytes(
+            btc_chain::notes::encode_pool_note_committed(
+                &btc_chain::notes::note_commitment(&new_note),
+                &value_commitment,
+            ),
+        );
+        let mut tx = Tx::new(2, vec![TxIn::new(prevout)], vec![TxOut::new(0, pool_script)], 0);
+        let context = btc_chain::confidential::ct_context(&tx);
+        let sig = authorize_spend(&note, secret, &anchor, &context)
+            .map_err(|_| WalletError::Build("note authorize failed".into()))?;
+        let dummy = [0u8; 32];
+        let transcript = btc_chain::value_snark::ValueTranscript {
+            fee,
+            cap,
+            c_old: btc_chain::value_snark::value_commitment(note.value, &note.rcm),
+            c_new: [
+                btc_chain::value_snark::value_commitment(new_value, &rcm),
+                btc_chain::value_snark::value_commitment(0, &dummy),
+            ],
+        };
+        let snark_witness = btc_chain::value_snark::ValueWitness {
+            v_old: note.value,
+            rcm_old: note.rcm,
+            v_new: [new_value, 0],
+            rcm_new: [rcm, dummy],
+        };
+        let proof = btc_chain::value_snark::prove(transcript, snark_witness)
+            .map_err(|_| WalletError::Build("note value proof failed".into()))?;
+        let mut shield = Vec::with_capacity(72);
+        shield.extend_from_slice(&fee.to_le_bytes());
+        shield.extend_from_slice(&btc_chain::value_snark::field_to_bytes(&transcript.c_new[0]));
+        shield.extend_from_slice(&btc_chain::value_snark::field_to_bytes(&transcript.c_new[1]));
+        tx.vin[0].witness = bitcoin::Witness::from_slice(&[
+            encode_note(&note),
+            encode_spend_auth(&anchor, index, &sig),
+            encode_path(&path),
+            btc_chain::value_snark::serialize_proof(&proof),
+            shield,
+        ]);
+        let info = NoteCoinInfo {
+            value: new_value,
+            rcm,
+            secret: owner_secret,
+            pubkey_hash: bitcoin::PubkeyHash::from(owner_id.clone()).to_byte_array(),
+        };
+        let txid = tx.txid();
+        Ok((tx, info, OutPoint::new(txid, 0)))
+    }
+
     /// Imports a WIF private key. Importing a known key changes nothing.
     pub fn import_wif(&mut self, wif: &str) -> Result<KeyId, WalletError> {
         self.check_unlocked()?;
@@ -1985,6 +2085,77 @@ mod tests {
             Some(anchor),
         )
         .expect("note spend must verify at chain level");
+    }
+
+    #[test]
+    fn shielded_note_spend_end_to_end() {
+        let file = TestFile::new("pool-shielded");
+        let mut wallet = Wallet::create(&file.0).unwrap();
+        let script = wallet.new_script(ScriptKind::P2pkh).unwrap();
+        connect(&mut wallet, 1, vec![coinbase(1, script.clone())]);
+        fill(&mut wallet, 2, 101);
+
+        // Create a pool note of 1 BTC (funded 1 BTC + 10_000 fee).
+        let (note_tx, note_info, note_op) = wallet.create_pool_note(101, 1_00000000, 10_000).unwrap();
+        wallet
+            .record_note_coin(note_op, note_tx.vout[0].script_pubkey.clone(), note_info)
+            .unwrap();
+        drop(wallet);
+
+        let wallet = Wallet::open(&file.0).unwrap();
+        let note_coin = wallet
+            .coins
+            .get(&note_op)
+            .and_then(|c| c.note.clone())
+            .expect("note coin recorded");
+        drop(wallet);
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let note = btc_chain::notes::Note {
+            spending_pub: bitcoin::secp256k1::PublicKey::from_secret_key(
+                &secp,
+                &bitcoin::secp256k1::SecretKey::from_slice(&note_coin.secret).unwrap(),
+            )
+            .serialize(),
+            value: 1_00000000,
+            rcm: note_coin.rcm,
+        };
+        let mut tree = btc_chain::notes::NoteTree::new();
+        assert_eq!(tree.insert(btc_chain::notes::note_commitment(&note)), 0);
+        let anchor = tree.root();
+        let path = tree.path(0);
+        let cap: u64 = 1_00000000 + 10_000;
+        let (spent_tx, new_info, new_op) = Wallet::open(&file.0)
+            .unwrap()
+            .create_note_spend_shielded(
+                note_op,
+                note.clone(),
+                &note_coin.secret,
+                anchor,
+                0,
+                path,
+                cap,
+                5_000,
+            )
+            .unwrap();
+        assert_eq!(new_info.value, note.value - 5_000);
+        // Chain-level verification with the funding cap.
+        let spent_outs = [btc_primitives::TxOut::new(0, note_tx.vout[0].script_pubkey.clone())];
+        let mut caps = std::collections::HashMap::new();
+        caps.insert(btc_chain::notes::note_commitment(&note), cap);
+        let fee = btc_chain::notes::verify_note_tx_block_with_caps(
+            &spent_tx,
+            &spent_outs,
+            Some(anchor),
+            Some(&caps),
+        )
+        .expect("shielded spend verifies at chain level");
+        assert_eq!(fee, 5_000);
+        // The new note is funded by the spend.
+        let new_caps = btc_chain::notes::funding_caps_for_block(&spent_tx, &[0]);
+        assert_eq!(new_caps.len(), 1);
+        assert_eq!(new_caps[0].1, note.value - 5_000);
+        let _ = new_op;
     }
 
     #[test]
