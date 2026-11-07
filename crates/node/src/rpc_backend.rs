@@ -541,6 +541,15 @@ impl WalletRpc for NodeRpc {
         self.with_node(|n| n.wallet_spend_note(bytes, amount))
     }
 
+    fn spend_note_shielded(&self, cmu_hex: String, fee: i64) -> Result<Txid, String> {
+        use bitcoin::hex::FromHex;
+        let bytes: [u8; 32] = Vec::<u8>::from_hex(&cmu_hex)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or("Invalid note commitment: expected 32 bytes as hex".to_string())?;
+        self.with_node(|n| n.wallet_spend_note_shielded(bytes, fee))
+    }
+
     fn list_notes(&self) -> Vec<btc_rpc::NoteEntry> {
         self.with_wallet(|w, _| {
             w.list_notes()

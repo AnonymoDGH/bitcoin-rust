@@ -211,6 +211,10 @@ const WALLET_METHODS: &[Method] = &[
         params: &[("commitment", true), ("amount", true)],
     },
     Method {
+        name: "shieldspendnote",
+        params: &[("commitment", true), ("fee", false)],
+    },
+    Method {
         name: "listnotes",
         params: &[],
     },

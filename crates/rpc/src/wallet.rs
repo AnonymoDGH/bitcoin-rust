@@ -117,6 +117,20 @@ pub(crate) fn call(backend: &dyn RpcBackend, method: &str, args: &Args) -> RpcRe
                 .map_err(wallet_error)?;
             Ok(json!(txid.to_string()))
         }
+        "shieldspendnote" => {
+            let commitment = args.str_req(0, "commitment")?;
+            let fee = match args.scaled(1, 8)? {
+                Some(sats) => sats,
+                None => 5_000,
+            };
+            if fee <= 0 {
+                return Err(RpcError::new(RPC_TYPE_ERROR, "Invalid fee for send"));
+            }
+            let txid = wallet
+                .spend_note_shielded(commitment.to_owned(), fee)
+                .map_err(wallet_error)?;
+            Ok(json!(txid.to_string()))
+        }
         "liststealthutxos" => {
             let minconf = args.u32(0)?.unwrap_or(0);
             let max_blocks = args.u32(1)?.unwrap_or(2000);

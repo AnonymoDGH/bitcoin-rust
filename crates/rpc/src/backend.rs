@@ -138,6 +138,9 @@ pub trait WalletRpc: Send + Sync {
     /// Spends a shielded note by its commitment hex.
     fn spend_note(&self, cmu_hex: String, amount: i64) -> Result<Txid, String>;
 
+    /// Shielded spend: note -> new shielded note, public fee only.
+    fn spend_note_shielded(&self, cmu_hex: String, fee: i64) -> Result<Txid, String>;
+
     /// Notes created by this wallet: commitment hex, value, spent status.
     fn list_notes(&self) -> Vec<NoteEntry>;
 

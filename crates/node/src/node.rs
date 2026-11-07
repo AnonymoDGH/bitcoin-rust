@@ -292,6 +292,68 @@ impl Node {
         Ok(txid)
     }
 
+    /// `shieldspendnote`: shielded spend — note -> new shielded note,
+    /// only the public fee leaves the pool.
+    pub fn wallet_spend_note_shielded(&mut self, cmu: [u8; 32], fee: i64) -> Result<Txid, String> {
+        use btc_chain::notes::{note_commitment, Note};
+        let wallet = self.wallet.as_mut().ok_or("wallet disabled")?;
+        let position = self
+            .chainstate
+            .pool_tree()
+            .position_of(&cmu)
+            .ok_or("note commitment unknown to the chain".to_string())?;
+        let outpoint = self
+            .chainstate
+            .pool_note_outpoint(position)
+            .ok_or("note outpoint not found".to_string())?;
+        let Some(record) = wallet
+            .coins_snapshot()
+            .get(&outpoint)
+            .and_then(|coin| coin.note.clone())
+        else {
+            return Err("note not held by this wallet".to_string());
+        };
+        let cap = self
+            .chainstate
+            .pool_funding()
+            .get(&cmu)
+            .copied()
+            .ok_or("note commitment unknown to the chain".to_string())?;
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let note = Note {
+            spending_pub: bitcoin::secp256k1::PublicKey::from_secret_key(
+                &secp,
+                &bitcoin::secp256k1::SecretKey::from_slice(&record.secret)
+                    .map_err(|_| "note secret invalid".to_string())?,
+            )
+            .serialize(),
+            value: record.value,
+            rcm: record.rcm,
+        };
+        debug_assert_eq!(note_commitment(&note), cmu);
+        let anchor = self.chainstate.pool_root();
+        let path = self.chainstate.pool_tree().path(position);
+        let (tx, new_info, new_outpoint) = wallet
+            .create_note_spend_shielded(
+                outpoint,
+                note.clone(),
+                &record.secret,
+                anchor,
+                position,
+                path,
+                cap,
+                fee.max(0) as u64,
+            )
+            .map_err(wallet_error_message)?;
+        let txid = self.submit_tx(tx.clone()).map_err(|e| format!("transaction rejected: {e:?}"))?;
+        if let Some(w) = self.wallet.as_mut() {
+            w.commit_transaction(&tx).map_err(wallet_error_message)?;
+            w.record_note_coin(new_outpoint, tx.vout[0].script_pubkey.clone(), new_info)
+                .map_err(wallet_error_message)?;
+        }
+        Ok(txid)
+    }
+
     /// `ProcessNewBlock` + mempool/fee updates. Ok(true) if new.
     pub fn submit_block(&mut self, block: &Block) -> Result<bool, ValidationError> {
         let result = self.chainstate.process_new_block(block, now_secs());
