@@ -147,9 +147,18 @@ protects the middle; the edges must be designed for too.
   the prefix fee. Covered end to end by
   `miner_includes_ct_spend_and_pays_public_fee` (shield at 102,
   all-CT ring spend at 103, coinbase = subsidy + prefix fee).
+- **SNARK layer (prototype, `crates/chain/src/value_snark.rs`).**
+  Groth16/BN254 value-hiding circuit over the pool note definition:
+  proves `C_old` opens, `v_old = v_new0 + v_new1 + fee`, values in
+  range and `v_old <= funding cap` without revealing values (public
+  inputs: fee, cap, commitments). Tests prove+verify a valid spend
+  and reject tampered fee / inflation / over-cap / bad opening
+  witnesses. Prototype limits: linear stand-in commitment hash
+  (bind to `cmu`/Pedersen next); not yet wired to consensus —
+  hash-note pool with the funding ledger remains the active scheme.
 - **Remaining limits (honest):** spent note values are transparent
-  at spend (a SNARK/Orchard-style upgrade would hide them); onion
-  inbound P2P is not supported (outbound SOCKS5 only).
+  at spend under the active (hash-note) scheme; onion inbound P2P
+  is not supported (outbound SOCKS5 only).
 
 ### Phase 3 — shielded pool
 **Implemented now (pre-zk milestone):** `crates/chain/src/notes.rs` —
