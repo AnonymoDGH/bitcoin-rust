@@ -517,9 +517,7 @@ impl WalletRpc for NodeRpc {
     }
 
     fn send_to_confidential(&self, amount: i64, fee: i64) -> Result<Txid, String> {
-        self.with_node(|n| {
-            n.wallet_send_ct(amount.max(0) as u64, fee)
-        })
+        self.with_node(|n| n.wallet_send_ct(amount.max(0) as u64, fee))
     }
 
     fn dump_privkey(&self, script: &ScriptBuf) -> Result<String, String> {
