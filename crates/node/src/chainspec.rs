@@ -331,7 +331,9 @@ mod tests {
     fn shipped_presets_are_hard_and_valid() {
         // Parse-only: mining bitcoin-level genesis would take hours, so these
         // tests validate the files without calling ChainParams::custom.
-        let hard = parse_chain_spec(include_str!("../../../chains/hardcoin.json")).unwrap();
+        let hard = parse_chain_spec(include_str!("../../../chains/anoncoin.json")).unwrap();
+        assert_eq!(hard.name, "AnonCoin");
+        assert_eq!(hard.bech32_hrp, "an");
         assert_eq!(hard.genesis_bits, 0x1e00_ffff);
         assert_eq!(hard.pow_limit, decode_compact(0x1e00_ffff).unwrap());
         assert_eq!(hard.target_spacing, 600);
