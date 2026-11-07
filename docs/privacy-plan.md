@@ -158,9 +158,11 @@ protects the middle; the edges must be designed for too.
   `verify_note_tx_block_with_caps` (ConnectBlock + mempool) with the
   transcript reconstructed from the note opening, the tx outputs
   and the funding cap; present-but-invalid proofs are rejected.
-  Prototype limits: linear stand-in commitment hash (bind to
-  `cmu`/Pedersen next); outputs transparent in this mode; wallet
-  proof generation not yet wired. The hash-note pool with the
+  Wallet generation is wired too: `create_note_spend` takes the
+  on-chain funding cap, proves the spend and attaches `witness[3]`
+  (RPC `spendnote` supplies the cap from the ledger). Prototype
+  limits: linear stand-in commitment hash (bind to `cmu`/Pedersen
+  next); outputs transparent in this mode. The hash-note pool with the
   funding ledger remains the active scheme.
 - **Remaining limits (honest):** spent note values are transparent
   at spend under the active (hash-note) scheme; onion inbound P2P
