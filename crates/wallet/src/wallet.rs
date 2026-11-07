@@ -90,13 +90,15 @@ pub struct WalletTxRecord {
 
 /// An output the wallet can pay, with the spend that consumes it if any.
 #[derive(Clone, Debug)]
-struct Coin {
-    txout: TxOut,
-    height: Option<u32>,
-    is_coinbase: bool,
-    spent_by: Option<Txid>,
+pub struct Coin {
+    pub txout: TxOut,
+    pub height: Option<u32>,
+    pub is_coinbase: bool,
+    pub spent_by: Option<Txid>,
     /// Blinding of a confidential coin created by this wallet.
-    ct: Option<CtCoinInfo>,
+    pub ct: Option<CtCoinInfo>,
+    /// Shielded note of a pool coin created by this wallet.
+    pub note: Option<NoteCoinInfo>,
 }
 
 /// Wallet bookkeeping for a confidential coin: the blinding is required
@@ -105,6 +107,15 @@ struct Coin {
 pub struct CtCoinInfo {
     pub value: u64,
     pub blinding: [u8; 32],
+    pub secret: [u8; 32],
+    pub pubkey_hash: [u8; 20],
+}
+
+/// Wallet bookkeeping for a shielded pool note.
+#[derive(Clone, Debug)]
+pub struct NoteCoinInfo {
+    pub value: u64,
+    pub rcm: [u8; 32],
     pub secret: [u8; 32],
     pub pubkey_hash: [u8; 20],
 }
@@ -262,6 +273,7 @@ impl Wallet {
             is_coinbase: false,
             spent_by: None,
             ct: None,
+            note: None,
         });
         entry.ct = Some(info);
         self.save()
@@ -532,6 +544,140 @@ impl Wallet {
     }
 
     /// Imports a WIF private key. Importing a known key changes nothing.
+    pub fn record_note_coin(
+        &mut self,
+        outpoint: OutPoint,
+        script: ScriptBuf,
+        info: NoteCoinInfo,
+    ) -> Result<(), WalletError> {
+        self.check_unlocked()?;
+        let entry = self.coins.entry(outpoint).or_insert_with(|| Coin {
+            txout: TxOut::new(0, script),
+            height: None,
+            is_coinbase: false,
+            spent_by: None,
+            ct: None,
+            note: None,
+        });
+        entry.note = Some(info);
+        self.save()
+    }
+
+    /// Creates a pool note: spends a mature plaintext coin into a pool
+    /// note output owned by a fresh wallet key. Returns the built+sign
+    /// transaction and the note record to persist after broadcast.
+    /// `tip_height` is the tip the note will be inserted at; the note
+    /// output is vout 1 of the returned outpoint.
+    pub fn create_pool_note(
+        &mut self,
+        tip_height: u32,
+        value: u64,
+        fee: i64,
+    ) -> Result<(Tx, NoteCoinInfo, OutPoint), WalletError> {
+        use btc_chain::notes::{encode_pool_note, note_commitment, Note};
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        self.check_unlocked()?;
+        if value == 0 {
+            return Err(WalletError::Build("note amount must be positive".into()));
+        }
+        let required = value as i64 + fee;
+        let mut candidates: Vec<(OutPoint, TxOut)> = self
+            .coins
+            .iter()
+            .filter(|(op, coin)| {
+                coin.ct.is_none()
+                    && coin.note.is_none()
+                    && self.is_spendable(op, coin, tip_height)
+                    && matches!(
+                        self.keys.is_mine(&coin.txout.script_pubkey),
+                        Some((_, ScriptKind::P2pkh))
+                    )
+            })
+            .map(|(op, coin)| (*op, coin.txout.clone()))
+            .filter(|(_, txout)| txout.value >= required)
+            .collect();
+        candidates.sort_by_key(|(_, txout)| txout.value);
+        let (spend_outpoint, spent) =
+            candidates.into_iter().next().ok_or(WalletError::InsufficientFunds {
+                required,
+                available: self.balance(tip_height, 0),
+            })?;
+
+        let owner_script = self.new_script(ScriptKind::P2wpkh)?;
+        let (owner_id, _) = self
+            .script_index
+            .get(&owner_script)
+            .cloned()
+            .ok_or(WalletError::NotMine)?;
+        let owner_key = self
+            .keys
+            .private_key(&owner_id)
+            .ok_or(WalletError::Locked)?;
+        let owner_secret = owner_key.inner.secret_bytes();
+        let secp = Secp256k1::new();
+        let pubkey_bytes = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&owner_secret).map_err(|_| WalletError::Build("note key invalid".into()))?).serialize();
+        let mut rcm = [0u8; 32];
+        getrandom::getrandom(&mut rcm)
+            .map_err(|_| WalletError::Build("note rcm failed".into()))?;
+        let note = Note {
+            spending_pub: pubkey_bytes,
+            value,
+            rcm,
+        };
+        let pool_script = ScriptBuf::from_bytes(encode_pool_note(&note_commitment(&note)));
+        let mut vout = vec![TxOut::new(0, pool_script)];
+        let change_value = spent.value - required;
+        if change_value >= 546 {
+            let change = self.new_script(ScriptKind::P2wpkh)?;
+            vout.push(TxOut::new(change_value, change));
+        }
+        let input = TxIn::new(spend_outpoint);
+        let mut tx = Tx::new(2, vec![input], vout, 0);
+        crate::signer::sign_transaction(&mut tx, &[spent.clone()], &self.keys)
+            .map_err(|e| WalletError::Build(e.to_string()))?;
+        let info = NoteCoinInfo {
+            value,
+            rcm,
+            secret: owner_secret,
+            pubkey_hash: bitcoin::PubkeyHash::from(owner_id.clone()).to_byte_array(),
+        };
+        let txid = tx.txid();
+        Ok((tx, info, OutPoint::new(txid, 0)))
+    }
+
+    /// Builds a note spend: spends the pool output at `prevout` with the
+    /// note opening, anchor authorisation and membership path, to the
+    /// given recipient script.
+    pub fn create_note_spend(
+        &mut self,
+        prevout: OutPoint,
+        note: btc_chain::notes::Note,
+        secret: &[u8; 32],
+        anchor: [u8; 32],
+        index: u32,
+        path: Vec<[u8; 32]>,
+        recipient_script: ScriptBuf,
+        amount: i64,
+    ) -> Result<Tx, WalletError> {
+        use btc_chain::notes::{
+            authorize_spend, encode_note, encode_path, encode_spend_auth,
+        };
+        if note.value == 0 || amount <= 0 || amount as u64 > note.value {
+            return Err(WalletError::Build("note spend amount out of range".into()));
+        }
+        let mut tx = Tx::new(2, vec![TxIn::new(prevout)], vec![TxOut::new(amount, recipient_script)], 0);
+        let context = btc_chain::confidential::ct_context(&tx);
+        let sig = authorize_spend(&note, secret, &anchor, &context)
+            .map_err(|_| WalletError::Build("note authorize failed".into()))?;
+        tx.vin[0].witness = bitcoin::Witness::from_slice(&[
+            encode_note(&note),
+            encode_spend_auth(&anchor, index, &sig),
+            encode_path(&path),
+        ]);
+        Ok(tx)
+    }
+
+    /// Imports a WIF private key. Importing a known key changes nothing.
     pub fn import_wif(&mut self, wif: &str) -> Result<KeyId, WalletError> {
         self.check_unlocked()?;
         let key = PrivateKey::from_wif(wif).map_err(KeyError::InvalidWif)?;
@@ -551,6 +697,12 @@ impl Wallet {
 
     pub fn is_mine(&self, script: &ScriptBuf) -> bool {
         self.script_index.contains_key(script)
+    }
+
+    /// A cloned snapshot of coin bookkeeping records (for external callers
+    /// that need to look up the note/CT info of an outpoint).
+    pub fn coins_snapshot(&self) -> BTreeMap<OutPoint, Coin> {
+        self.coins.clone()
     }
 
     /// Adds `key` to the wallet and returns its id. The caller saves the file.
@@ -879,6 +1031,7 @@ impl Wallet {
                     // output (recorded via `record_ct_coin`); blindings of
                     // incoming CT outputs are not recoverable here.
                     ct: None,
+                    note: None,
                 });
             coin.height = conf.height;
         }
@@ -1214,6 +1367,12 @@ impl Wallet {
                         secret: info.secret.to_lower_hex_string(),
                         pubkey_hash: info.pubkey_hash.to_lower_hex_string(),
                     }),
+                    note: coin.note.as_ref().map(|info| NoteFile {
+                        value: info.value,
+                        rcm: info.rcm.to_lower_hex_string(),
+                        secret: info.secret.to_lower_hex_string(),
+                        pubkey_hash: info.pubkey_hash.to_lower_hex_string(),
+                    }),
                 })
                 .collect(),
             transactions: self
@@ -1326,6 +1485,17 @@ impl Wallet {
                     })
                 })
                 .transpose()?;
+            let note = cf
+                .note
+                .map(|entry| -> Result<NoteCoinInfo, WalletError> {
+                    Ok(NoteCoinInfo {
+                        value: entry.value,
+                        rcm: fixed::<32>(&hex_bytes(&entry.rcm)?)?,
+                        secret: fixed::<32>(&hex_bytes(&entry.secret)?)?,
+                        pubkey_hash: fixed::<20>(&hex_bytes(&entry.pubkey_hash)?)?,
+                    })
+                })
+                .transpose()?;
             let coin = Coin {
                 txout: TxOut::new(
                     cf.value,
@@ -1335,6 +1505,7 @@ impl Wallet {
                 is_coinbase: cf.is_coinbase,
                 spent_by: cf.spent_by.as_deref().map(parse_txid).transpose()?,
                 ct,
+                note,
             };
             wallet.coins.insert(outpoint, coin);
         }
@@ -1423,6 +1594,16 @@ struct CoinFile {
     spent_by: Option<String>,
     #[serde(default)]
     ct: Option<CtFile>,
+    #[serde(default)]
+    note: Option<NoteFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct NoteFile {
+    value: u64,
+    rcm: String,
+    secret: String,
+    pubkey_hash: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1624,8 +1805,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_ct_creation_is_chain_verifiable() {
-        let file = TestFile::new("ct-hybrid");
+    fn hybrid_ct_creation_is_chain_verifiable() {        let file = TestFile::new("ct-hybrid");
         let mut wallet = Wallet::create(&file.0).unwrap();
         let script = wallet.new_script(ScriptKind::P2pkh).unwrap();
         connect(&mut wallet, 1, vec![coinbase(1, script.clone())]);
@@ -1680,6 +1860,61 @@ mod tests {
         let check = |_tx: &Tx, _spent: &[TxOut], _indices: &[usize]| -> Result<(), btc_chain::ValidationError> { Ok(()) };
         btc_chain::confidential::verify_ct_tx_block(&tx, &spent, &check)
             .expect("CT spend with ring signature must verify");
+    }
+
+    #[test]
+    fn pool_note_creation_and_spend_verify() {
+        let file = TestFile::new("pool-note");
+        let mut wallet = Wallet::create(&file.0).unwrap();
+        let script = wallet.new_script(ScriptKind::P2pkh).unwrap();
+        connect(&mut wallet, 1, vec![coinbase(1, script.clone())]);
+        fill(&mut wallet, 2, 101);
+
+        // Create a pool note of 1 BTC.
+        let (note_tx, note_info, note_op) = wallet.create_pool_note(101, 1_00000000, 10_000).unwrap();
+        wallet
+            .record_note_coin(note_op, note_tx.vout[1].script_pubkey.clone(), note_info)
+            .unwrap();
+        drop(wallet);
+
+        let wallet = Wallet::open(&file.0).unwrap();
+        let note_coin = wallet
+            .coins
+            .get(&note_op)
+            .and_then(|c| c.note.clone())
+            .expect("note coin recorded");
+        assert_eq!(note_coin.value, 1_00000000);
+        drop(wallet);
+
+        // Build a spend of the mined note output and verify its witnesses.
+        let mut tree = btc_chain::notes::NoteTree::new();
+        let note = btc_chain::notes::Note {
+            spending_pub: {
+                let secp = bitcoin::secp256k1::Secp256k1::new();
+                bitcoin::secp256k1::PublicKey::from_secret_key(
+                    &secp,
+                    &bitcoin::secp256k1::SecretKey::from_slice(&note_coin.secret).unwrap(),
+                )
+                .serialize()
+            },
+            value: 1_00000000,
+            rcm: note_coin.rcm,
+        };
+        assert_eq!(tree.insert(btc_chain::notes::note_commitment(&note)), 0);
+        let anchor = tree.root();
+        let path = tree.path(0);
+        let spendscript = ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([0x42; 20]));
+        let spent_tx = Wallet::open(&file.0)
+            .unwrap()
+            .create_note_spend(note_op, note.clone(), &note_coin.secret, anchor, 0, path, spendscript, 99_990000)
+            .unwrap();
+        let spent_outs = [btc_primitives::TxOut::new(0, note_tx.vout[0].script_pubkey.clone())];
+        btc_chain::notes::verify_note_tx_block(
+            &spent_tx,
+            &spent_outs,
+            Some(anchor),
+        )
+        .expect("note spend must verify at chain level");
     }
 
     #[test]
