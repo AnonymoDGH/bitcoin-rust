@@ -286,4 +286,12 @@ impl WalletRpc for MockWallet {
         state.unlocked_until = 0;
         Ok(())
     }
+
+    fn get_stealth_address(&self) -> Result<String, String> {
+        Ok("02".to_owned() + &"ab".repeat(65))
+    }
+
+    fn list_stealth_utxos(&self, _minconf: u32, _max_blocks: u32) -> Vec<WalletUtxo> {
+        Vec::new()
+    }
 }
