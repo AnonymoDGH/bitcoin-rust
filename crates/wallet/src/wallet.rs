@@ -629,8 +629,14 @@ impl Wallet {
         let value_commitment =
             btc_chain::confidential::commitment_point(value, rcm)
                 .map_err(|_| WalletError::Build("note value commitment failed".into()))?;
-        let pool_script = ScriptBuf::from_bytes(encode_pool_note_committed(
+        let poseidon = btc_chain::value_snark::field_to_bytes(&btc_chain::value_snark::poseidon_cmu(
+            &pubkey_bytes,
+            value,
+            &rcm,
+        ));
+        let pool_script = ScriptBuf::from_bytes(btc_chain::notes::encode_pool_note_v3(
             &note_commitment(&note),
+            &poseidon,
             &value_commitment,
         ));
         let mut vout = vec![TxOut::new(0, pool_script)];
@@ -695,6 +701,7 @@ impl Wallet {
         let snark_witness = btc_chain::value_snark::ValueWitness {
             v_old: note.value,
             rcm_old: note.rcm,
+            spending_pub: note.spending_pub,
             v_new: [amount as u64, 0],
             rcm_new: [dummy, dummy],
         };
@@ -760,12 +767,16 @@ impl Wallet {
         let value_commitment =
             btc_chain::confidential::commitment_point(new_value, rcm)
                 .map_err(|_| WalletError::Build("note value commitment failed".into()))?;
-        let pool_script = ScriptBuf::from_bytes(
-            btc_chain::notes::encode_pool_note_committed(
-                &btc_chain::notes::note_commitment(&new_note),
-                &value_commitment,
-            ),
-        );
+        let poseidon = btc_chain::value_snark::field_to_bytes(&btc_chain::value_snark::poseidon_cmu(
+            &pubkey_bytes,
+            new_value,
+            &rcm,
+        ));
+        let pool_script = ScriptBuf::from_bytes(btc_chain::notes::encode_pool_note_v3(
+            &btc_chain::notes::note_commitment(&new_note),
+            &poseidon,
+            &value_commitment,
+        ));
         let mut tx = Tx::new(2, vec![TxIn::new(prevout)], vec![TxOut::new(0, pool_script)], 0);
         let context = btc_chain::confidential::ct_context(&tx);
         let sig = authorize_spend(&note, secret, &anchor, &context)
@@ -776,6 +787,7 @@ impl Wallet {
             fee,
             cap,
             cmu: btc_chain::value_snark::cmu_field(&cmu),
+            poseidon: btc_chain::value_snark::poseidon_cmu(&note.spending_pub, note.value, &note.rcm),
             c_old: btc_chain::value_snark::value_commitment(note.value, &note.rcm, &cmu),
             c_new: [
                 btc_chain::value_snark::new_commitment(new_value, &rcm),
@@ -785,6 +797,7 @@ impl Wallet {
         let snark_witness = btc_chain::value_snark::ValueWitness {
             v_old: note.value,
             rcm_old: note.rcm,
+            spending_pub: note.spending_pub,
             v_new: [new_value, 0],
             rcm_new: [rcm, dummy],
         };
