@@ -441,6 +441,18 @@ mod tests {
         .expect("regtest genesis loads")
     }
 
+    fn new_chain_ct() -> Chainstate {
+        let mut params = ChainParams::regtest();
+        params.ct_enabled = true;
+        Chainstate::new(
+            params,
+            regtest_genesis(),
+            Box::new(CoinsViewMemory::new()),
+            Box::new(MemBlockStore::default()),
+        )
+        .expect("regtest genesis loads")
+    }
+
     fn mine_blocks(cs: &mut Chainstate, pool: &Mempool, count: u32) -> Vec<BlockHash> {
         (0..count)
             .map(|_| generate_block(cs, pool, op_true(), NOW).expect("generated block is accepted"))
@@ -596,6 +608,130 @@ mod tests {
         assert!(mine_block(&mut template.block, 1 << 32));
         assert_eq!(cs.process_new_block(&template.block, NOW), Ok(true));
         assert_eq!(cs.height(), 103);
+    }
+
+    #[test]
+    fn miner_includes_ct_spend_and_pays_public_fee() {
+        use crate::confidential::{
+            create_balance_proof, create_commitment, ct_context, ct_public_fee, encode_ct_script,
+            encode_shield_marker, is_ct_tx, serialize_balance_proof, serialize_ring_sig,
+            with_fee, CtOutputData,
+        };
+        use crate::mempool_accept::accept_to_mempool;
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        use bitcoin::Witness;
+
+        let mut cs = new_chain_ct();
+        let hashes = mine_blocks(&mut cs, &Mempool::new(100), 101);
+        // Ring of 16 keys; owner at index 3.
+        let secp = Secp256k1::new();
+        let mut secrets = Vec::new();
+        let mut pubs: Vec<[u8; 33]> = Vec::new();
+        for i in 1..=16u8 {
+            let mut buf = [0u8; 32];
+            buf[0] = i;
+            buf[31] = 5;
+            secrets.push(buf);
+            pubs.push(PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&buf).unwrap()).serialize());
+        }
+        let own = 3usize;
+        let mut own_hash20 = [0u8; 20];
+        own_hash20.copy_from_slice(&bitcoin_hashes::hash160::Hash::hash(&pubs[own]).to_byte_array()[..20]);
+
+        // Shield block 102: spend coinbase 1 (50 BTC) into a CT output
+        // of 50 BTC - 1000 with a shield marker carrying fee 1000.
+        let r_in = [11u8; 32];
+        let r_out = [22u8; 32];
+        let shield_fee: u64 = 1_000;
+        let shield_value: u64 = subsidy(1) as u64 - shield_fee;
+        let c_out = create_commitment(shield_value, r_out).unwrap();
+        let mut shield_tx = Tx::new(
+            2,
+            vec![TxIn::new(coinbase_outpoint(&cs, &hashes[0]))],
+            vec![
+                TxOut::new(
+                    0,
+                    encode_ct_script(&CtOutputData {
+                        commitment: c_out.commitment,
+                        pubkey_hash: own_hash20,
+                        proof: c_out.proof,
+                    })
+                    .unwrap(),
+                ),
+                TxOut::new(
+                    0,
+                    ScriptBuf::from_bytes(encode_shield_marker(&r_in, &[0u8; 73])),
+                ),
+            ],
+            0,
+        );
+        let context = ct_context(&shield_tx);
+        let (proof, _) = create_balance_proof(&[r_in], &[r_out], shield_fee, &context).unwrap();
+        let balance = with_fee(serialize_balance_proof(&proof), shield_fee);
+        shield_tx.vout[1] = TxOut::new(
+            0,
+            ScriptBuf::from_bytes(encode_shield_marker(&r_in, &balance)),
+        );
+        let shield_id = shield_tx.txid();
+        assert_eq!(ct_public_fee(&shield_tx), shield_fee);
+        let mut pool = Mempool::new(100);
+        pool.add(pool_entry(shield_tx, shield_fee as i64)).unwrap();
+        let mut template = create_new_block(&cs, &pool, op_true(), NOW);
+        assert_eq!(template.block.txdata[1].txid(), shield_id);
+        assert_eq!(template.block.txdata[0].vout[0].value, subsidy(102) + shield_fee as i64);
+        assert!(mine_block(&mut template.block, 1 << 32));
+        assert_eq!(cs.process_new_block(&template.block, NOW), Ok(true));
+
+        // All-CT spend of the shielded coin, fee 10_000 in the prefix.
+        // The input commitment was created with blinding r_out, so the
+        // balance proof uses r_out as its input blinding.
+        let ct_prevout = OutPoint { txid: shield_id, vout: 0 };
+        let r2_out = [44u8; 32];
+        let ct_fee: u64 = 10_000;
+        let value_out = shield_value - ct_fee;
+        let c2 = create_commitment(value_out, r2_out).unwrap();
+        let mut ct_tx = Tx::new(
+            2,
+            vec![TxIn::new(ct_prevout)],
+            vec![TxOut::new(
+                0,
+                encode_ct_script(&CtOutputData {
+                    commitment: c2.commitment,
+                    pubkey_hash: own_hash20,
+                    proof: c2.proof,
+                })
+                .unwrap(),
+            )],
+            0,
+        );
+        let context = ct_context(&ct_tx);
+        let (proof2, _) = create_balance_proof(&[r_out], &[r2_out], ct_fee, &context).unwrap();
+        let balance2 = with_fee(serialize_balance_proof(&proof2), ct_fee);
+        let sig = crate::ringsig::sign_ring(&context, &pubs, own, &secrets[own]).unwrap();
+        let mut ring_bytes = Vec::new();
+        for key in &pubs {
+            ring_bytes.extend_from_slice(key);
+        }
+        ct_tx.vin[0].witness =
+            Witness::from_slice(&[balance2, serialize_ring_sig(&sig), ring_bytes]);
+        let ct_id = ct_tx.txid();
+        assert_eq!(ct_public_fee(&ct_tx), ct_fee);
+        let _ = is_ct_tx(&ct_tx, &[]);
+        let mut pool = Mempool::new(100);
+        accept_to_mempool(&cs, &mut pool, ct_tx)
+            .expect("all-CT spend accepted to mempool");
+        assert_eq!(pool.get(&ct_id).unwrap().fee, ct_fee as i64);
+
+        let mut template = create_new_block(&cs, &pool, op_true(), NOW);
+        assert_eq!(template.height, 103);
+        assert_eq!(template.block.txdata.len(), 2);
+        assert_eq!(template.block.txdata[1].txid(), ct_id);
+        assert_eq!(
+            template.block.txdata[0].vout[0].value,
+            subsidy(103) + ct_fee as i64
+        );
+        assert!(mine_block(&mut template.block, 1 << 32));
+        assert_eq!(cs.process_new_block(&template.block, NOW), Ok(true));
     }
 
     #[test]
