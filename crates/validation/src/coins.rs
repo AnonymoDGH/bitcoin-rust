@@ -83,10 +83,12 @@ pub fn is_unspendable(script_pubkey: &Script) -> bool {
     if bytes.get(1) == Some(&btc_consensus::CT_SCRIPT_VERSION) {
         return false;
     }
-    // Pool note: OP_RETURN OP_PUSHDATA1(32) <cmu> (legacy) or
-    // OP_RETURN OP_PUSHDATA1(65) <cmu || value commitment> (committed).
+    // Pool note: OP_RETURN OP_PUSHDATA1(32) <cmu> (legacy),
+    // OP_RETURN OP_PUSHDATA1(65) <cmu || value commitment> (committed),
+    // or OP_RETURN OP_PUSHDATA1(97) <cmu || poseidon || commitment> (v3).
     !((bytes.len() == 35 && bytes[1] == 0x4c && bytes[2] == 32)
-        || (bytes.len() == 68 && bytes[1] == 0x4c && bytes[2] == 65))
+        || (bytes.len() == 68 && bytes[1] == 0x4c && bytes[2] == 65)
+        || (bytes.len() == 100 && bytes[1] == 0x4c && bytes[2] == 97))
 }
 
 /// In-memory UTXO set backed by a `HashMap`.
