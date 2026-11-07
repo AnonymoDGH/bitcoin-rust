@@ -52,6 +52,32 @@ to mine in the background. `-gen` hashes until a block is found and immediately 
 add `-blockinterval=<secs>` to throttle (old fixed-interval behaviour) and `-maxblocks=<n>` to stop after
 n blocks. On regtest that is roughly 90 blocks/s, so use `-maxblocks` when leaving it unattended.
 
+### Difficulty
+
+Custom chains start hard and can only get harder: `pow_limit` equals the genesis target, so the minimum
+difficulty is the launch difficulty, and retargeting every `target_timespan / target_spacing` blocks
+(2016 by default, 600 s spacing) pushes the target towards the spacing as hash power changes.
+
+| Preset | `genesis_bits` | Expected hashes/block | Time/block (1 CPU core, release) |
+|---|---|---|---|
+| `chains/hardcoin.json` | `1e00ffff` | ~16.7 M | ~40–200 s |
+| `-printchainspec` default | `1e00ffff` | ~16.7 M | ~40–200 s |
+| `chains/satoshibtc.json` | `1d00ffff` (Bitcoin initial difficulty) | ~4.3 B | ~3 h |
+
+Halving the mantissa doubles the difficulty: `1e003fff` ≈ 67 M hashes, `1e001fff` ≈ 134 M.
+Barely-harder than current defaults: `1f00ffff` ≈ 65 k hashes (~0.5 s).
+
+```bash
+cargo build --release -p btc-node
+./target/release/btc-node -chainspec=chains/hardcoin.json -datadir=./node1 \
+  -gen -genaddress=<address-or-script-hex> -maxblocks=10
+# mining genesis block for hardcoin (bits 0x1e00ffff, expected ~16777472 hashes, ...)
+```
+
+Warning: genesis is mined synchronously at startup, so a `1d00ffff`-class spec does not start
+for hours. Freeze the spec (`chainspec`) after launch — changing `genesis_bits`, `magic` or ports
+afterwards produces a different genesis hash and orphans the chain.
+
 Pending: DoS scoring/banning, mempool ancestor limits + RBF + persistence, UTXO cache (coins db is fully
 in RAM), per-candidate best-chain index, header-only index on disk, compact blocks, BIP324, descriptors/PSBT.
 
