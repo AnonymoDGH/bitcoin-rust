@@ -302,4 +302,12 @@ impl WalletRpc for MockWallet {
     fn send_to_confidential(&self, _amount: i64, _fee: i64) -> Result<Txid, String> {
         Ok(Txid::from_byte_array([8u8; 32]))
     }
+
+    fn create_pool_note(&self, _amount: i64, _fee: i64) -> Result<String, String> {
+        Ok("aa".repeat(32))
+    }
+
+    fn spend_note(&self, _cmu_hex: String, _amount: i64) -> Result<Txid, String> {
+        Ok(Txid::from_byte_array([9u8; 32]))
+    }
 }
