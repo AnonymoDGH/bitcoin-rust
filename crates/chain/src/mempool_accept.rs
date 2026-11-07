@@ -204,7 +204,15 @@ pub fn accept_to_mempool(chainstate: &Chainstate, mempool: &mut Mempool, tx: Tx)
     }
 
     if !is_ct {
-        if let Err(err) = check_input_scripts(&tx, &spent_outs, standard_script_flags()) {
+        // Plain inputs script-verify; note inputs are authorised by pool
+        // verification above.
+        let plain_indices: Vec<usize> = spent_outs
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| !crate::notes::is_pool_script(o.script_pubkey.as_bytes()))
+            .map(|(i, _)| i)
+            .collect();
+        if let Err(err) = crate::inputs::check_input_indices(&tx, &spent_outs, standard_script_flags(), &plain_indices) {
             return Err(match err {
                 ValidationError::Script { error, .. } => {
                     MempoolReject::Policy(format!("mempool-script-verify-flag-failed ({error})"))
@@ -213,7 +221,7 @@ pub fn accept_to_mempool(chainstate: &Chainstate, mempool: &mut Mempool, tx: Tx)
             });
         }
         let block_flags = block_script_flags(next_height, &chainstate.tip_hash(), &chainstate.params);
-        check_input_scripts(&tx, &spent_outs, block_flags)
+        crate::inputs::check_input_indices(&tx, &spent_outs, block_flags, &plain_indices)
             .map_err(|_| MempoolReject::Consensus("mandatory-script-verify-flag-failed".into()))?;
     }
 
