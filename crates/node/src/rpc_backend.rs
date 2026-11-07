@@ -312,6 +312,33 @@ mod tests {
     }
 
     #[test]
+    fn stealth_address_rpc_is_deterministic_and_scans_empty() {
+        let mut node = Node::new(
+            ChainParams::regtest(),
+            regtest_genesis_block(),
+            Box::new(CoinsViewMemory::new()),
+            Box::<MemBlockStore>::default(),
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("btc-node-wallet-stealth-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let wallet = Wallet::create(&dir).unwrap();
+        node.attach_wallet(wallet).unwrap();
+        let shutdown = Arc::new(Notify::new());
+        let rpc = NodeRpc::new(node.shared(), shutdown);
+
+        let first = result(&call(&rpc, "getnewstealthaddress", json!([]))).clone();
+        let hex = first.as_str().unwrap();
+        assert_eq!(hex.len(), 132, "66 bytes as hex");
+        let second = result(&call(&rpc, "getnewstealthaddress", json!([]))).clone();
+        assert_eq!(first, second, "reusable invitation address");
+        let utxos = result(&call(&rpc, "liststealthutxos", json!([]))).clone();
+        assert_eq!(utxos, json!([]), "no stealth payments yet");
+
+        std::fs::remove_file(&dir).unwrap();
+    }
+
+    #[test]
     fn gettxout_and_raw_transaction_for_block_one_coinbase() {
         let (rpc, _) = regtest_backend();
         let hashes: Vec<String> = serde_json::from_value(
@@ -503,5 +530,77 @@ impl WalletRpc for NodeRpc {
     fn wallet_lock(&self) -> Result<(), String> {
         self.with_wallet(|w, _| w.lock().map_err(wallet_error_message))
             .unwrap_or_else(|| Err("wallet disabled".into()))
+    }
+
+    fn get_stealth_address(&self) -> Result<String, String> {
+        self.with_wallet(|w, _| {
+            w.stealth_address()
+                .map(|a| a.to_bytes().to_lower_hex_string())
+                .map_err(wallet_error_message)
+        })
+        .unwrap_or_else(|| Err("wallet disabled".into()))
+    }
+
+    fn list_stealth_utxos(&self, minconf: u32, max_blocks: u32) -> Vec<WalletUtxo> {
+        use btc_wallet::stealth::{extract_hash160, parse_marker};
+        self.with_node(|n| {
+            let Some(wallet) = n.wallet.as_ref() else {
+                return Vec::new();
+            };
+            let Ok(keys) = wallet.stealth_keys() else {
+                return Vec::new();
+            };
+            let tip = n.chainstate.height();
+            let mut found = Vec::new();
+
+            let scan_tx = |tx: &Tx, height: Option<u32>, out: &mut Vec<WalletUtxo>| {
+                // Markers announce the ephemeral key for this payment.
+                let Some(ephemeral) = tx.vout.iter().find_map(|o| parse_marker(&o.script_pubkey))
+                else {
+                    return;
+                };
+                let confirmations = height.map_or(0, |h| tip - h + 1);
+                if confirmations < minconf {
+                    return;
+                }
+                for (vout, output) in tx.vout.iter().enumerate() {
+                    let Some(candidate) = extract_hash160(&output.script_pubkey) else {
+                        continue;
+                    };
+                    let matched = keys
+                        .scan_output(&ephemeral, &candidate)
+                        .ok()
+                        .flatten();
+                    if let Some(_secret) = matched {
+                        out.push(WalletUtxo {
+                            outpoint: OutPoint::new(tx.txid(), vout as u32),
+                            script_pubkey: output.script_pubkey.clone(),
+                            amount: output.value,
+                            confirmations,
+                            spendable: true,
+                        });
+                    }
+                }
+            };
+
+            // Mempool first (0 confirmations), then blocks newest-last window.
+            for entry in n.mempool.sorted_by_fee_rate() {
+                let tx = entry.tx.clone();
+                scan_tx(&tx, None, &mut found);
+            }
+            let start = tip.saturating_sub(max_blocks);
+            for height in start..=tip {
+                if let Some(block) = n
+                    .chainstate
+                    .block_hash_at(height)
+                    .and_then(|h| n.chainstate.get_block(&h))
+                {
+                    for tx in &block.txdata {
+                        scan_tx(tx, Some(height), &mut found);
+                    }
+                }
+            }
+            found
+        })
     }
 }
