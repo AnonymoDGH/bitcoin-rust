@@ -43,6 +43,10 @@ pub trait RpcBackend: Send + Sync + 'static {
     /// `Ok(())` when the block was accepted, otherwise the BIP22 rejection reason.
     fn submit_block(&self, block: Block) -> Result<(), String>;
     fn generate_to_script(&self, n: u32, script: ScriptBuf) -> Result<Vec<BlockHash>, String>;
+    /// Shielded pool anchor (Merkle root over note commitments) at the tip.
+    fn pool_anchor(&self) -> [u8; 32];
+    /// Number of note leaves in the shielded pool on the active chain.
+    fn pool_len(&self) -> usize;
     /// Returns the output, its confirmations and whether it is a coinbase output.
     fn get_tx_out(&self, outpoint: &OutPoint) -> Option<(TxOut, u32, bool)>;
     fn network(&self) -> Network;
