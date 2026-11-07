@@ -125,6 +125,126 @@ pub fn verify_authorization(
     }
 }
 
+/// Note witness: the note itself (`pub || value || rcm = 73 bytes`).
+pub fn encode_note(note: &Note) -> Vec<u8> {
+    let mut out = Vec::with_capacity(73);
+    out.extend_from_slice(&note.spending_pub);
+    out.extend_from_slice(&note.value.to_le_bytes());
+    out.extend_from_slice(&note.rcm);
+    out
+}
+
+/// Decodes a note witness.
+pub fn decode_note(bytes: &[u8]) -> Option<Note> {
+    if bytes.len() != 73 {
+        return None;
+    }
+    Some(Note {
+        spending_pub: bytes[0..33].try_into().ok()?,
+        value: u64::from_le_bytes(bytes[33..41].try_into().ok()?),
+        rcm: bytes[41..73].try_into().ok()?,
+    })
+}
+
+/// Spend auth witness: anchor (32) || index (4 LE) || signature (64).
+pub fn encode_spend_auth(anchor: &[u8; 32], index: u32, signature: &[u8; 64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(100);
+    out.extend_from_slice(anchor);
+    out.extend_from_slice(&index.to_le_bytes());
+    out.extend_from_slice(signature);
+    out
+}
+
+/// Decodes a spend auth witness.
+pub fn decode_spend_auth(bytes: &[u8]) -> Option<([u8; 32], u32, [u8; 64])> {
+    if bytes.len() != 100 {
+        return None;
+    }
+    Some((
+        bytes[0..32].try_into().ok()?,
+        u32::from_le_bytes(bytes[32..36].try_into().ok()?),
+        bytes[36..100].try_into().ok()?,
+    ))
+}
+
+/// Verifies one note spend in block context (called by `ConnectBlock`).
+/// Returns the fee (note value minus outputs). `spent_outs` are the
+/// previous outputs; pool note spends carry `value > 0` inside the note.
+pub fn verify_note_tx_block(
+    tx: &btc_primitives::Tx,
+    spent_outs: &[btc_primitives::TxOut],
+    pool_root: Option<[u8; 32]>,
+) -> Result<i64, NoteError> {
+    if spent_outs.len() != tx.vin.len() || tx.vin.is_empty() {
+        return Err(NoteError::Invalid);
+    }
+    // Hash of the stripped tx: context for spend authorisations.
+    let context = crate::confidential::ct_context(tx);
+    let anchor = pool_root.ok_or(NoteError::UnknownAnchor)?;
+    let anchors = [anchor].into_iter().collect();
+    let mut total_value: i64 = 0;
+    for (i, (input, spent_out)) in tx.vin.iter().zip(spent_outs).enumerate() {
+        if crate::confidential::is_ct_script(spent_out.script_pubkey.as_bytes()) {
+            continue; // CT spends are checked elsewhere
+        }
+        let pool_cmu = decode_pool_note(spent_out.script_pubkey.as_bytes());
+        let Some(pool_cmu) = pool_cmu else {
+            continue; // plain input: script checks run elsewhere
+        };
+        eprintln!("ct-note dbg: pool input {i} spending cmu from script");
+        let note_bytes = input.witness.iter().next().map(|b| b.to_vec());
+        let Some(note_bytes) = note_bytes else {
+            return Err(NoteError::Invalid);
+        };
+        let note = decode_note(&note_bytes).ok_or(NoteError::Invalid)?;
+        if spent_out.value != 0 && note.value != 0 {
+            // Pool notes are zero-valued in the ledger (value hidden inside).
+            return Err(NoteError::Invalid);
+        }
+        if note_commitment(&note) != pool_cmu {
+            return Err(NoteError::Invalid);
+        }
+        let Some(auth_bytes) = input.witness.iter().nth(1).map(|b| b.to_vec()) else {
+            return Err(NoteError::Invalid);
+        };
+        let (anchor_claimed, index, signature) =
+            decode_spend_auth(&auth_bytes).ok_or(NoteError::Invalid)?;
+        let path_bytes = input.witness.iter().nth(2).ok_or(NoteError::Invalid)?;
+        let path = decode_path(path_bytes).ok_or(NoteError::Invalid)?;
+        if anchor_claimed != anchor {
+            return Err(NoteError::UnknownAnchor);
+        }
+        // Membership + signature, double spend registration is checked by
+        // the caller through the chainstate pool registry.
+        verify_spend(&anchors, &std::collections::HashSet::new(), &note, &anchor, index, &path, &context, &signature)?;
+        total_value += note.value as i64;
+    }
+    let value_out: i64 = tx.vout.iter().map(|o| o.value).sum();
+    let fee = total_value - value_out;
+    if fee < 0 || fee > 21_000_000 * 100_000_000 {
+        return Err(NoteError::Invalid);
+    }
+    Ok(fee)
+}
+
+/// Packs a Merkle path (32 siblings).
+pub fn encode_path(path: &[[u8; 32]]) -> Vec<u8> {
+    path.concat()
+}
+
+/// Decodes a Merkle path.
+pub fn decode_path(bytes: &[u8]) -> Option<Vec<[u8; 32]>> {
+    if bytes.len() != NOTE_DEPTH * 32 {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(32)
+            .map(|chunk| chunk.try_into().unwrap())
+            .collect(),
+    )
+}
+
 /// Context digest: commitment, anchor, nullifier and transaction context.
 pub fn authorize_message(note: &Note, anchor: &[u8; 32], context: &[u8]) -> [u8; 32] {
     let mut buf = Vec::with_capacity(TAG_AUTH.len() + 32 + 32 + 32 + context.len());
