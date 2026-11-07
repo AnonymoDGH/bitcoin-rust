@@ -12,3 +12,4 @@ bitcoin = { workspace = true }
 bitcoin_hashes = { workspace = true }
 primitive-types = "0.13"
 thiserror = { workspace = true }
+getrandom = "0.2"
