@@ -88,9 +88,35 @@ fn dust_threshold(script: &Script) -> i64 {
 /// Entries whose script `keys` cannot sign for are ignored. Coin selection tries Branch and
 /// Bound and falls back to Knapsack. Change goes to `change_script` unless it would be dust.
 /// `fee_rate_sat_per_kvb` is the target rate; the long-term rate used for selection equals it.
+///
+/// With `extras`, each extra script is paid 0 as an additional output (used for
+/// stealth ephemeral markers): `extras` count towards the fee estimation because
+/// they are committed by the sighash, but carry no value. Extras are extracted
+/// before change is appended.
 pub fn build_transaction(
     utxos: &[(OutPoint, TxOut)],
     recipients: &[(ScriptBuf, i64)],
+    change_script: ScriptBuf,
+    fee_rate_sat_per_kvb: i64,
+    keys: &KeyStore,
+) -> Result<Tx, BuildError> {
+    build_transaction_with_extras(
+        utxos,
+        recipients,
+        &[],
+        change_script,
+        fee_rate_sat_per_kvb,
+        keys,
+    )
+}
+
+/// Builds a transaction like [`build_transaction`], additionally paying 0 to
+/// every `extras` script (stealth marker outputs). Extras are committed by
+/// the sighash, so they must be constructed before signing.
+pub fn build_transaction_with_extras(
+    utxos: &[(OutPoint, TxOut)],
+    recipients: &[(ScriptBuf, i64)],
+    extras: &[ScriptBuf],
     change_script: ScriptBuf,
     fee_rate_sat_per_kvb: i64,
     keys: &KeyStore,
@@ -140,7 +166,11 @@ pub fn build_transaction(
     }
 
     // Sized for every spendable input, so the target covers any subset that gets selected.
-    let target = recipient_sum + fee_for(base_weight(coins.len(), &recipient_outs), rate);
+    let mut all_output_weight = recipient_outs.clone();
+    for script in extras {
+        all_output_weight.push(TxOut::new(0, script.clone()));
+    }
+    let target = recipient_sum + fee_for(base_weight(coins.len(), &all_output_weight), rate);
     let cost_of_change =
         fee_for(4 * output_size(&change_script), rate) + fee_for(CHANGE_SPEND_WEIGHT, rate);
     let selection = select_coins_bnb(
@@ -187,7 +217,7 @@ pub fn build_transaction(
         input_fees += coins[index].fee(rate);
     }
 
-    let fee_without_change = input_fees + fee_for(base_weight(vin.len(), &recipient_outs), rate);
+    let fee_without_change = input_fees + fee_for(base_weight(vin.len(), &all_output_weight), rate);
     let remainder = input_value - recipient_sum - fee_without_change;
     if remainder < 0 {
         return Err(BuildError::InsufficientFunds {
@@ -197,6 +227,9 @@ pub fn build_transaction(
     }
 
     let mut outputs = recipient_outs;
+    for script in extras {
+        outputs.push(TxOut::new(0, script.clone()));
+    }
     let change_value = remainder - fee_for(4 * output_size(&change_script), rate);
     if change_value >= dust_threshold(&change_script) {
         outputs.push(TxOut::new(change_value, change_script));
