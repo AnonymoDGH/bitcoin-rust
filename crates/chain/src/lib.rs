@@ -15,8 +15,10 @@ pub mod inputs;
 pub mod contextual;
 pub mod connect;
 pub mod chainstate;
+pub mod confidential;
 pub mod miner;
 pub mod mempool_accept;
+pub mod ringsig;
 
 pub use error::ValidationError;
 pub use index::{ActiveChain, BlockIndex, BlockStatus, BlockTree, IndexId};
