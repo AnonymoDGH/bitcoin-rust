@@ -138,6 +138,14 @@ impl RpcBackend for NodeRpc {
         })
     }
 
+    fn pool_anchor(&self) -> [u8; 32] {
+        self.with_node(|n| n.chainstate.pool_root())
+    }
+
+    fn pool_len(&self) -> usize {
+        self.with_node(|n| n.chainstate.pool_len())
+    }
+
     fn get_tx_out(&self, outpoint: &OutPoint) -> Option<(TxOut, u32, bool)> {
         self.with_node(|n| {
             if n.mempool.spender_of(outpoint).is_some() {
