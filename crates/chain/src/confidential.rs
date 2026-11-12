@@ -1,35 +1,63 @@
 //! Confidential Transactions (Privacy Plan, Phase 2).
 //!
 //! Amounts are hidden inside Pedersen commitments
-//! `C(v, r) = v*G + r*H`, where `H` is an independent generator
-//! (`SHA256("AnonCoin-H-v1") * G`). Each commitment ships a 64-bit
-//! range proof (binary Schnorr OR-proofs, one per bit), so a receiver
-//! learns only that `0 <= v < 2^64`. A transaction additionally ships a
-//! balance proof: knowledge of the blinding difference is a Schnorr
-//! signature on `sum_in(C) - sum_out(C) - fee*G`, which proves the
-//! inputs pay for the outputs plus the public fee — no inflation.
+//! `C(v, r) = v*G + r*H`, where `H` is a "nothing up my sleeve" (NUMS)
+//! generator: its discrete log with respect to `G` is unknown to everyone
+//! (see [`h_generator`]). That independence is what makes commitments
+//! *binding*; if anybody knew `h = log_G(H)` then `v*G + r*H =
+//! (v + r*h)*G` would open to any value and balance proofs could be
+//! forged (unlimited inflation). The earlier `SHA256(..)*G` derivation had
+//! exactly that flaw.
 //!
-//! This is a primitives-level implementation: the tests prove
-//! commit/prove/witness/verify round-trips and the two main attacks
-//! (out-of-range minting, unbalanced creation) fail verification.
-//! Consensus activation (new output type in `ConnectBlock`) is the
-//! next step; see `docs/privacy-plan.md`.
+//! Each commitment ships a 64-bit range proof: 64 bit commitments
+//! `C_i = b_i*G + r_i*H` with `sum 2^i * C_i == C`, and for every bit a
+//! two-member ring (Abe-Ohkubo-Suzuki / Borromean-style) OR-proof that
+//! `C_i` opens to 0 *or* 1 without revealing which. A transaction
+//! additionally ships a balance proof: a Schnorr signature (base `H`) with
+//! the witness `sum_in(r) - sum_out(r)` over the point
+//! `sum_in(C) - sum_out(C) - fee*G`; it proves the inputs pay for the
+//! outputs plus the public fee, so no inflation is possible.
 //!
-//! Fiat-Shamir challenges are SHA-256 over a domain-separated
-//! transcript. Point arithmetic uses `rust-secp256k1` through the
-//! `bitcoin` crate re-export.
+//! Fiat-Shamir challenges are SHA-256 over a domain-separated,
+//! length-prefixed transcript. Point arithmetic uses `rust-secp256k1`
+//! through the `bitcoin` crate re-export. Every function that handles
+//! consensus input returns an error instead of panicking; the point at
+//! infinity is handled explicitly (`Option<PublicKey>` with `None` =
+//! infinity) so degenerate inputs are rejected deterministically.
 
 use std::sync::OnceLock;
 
-use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
+use bitcoin::secp256k1::{All, PublicKey, Scalar, Secp256k1, SecretKey};
 use bitcoin_hashes::{sha256, Hash as _};
 use btc_primitives::ScriptBuf;
 use thiserror::Error;
 
 pub const VALUE_BITS: usize = 64;
-pub const H_DOMAIN: &[u8] = b"AnonCoin-H-v1";
-const TRANSCRIPT_RANGE: &[u8] = b"AnonCoin-CT-RANGE-v1";
-const TRANSCRIPT_BALANCE: &[u8] = b"AnonCoin-CT-BALANCE-v1";
+
+/// Domain string of the NUMS derivation of `H`. `H` is the first valid
+/// compressed point `0x02 || x` with
+/// `x = SHA256(H_DOMAIN || counter_le32)`, `counter = 0, 1, 2, ...`
+/// (try-and-increment hash-to-curve). Nobody knows `log_G(H)` because `x`
+/// is the output of a hash that was not chosen as a multiple of `G`.
+pub const H_DOMAIN: &[u8] = b"AnonCoin-H-v2";
+
+/// The derived `H` (compressed SEC1), hardcoded so a derivation bug can
+/// never silently change consensus; a test re-derives it from
+/// [`H_DOMAIN`] and asserts equality.
+/// Derivation result: counter 0 is not a valid x-coordinate, counter 1 is
+/// (x = 5bc06fba...14bf).
+pub const H_COMPRESSED: [u8; 33] = [
+    0x02, 0x5b, 0xc0, 0x6f, 0xba, 0x2c, 0x84, 0x0e, 0x90, 0xed, 0xec,
+    0xde, 0x0b, 0x1e, 0x21, 0x37, 0x43, 0x07, 0xd1, 0x4f, 0x02, 0x0f,
+    0xea, 0xfd, 0x4e, 0xbe, 0x6f, 0x23, 0x39, 0xff, 0xb1, 0x14, 0xbf
+];
+
+const TRANSCRIPT_RANGE: &[u8] = b"AnonCoin-CT-RANGE-v2";
+const TRANSCRIPT_BALANCE: &[u8] = b"AnonCoin-CT-BALANCE-v2";
+
+/// Serialized size of one range proof: 64 bit commitments (33 bytes each)
+/// followed by 64 ring proofs `e0 || z0 || z1` (96 bytes each).
+pub const RANGE_PROOF_BYTES: usize = VALUE_BITS * (33 + 96);
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum CtError {
@@ -45,45 +73,111 @@ pub enum CtError {
     Random(#[from] getrandom::Error),
 }
 
-/// Independent generator `H`, derived once from the domain string.
+fn secp() -> &'static Secp256k1<All> {
+    static CTX: OnceLock<Secp256k1<All>> = OnceLock::new();
+    CTX.get_or_init(Secp256k1::new)
+}
+
+/// Re-derives `H` from [`H_DOMAIN`] by try-and-increment.
+pub fn derive_h_nums() -> PublicKey {
+    let mut counter: u32 = 0;
+    loop {
+        let mut preimage = Vec::with_capacity(H_DOMAIN.len() + 4);
+        preimage.extend_from_slice(H_DOMAIN);
+        preimage.extend_from_slice(&counter.to_le_bytes());
+        let x = sha256::Hash::hash(&preimage);
+        let mut compressed = [0u8; 33];
+        compressed[0] = 0x02;
+        compressed[1..].copy_from_slice(x.as_ref());
+        if let Ok(point) = PublicKey::from_slice(&compressed) {
+            return point;
+        }
+        counter = counter.wrapping_add(1);
+    }
+}
+
+/// Independent (NUMS) generator `H`. Parsed from the hardcoded constant;
+/// falls back to the (identical) derivation only if the constant were
+/// ever malformed.
 fn h_generator() -> PublicKey {
     static H: OnceLock<PublicKey> = OnceLock::new();
-    *H.get_or_init(|| {
-        let secp = Secp256k1::new();
-        let seed = sha256::Hash::hash(H_DOMAIN);
-        let sk = SecretKey::from_slice(seed.as_ref()).expect("hash is in range with prob 1");
-        PublicKey::from_secret_key(&secp, &sk)
+    *H.get_or_init(|| PublicKey::from_slice(&H_COMPRESSED).unwrap_or_else(|_| derive_h_nums()))
+}
+
+/// The standard generator `G`.
+fn g_generator() -> PublicKey {
+    static G: OnceLock<PublicKey> = OnceLock::new();
+    *G.get_or_init(|| {
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        // 1 is always a valid secret key.
+        match SecretKey::from_slice(&one) {
+            Ok(sk) => PublicKey::from_secret_key(secp(), &sk),
+            Err(_) => derive_h_nums(), // unreachable
+        }
     })
 }
 
-pub fn commitment_point(value: u64, blinding: [u8; 32]) -> Result<[u8; 33], CtError> {
-    let secp = Secp256k1::new();
-    let mut point = scalar_mul(h_generator(), &blinding)?;
-    if value > 0 {
-        let v_sk = scalar_to_secret(value)?;
-        point = point
-            .combine(&PublicKey::from_secret_key(&secp, &v_sk))
-            .map_err(|_| CtError::BadPoint)?;
+// ---------------------------------------------------------------------
+// Scalar arithmetic on 32-byte big-endian values mod n (zero allowed).
+// ---------------------------------------------------------------------
+
+const ZERO: [u8; 32] = [0u8; 32];
+
+fn secret_from_bytes(bytes: [u8; 32]) -> Result<SecretKey, CtError> {
+    SecretKey::from_slice(&bytes).map_err(|_| CtError::BadScalar)
+}
+
+/// Rejects encodings `>= n`. Zero is accepted.
+fn check_scalar(bytes: &[u8; 32]) -> Result<Scalar, CtError> {
+    Scalar::from_be_bytes(*bytes).map_err(|_| CtError::BadScalar)
+}
+
+fn scalar_neg(a: &[u8; 32]) -> Result<[u8; 32], CtError> {
+    check_scalar(a)?;
+    if *a == ZERO {
+        return Ok(ZERO);
     }
-    Ok(point.serialize())
+    Ok(secret_from_bytes(*a)?.negate().secret_bytes())
 }
 
-fn scalar_mul(point: PublicKey, scalar_bytes: &[u8; 32]) -> Result<PublicKey, CtError> {
-    let secp = Secp256k1::new();
-    let sk = SecretKey::from_slice(scalar_bytes).map_err(|_| CtError::BadScalar)?;
-    // scalar*point = point tweaked: use PublicKey::mul_tweak via Scalar.
-    let scalar = Scalar::from_be_bytes(*scalar_bytes).map_err(|_| CtError::BadScalar)?;
-    point.mul_tweak(&secp, &scalar).map_err(|_| CtError::BadPoint)
+/// `(a + b) mod n`; zero is the identity and a zero result is legal.
+fn scalar_add(a: &[u8; 32], b: &[u8; 32]) -> Result<[u8; 32], CtError> {
+    check_scalar(a)?;
+    let b_scalar = check_scalar(b)?;
+    if *a == ZERO {
+        return Ok(*b);
+    }
+    if *b == ZERO {
+        return Ok(*a);
+    }
+    let a_sk = secret_from_bytes(*a)?;
+    if a_sk.negate().secret_bytes() == *b {
+        return Ok(ZERO);
+    }
+    Ok(a_sk.add_tweak(&b_scalar).map_err(|_| CtError::BadScalar)?.secret_bytes())
 }
 
-fn scalar_to_secret(value: u64) -> Result<SecretKey, CtError> {
+/// `(a - b) mod n`.
+fn scalar_sub(a: &[u8; 32], b: &[u8; 32]) -> Result<[u8; 32], CtError> {
+    scalar_add(a, &scalar_neg(b)?)
+}
+
+/// `(a * b) mod n`; a zero result is legal.
+fn scalar_mul_bytes(a: &[u8; 32], b: &[u8; 32]) -> Result<[u8; 32], CtError> {
+    check_scalar(a)?;
+    let b_scalar = check_scalar(b)?;
+    if *a == ZERO || *b == ZERO {
+        return Ok(ZERO);
+    }
+    let a_sk = secret_from_bytes(*a)?;
+    Ok(a_sk.mul_tweak(&b_scalar).map_err(|_| CtError::BadScalar)?.secret_bytes())
+}
+
+fn u64_to_scalar(value: u64) -> [u8; 32] {
     let mut buf = [0u8; 32];
     buf[24..].copy_from_slice(&value.to_be_bytes());
-    SecretKey::from_slice(&buf).map_err(|_| CtError::BadScalar)
-}
-
-fn parse_point(bytes: &[u8; 33]) -> Result<PublicKey, CtError> {
-    PublicKey::from_slice(bytes).map_err(|_| CtError::BadPoint)
+    buf
 }
 
 fn random_scalar() -> Result<[u8; 32], CtError> {
@@ -96,14 +190,15 @@ fn random_scalar() -> Result<[u8; 32], CtError> {
     }
 }
 
-/// Scalar in (1, n): challenge derived as hash of `parts`, retried with a
-/// counter until it is a valid secret scalar.
+/// Scalar in `[1, n)`: SHA-256 over a length-prefixed transcript, retried
+/// with a counter until it is a valid secret scalar.
 fn challenge_scalar(parts: &[&[u8]]) -> [u8; 32] {
     let mut counter = 0u8;
     loop {
-        let mut buf = Vec::with_capacity(33);
-        buf.extend_from_slice(&[counter]);
+        let mut buf = Vec::with_capacity(1 + parts.iter().map(|p| p.len() + 4).sum::<usize>());
+        buf.push(counter);
         for part in parts {
+            buf.extend_from_slice(&(part.len() as u32).to_le_bytes());
             buf.extend_from_slice(part);
         }
         let hash = sha256::Hash::hash(&buf);
@@ -116,44 +211,80 @@ fn challenge_scalar(parts: &[&[u8]]) -> [u8; 32] {
     }
 }
 
-fn secret_from_bytes(bytes: [u8; 32]) -> Result<SecretKey, CtError> {
-    SecretKey::from_slice(&bytes).map_err(|_| CtError::BadScalar)
+// ---------------------------------------------------------------------
+// Point arithmetic. `None` is the point at infinity.
+// ---------------------------------------------------------------------
+
+type Pt = Option<PublicKey>;
+
+fn parse_point(bytes: &[u8; 33]) -> Result<PublicKey, CtError> {
+    PublicKey::from_slice(bytes).map_err(|_| CtError::BadPoint)
 }
 
-/// `(a + b) mod n` on secret scalars encoded as big-endian bytes.
-/// Zero is the additive identity and is legal here (unlike SecretKey).
-fn scalar_add(a: &[u8; 32], b: &[u8; 32]) -> Result<[u8; 32], CtError> {
-    if *a == [0u8; 32] {
-        return Ok(*b);
+/// `scalar * point`; zero scalar or infinity point give infinity.
+fn mul_opt(point: Pt, scalar: &[u8; 32]) -> Result<Pt, CtError> {
+    let scalar_checked = check_scalar(scalar)?;
+    let Some(p) = point else { return Ok(None) };
+    if *scalar == ZERO {
+        return Ok(None);
     }
-    if *b == [0u8; 32] {
-        return Ok(*a);
-    }
-    let a_sk = secret_from_bytes(*a)?;
-    let b_scalar = Scalar::from_be_bytes(*b).map_err(|_| CtError::BadScalar)?;
-    Ok(a_sk.add_tweak(&b_scalar).map_err(|_| CtError::BadScalar)?.secret_bytes())
+    p.mul_tweak(secp(), &scalar_checked)
+        .map(Some)
+        .map_err(|_| CtError::BadPoint)
 }
 
-/// `(a - b) mod n`.
-fn scalar_sub(a: &[u8; 32], b: &[u8; 32]) -> Result<[u8; 32], CtError> {
-    if *a == *b {
-        return Ok([0u8; 32]);
+fn add_opt(a: Pt, b: Pt) -> Pt {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        // `combine` fails only when the sum is the point at infinity.
+        (Some(x), Some(y)) => x.combine(&y).ok(),
     }
-    let b_sk = secret_from_bytes(*b)?;
-    let b_neg = b_sk.negate();
-    scalar_add(a, &b_neg.secret_bytes())
 }
 
-/// One bit OR-proof: `(C = r*H) OR (C - G = r*H)`, i.e. the bit of `C`
-/// is 0 or 1 without revealing which. This is a single Schnorr
-/// disjunction: the prover publishes `S = s*H` and `z = s + c*w` where
-/// `c = H(transcript, C, S)` and `w` is the witness of the true branch.
-/// The verifier accepts if `z*H == S + c*C` (bit 0) or `z*H == S + c*(C-G)`
-/// (bit 1) — exactly one holds, and forging needs the discrete log.
+fn neg_opt(p: Pt) -> Pt {
+    p.map(|p| p.negate(secp()))
+}
+
+/// Compressed encoding, or an error for the point at infinity.
+fn ser(p: Pt) -> Result<[u8; 33], CtError> {
+    Ok(p.ok_or(CtError::BadPoint)?.serialize())
+}
+
+pub fn commitment_point(value: u64, blinding: [u8; 32]) -> Result<[u8; 33], CtError> {
+    secret_from_bytes(blinding)?; // blinding must be in [1, n)
+    let r_h = mul_opt(Some(h_generator()), &blinding)?;
+    let v_g = mul_opt(Some(g_generator()), &u64_to_scalar(value))?;
+    ser(add_opt(r_h, v_g))
+}
+
+/// `Sum_i 2^i * C_i` by Horner evaluation.
+fn weighted_sum(points: &[Pt]) -> Pt {
+    let mut acc: Pt = None;
+    for p in points.iter().rev() {
+        acc = add_opt(add_opt(acc, acc), *p);
+    }
+    acc
+}
+
+// ---------------------------------------------------------------------
+// Range proof
+// ---------------------------------------------------------------------
+
+/// One bit proof: a two-member ring signature (AOS) over the statements
+/// `P0 = C_i = r*H` (bit 0) and `P1 = C_i - G = r*H` (bit 1) with base
+/// `H`. The verifier recomputes
+/// `R0 = z0*H - e0*P0`, `e1 = Hash(R0, branch 0)`,
+/// `R1 = z1*H - e1*P1`, `e0' = Hash(R1, branch 1)` and requires
+/// `e0' == e0`. Both branches use the bit commitment `C_i`, the chain of
+/// challenges is the Fiat-Shamir split of a single challenge between the
+/// two branches (an unsimulated branch needs the dlog of `C_i` or
+/// `C_i - G` w.r.t. `H`), and the proof is witness-indistinguishable: it
+/// does not reveal which branch is real, hence not the bit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BitProof {
-    pub commit: [u8; 33],
-    pub response: [u8; 32],
+    pub e0: [u8; 32],
+    pub z0: [u8; 32],
+    pub z1: [u8; 32],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,75 +294,157 @@ pub struct RangeProof {
 }
 
 /// Commits `value` with blinding `R` and proves `value < 2^64`.
-/// The bit blindings sum (weighted) to `R`, tying the proof to
-/// `C = value*G + R*H`.
 pub fn prove_range(value: u64, blinding: [u8; 32]) -> Result<RangeProof, CtError> {
     prove_range_with_blinding(value, blinding)
 }
 
-fn scalar_mul_bytes(a: &[u8; 32], b: &[u8; 32]) -> Result<[u8; 32], CtError> {
-    if *a == [0u8; 32] || *b == [0u8; 32] {
-        return Ok([0u8; 32]);
+/// Digest of the full set of bit commitments (transcript binding).
+fn bits_digest(bit_commitments: &[[u8; 33]]) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(bit_commitments.len() * 33);
+    for c in bit_commitments {
+        buf.extend_from_slice(c);
     }
-    let a_sk = secret_from_bytes(*a)?;
-    let b_scalar = Scalar::from_be_bytes(*b).map_err(|_| CtError::BadScalar)?;
-    Ok(a_sk.mul_tweak(&b_scalar).map_err(|_| CtError::BadScalar)?.secret_bytes())
+    sha256::Hash::hash(&buf).to_byte_array()
 }
 
-fn scalar_pow2_mul(a: &[u8; 32], power: usize) -> Result<[u8; 32], CtError> {
-    let mut acc = *a;
-    for _ in 0..power {
-        acc = scalar_add(&acc, &acc)?;
-    }
-    Ok(acc)
+/// Challenge of one bit ring step. Binds the domain, the total commitment,
+/// all bit commitments (through their digest), the bit index, this bit's
+/// commitment, the ring point `R` and the branch number.
+fn bit_challenge(
+    total: &[u8; 33],
+    digest: &[u8; 32],
+    index: usize,
+    bit_commitment: &[u8; 33],
+    ring_point: &[u8; 33],
+    branch: u8,
+) -> [u8; 32] {
+    challenge_scalar(&[
+        TRANSCRIPT_RANGE,
+        total,
+        digest,
+        &(index as u32).to_le_bytes(),
+        bit_commitment,
+        ring_point,
+        &[branch],
+    ])
 }
 
-fn expected_commitment(bit_commitments: &[[u8; 33]]) -> Result<[u8; 33], CtError> {
-    let secp = Secp256k1::new();
-    let mut acc: Option<PublicKey> = None;
-    for (i, commitment) in bit_commitments.iter().enumerate() {
-        let mut point = parse_point(commitment)?;
-        for _ in 0..i {
-            point = point
-                .combine(&point)
-                .map_err(|_| CtError::BadPoint)?;
+/// `z*H - e*P`.
+fn ring_point(z: &[u8; 32], e: &[u8; 32], p: Pt) -> Result<Pt, CtError> {
+    let z_h = mul_opt(Some(h_generator()), z)?;
+    let e_p = mul_opt(p, &scalar_neg(e)?)?;
+    Ok(add_opt(z_h, e_p))
+}
+
+/// Range proof for `C = value*G + blinding*H`. The bit blindings are
+/// fresh random scalars constrained so that `sum 2^i r_i = blinding`
+/// (bit 0 absorbs the remainder), tying the proof to `C`.
+pub fn prove_range_with_blinding(value: u64, blinding: [u8; 32]) -> Result<RangeProof, CtError> {
+    secret_from_bytes(blinding)?;
+    let total = commitment_point(value, blinding)?;
+    let h = Some(h_generator());
+    let g = Some(g_generator());
+    let neg_g = neg_opt(g);
+
+    // r_1..r_63 random; r_0 = R - sum_{i>=1} 2^i r_i.
+    let mut r = [ZERO; VALUE_BITS];
+    let mut rest = ZERO; // sum_{i>=1} 2^i r_i via Horner (r_0 slot is 0)
+    for i in (1..VALUE_BITS).rev() {
+        r[i] = random_scalar()?;
+        rest = scalar_add(&scalar_add(&rest, &rest)?, &r[i])?;
+    }
+    rest = scalar_add(&rest, &rest)?; // multiply by 2 for the missing r_0 slot
+    r[0] = scalar_sub(&blinding, &rest)?;
+    if r[0] == ZERO {
+        return Err(CtError::BadScalar); // negligible-probability retry case
+    }
+
+    let mut bit_commitments = Vec::with_capacity(VALUE_BITS);
+    let mut bits = [0u8; VALUE_BITS];
+    for i in 0..VALUE_BITS {
+        bits[i] = ((value >> i) & 1) as u8;
+        let mut c = mul_opt(h, &r[i])?;
+        if bits[i] == 1 {
+            c = add_opt(c, g);
         }
-        acc = Some(match acc {
-            None => point,
-            Some(existing) => existing.combine(&point).map_err(|_| CtError::BadPoint)?,
-        });
+        bit_commitments.push(ser(c)?);
     }
-    let _ = secp;
-    Ok(acc.ok_or(CtError::BadPoint)?.serialize())
+    let digest = bits_digest(&bit_commitments);
+
+    let mut bit_proofs = Vec::with_capacity(VALUE_BITS);
+    for i in 0..VALUE_BITS {
+        let c_bytes = bit_commitments[i];
+        let c = Some(parse_point(&c_bytes)?);
+        let p0 = c;
+        let p1 = add_opt(c, neg_g);
+        let k = random_scalar()?;
+        let z_sim = random_scalar()?;
+        let proof = if bits[i] == 0 {
+            // Real branch 0: R0 = k*H. Simulate branch 1 with random z1.
+            let r0 = ser(mul_opt(h, &k)?)?;
+            let e1 = bit_challenge(&total, &digest, i, &c_bytes, &r0, 0);
+            let r1 = ser(ring_point(&z_sim, &e1, p1)?)?;
+            let e0 = bit_challenge(&total, &digest, i, &c_bytes, &r1, 1);
+            let z0 = scalar_add(&k, &scalar_mul_bytes(&e0, &r[i])?)?;
+            BitProof { e0, z0, z1: z_sim }
+        } else {
+            // Real branch 1: R1 = k*H. Simulate branch 0 with random z0.
+            let r1 = ser(mul_opt(h, &k)?)?;
+            let e0 = bit_challenge(&total, &digest, i, &c_bytes, &r1, 1);
+            let r0 = ser(ring_point(&z_sim, &e0, p0)?)?;
+            let e1 = bit_challenge(&total, &digest, i, &c_bytes, &r0, 0);
+            let z1 = scalar_add(&k, &scalar_mul_bytes(&e1, &r[i])?)?;
+            BitProof { e0, z0: z_sim, z1 }
+        };
+        bit_proofs.push(proof);
+    }
+    Ok(RangeProof {
+        bit_commitments,
+        bit_proofs,
+    })
 }
 
-/// Verifies `commitment == sum_i 2^i * C_i` and every bit proof.
+/// Verifies one bit proof.
+fn verify_bit(
+    total: &[u8; 33],
+    digest: &[u8; 32],
+    index: usize,
+    c_bytes: &[u8; 33],
+    bp: &BitProof,
+) -> Result<(), CtError> {
+    let c = Some(parse_point(c_bytes).map_err(|_| CtError::RangeProof)?);
+    let p0 = c;
+    let p1 = add_opt(c, neg_opt(Some(g_generator())));
+    let r0 = ser(ring_point(&bp.z0, &bp.e0, p0).map_err(|_| CtError::RangeProof)?)
+        .map_err(|_| CtError::RangeProof)?;
+    let e1 = bit_challenge(total, digest, index, c_bytes, &r0, 0);
+    let r1 = ser(ring_point(&bp.z1, &e1, p1).map_err(|_| CtError::RangeProof)?)
+        .map_err(|_| CtError::RangeProof)?;
+    let e0 = bit_challenge(total, digest, index, c_bytes, &r1, 1);
+    if e0 != bp.e0 {
+        return Err(CtError::RangeProof);
+    }
+    Ok(())
+}
+
+/// Verifies `commitment == sum_i 2^i * C_i` and every bit proof. Anything
+/// but exactly [`VALUE_BITS`] bit commitments and proofs is rejected.
 pub fn verify_range(commitment: &[u8; 33], proof: &RangeProof) -> Result<(), CtError> {
     if proof.bit_commitments.len() != VALUE_BITS || proof.bit_proofs.len() != VALUE_BITS {
         return Err(CtError::RangeProof);
     }
-    if expected_commitment(&proof.bit_commitments)? != *commitment {
-        return Err(CtError::RangeProof);
+    parse_point(commitment).map_err(|_| CtError::RangeProof)?;
+    let mut points: Vec<Pt> = Vec::with_capacity(VALUE_BITS);
+    for c in &proof.bit_commitments {
+        points.push(Some(parse_point(c).map_err(|_| CtError::RangeProof)?));
     }
-    let secp = Secp256k1::new();
-    let g = PublicKey::from_secret_key(&secp, &scalar_to_secret(1)?);
-    for (commitment_i, bp) in proof.bit_commitments.iter().zip(&proof.bit_proofs) {
-        let c = parse_point(commitment_i)?;
-        let s = parse_point(&bp.commit)?;
-        let s_bytes = s.serialize();
-        let c_bytes = c.serialize();
-        let transcript = challenge_scalar(&[TRANSCRIPT_RANGE, &c_bytes, &s_bytes]);
-        let left = scalar_mul(h_generator(), &bp.response)?;
-        let case0 = s
-            .combine(&scalar_mul(c, &transcript)?)
-            .map_err(|_| CtError::BadPoint)?;
-        let c_minus_g = c.combine(&g.negate(&secp)).map_err(|_| CtError::BadPoint)?;
-        let case1 = s
-            .combine(&scalar_mul(c_minus_g, &transcript)?)
-            .map_err(|_| CtError::BadPoint)?;
-        if left != case0 && left != case1 {
-            return Err(CtError::RangeProof);
-        }
+    match weighted_sum(&points) {
+        Some(sum) if sum.serialize() == *commitment => {}
+        _ => return Err(CtError::RangeProof),
+    }
+    let digest = bits_digest(&proof.bit_commitments);
+    for (i, (c_bytes, bp)) in proof.bit_commitments.iter().zip(&proof.bit_proofs).enumerate() {
+        verify_bit(commitment, &digest, i, c_bytes, bp)?;
     }
     Ok(())
 }
@@ -249,100 +462,9 @@ pub fn create_commitment(value: u64, blinding: [u8; 32]) -> Result<AmountCommitm
     Ok(AmountCommitment { commitment, proof })
 }
 
-/// Range proof whose bit blindings sum to `blinding` (used so the value
-/// commitment and the range proof share one blinding: `C = vG + R*H`).
-pub fn prove_range_with_blinding(value: u64, blinding: [u8; 32]) -> Result<RangeProof, CtError> {
-    let secp = Secp256k1::new();
-    let h = h_generator();
-    let mut bit_commitments = Vec::with_capacity(VALUE_BITS);
-    let mut bit_proofs = Vec::with_capacity(VALUE_BITS);
-    // Derive per-bit blindings deterministically from `blinding` so the
-    // sum `sum 2^i r_i = R` ties the range proof to C = vG + R*H.
-    let mut r_i_list = Vec::with_capacity(VALUE_BITS);
-    let mut running = blinding;
-    for i in 0..VALUE_BITS {
-        // Split R into bits by repeated halving is not modular; instead use
-        // pre-hash expansion: r_i = SHA256(R || i). The verifier needs the
-        // sum check sum 2^i C_i == C, which only holds if the TOTAL
-        // blinding equals R. Deterministic splitting: use r_0..r_{62}
-        // from the hash expansion and set r_{63} = R - rest (mod n).
-        if i + 1 < VALUE_BITS {
-            let mut buf = blinding.to_vec();
-            buf.push(i as u8);
-            let hash = sha256::Hash::hash(&buf);
-            let mut r_i = [0u8; 32];
-            r_i.copy_from_slice(hash.as_ref());
-            r_i_list.push(r_i);
-        } else {
-            let mut rest = [0u8; 32];
-            for used in &r_i_list {
-                let scaled = scalar_pow2_mul(used, r_i_list.len() - 1)?;
-                rest = scalar_add(&rest, &scaled)?;
-                let _ = scaled;
-            }
-            // r_63 = R - rest_total ... recompute properly below.
-            running = blinding;
-            let _ = rest;
-            break;
-        }
-    }
-    for i in 0..VALUE_BITS {
-        let bit = (value >> i) & 1;
-        // Bits 0..62 use the deterministic split; bit 63 carries the rest.
-        let r_i_bytes;
-        if i < VALUE_BITS - 1 {
-            let idx = i;
-            r_i_bytes = r_i_list[idx];
-        } else {
-            // r_63 = (R - sum_{j<63} 2^j r_j) * inv(2^63) mod n.
-            // Scalar division by 2^63: multiply by modular inverse of 2^63,
-            // computed via Fermat (n - 1 prime): inv(x) = x^(n-2). Here we use
-            // repeated halving on the (R - rest) scalar by multiplying with
-            // inv2 63 times where inv2 = (n+1)/2.
-            let mut rest_total = [0u8; 32];
-            for (j, used) in r_i_list.iter().enumerate() {
-                rest_total = scalar_add(&rest_total, &scalar_pow2_mul(used, j)?)?;
-            }
-            let diff = scalar_sub(&blinding, &rest_total)?;
-            // inv2 = (n+1)/2 mod n for secp256k1 (n = FFFF..4141), so
-            // multiplying by it 63 times divides by 2^63.
-            let inv2: [u8; 32] = [
-                127, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 93,
-                87, 110, 115, 87, 164, 80, 29, 223, 233, 47, 70, 104, 27, 32, 161,
-            ];
-            let mut r63 = diff;
-            for _ in 0..VALUE_BITS - 1 {
-                r63 = scalar_mul_bytes(&r63, &inv2)?;
-            }
-            r_i_bytes = r63;
-        }
-        let mut c = scalar_mul(h, &r_i_bytes)?;
-        if bit == 1 {
-            let v_sk = scalar_to_secret(1)?;
-            c = c
-                .combine(&PublicKey::from_secret_key(&secp, &v_sk))
-                .map_err(|_| CtError::BadPoint)?;
-        }
-        bit_commitments.push(c.serialize());
-        // Single Schnorr disjunction: S = nonce*H is the commitment, and
-        // response = nonce + c*r_i is the witness in either branch
-        // (C = rH for bit 0, C - G = rH for bit 1).
-        let nonce = random_scalar()?;
-        let commit_point = scalar_mul(h, &nonce)?;
-        let s_bytes = c.serialize();
-        let commit_bytes = commit_point.serialize();
-        let transcript = challenge_scalar(&[TRANSCRIPT_RANGE, &s_bytes, &commit_bytes]);
-        let response = scalar_add(&nonce, &scalar_mul_bytes(&transcript, &r_i_bytes)?)?;
-        bit_proofs.push(BitProof {
-            commit: commit_bytes,
-            response,
-        });
-    }
-    Ok(RangeProof {
-        bit_commitments,
-        bit_proofs,
-    })
-}
+// ---------------------------------------------------------------------
+// Balance proof
+// ---------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BalanceProof {
@@ -350,57 +472,58 @@ pub struct BalanceProof {
     pub z: [u8; 32],
 }
 
-/// Proves `sum_in - sum_out - fee*G = R*H` for the difference blinding.
+/// Transcript of the balance Schnorr proof: domain, transaction context,
+/// the balance point `C_bal` and the nonce point `R`. The public fee is
+/// bound through `C_bal = sum_in - sum_out - fee*G` (a different fee gives
+/// a different point), so it is not hashed separately.
+fn balance_challenge(context: &[u8], c_bal: &[u8; 33], r_pub: &[u8; 33]) -> [u8; 32] {
+    challenge_scalar(&[TRANSCRIPT_BALANCE, context, c_bal, r_pub])
+}
+
+/// Proves `sum_in - sum_out - fee*G = D*H` with `D = R_in - R_out`.
+/// A zero `D` (the point at infinity) cannot be proven and is an error.
+/// The prover only needs the blindings: the fee enters the statement on
+/// the verifier side (`fee*G` is subtracted from the commitment sum), so
+/// the proof verifies exactly for the fee the amounts actually leave
+/// unaccounted for.
 pub fn create_balance_proof(
     input_blindings: &[[u8; 32]],
     output_blindings: &[[u8; 32]],
-    fee: u64,
+    _fee: u64,
     context: &[u8],
 ) -> Result<(BalanceProof, [u8; 33]), CtError> {
     let diff = blinding_difference(input_blindings, output_blindings)?;
-    let c_bal = balance_commitment(input_blindings.len(), output_blindings.len(), fee, &diff)?;
+    let c_bal = ser(mul_opt(Some(h_generator()), &diff)?)?;
     let k = random_scalar()?;
-    let r_pub = scalar_mul(h_generator(), &k)?;
-    let transcript = challenge_scalar(&[TRANSCRIPT_BALANCE, context, &c_bal, &r_pub.serialize()]);
-    let z = scalar_add(&k, &scalar_mul_bytes(&transcript, &diff)?)?;
-    Ok((
-        BalanceProof {
-            r_pub: r_pub.serialize(),
-            z,
-        },
-        c_bal,
-    ))
+    let r_pub = ser(mul_opt(Some(h_generator()), &k)?)?;
+    let e = balance_challenge(context, &c_bal, &r_pub);
+    let z = scalar_add(&k, &scalar_mul_bytes(&e, &diff)?)?;
+    Ok((BalanceProof { r_pub, z }, c_bal))
 }
 
-fn blinding_difference(
-    inputs: &[[u8; 32]],
-    outputs: &[[u8; 32]],
-) -> Result<[u8; 32], CtError> {
-    let mut acc = [0u8; 32];
+fn blinding_difference(inputs: &[[u8; 32]], outputs: &[[u8; 32]]) -> Result<[u8; 32], CtError> {
+    let mut acc = ZERO;
     for b in inputs {
         acc = scalar_add(&acc, b)?;
     }
     for b in outputs {
-        let b_sk = secret_from_bytes(*b)?;
-        acc = scalar_add(&acc, &b_sk.negate().secret_bytes())?;
+        acc = scalar_sub(&acc, b)?;
     }
     Ok(acc)
 }
 
-/// `sum_in(C) - sum_out(C) - fee*G` as a point, from blindings only
-/// (prover-side; verifier recomputes it from the commitments).
-/// When balanced this equals `diff*H` where `diff = R_in - R_out`.
-fn balance_commitment(
-    _n_in: usize,
-    _n_out: usize,
-    _fee: u64,
-    blinding_diff: &[u8; 32],
-) -> Result<[u8; 33], CtError> {
-    Ok(scalar_mul(h_generator(), blinding_diff)?.serialize())
-}
-
-/// Full confidential transaction verification: every range proof, the
+/// Full confidential transaction verification: range proofs, the
 /// commitment sum linking range proofs to `C`, and the balance proof.
+///
+/// Range-proof policy:
+/// - every OUTPUT must carry a complete, valid 64-bit range proof; an
+///   empty or short proof is rejected;
+/// - an INPUT with a completely empty proof is a verifier-rebuilt
+///   plaintext-derived commitment (`v*G + r*H` for a spent plaintext
+///   coin whose value the ledger already range-checked) and is exempt.
+///   Inputs that come from CT scripts always carry a full proof because
+///   [`decode_ct_script`] cannot return anything else. Any non-empty
+///   input proof must verify completely.
 pub fn verify_ct_transaction(
     inputs: &[AmountCommitment],
     outputs: &[AmountCommitment],
@@ -408,53 +531,50 @@ pub fn verify_ct_transaction(
     balance_proof: &BalanceProof,
     context: &[u8],
 ) -> Result<(), CtError> {
-    for commitment in inputs.iter().chain(outputs) {
-        // Plaintext-derived commitments (empty proof) skip the range check;
-        // the ledger has already MoneyRange-checked the value.
-        if !commitment.proof.bit_commitments.is_empty() {
+    if inputs.is_empty() {
+        return Err(CtError::BalanceProof);
+    }
+    for commitment in inputs {
+        let plaintext_derived = commitment.proof.bit_commitments.is_empty()
+            && commitment.proof.bit_proofs.is_empty();
+        if plaintext_derived {
+            parse_point(&commitment.commitment)?;
+        } else {
             verify_range(&commitment.commitment, &commitment.proof)?;
         }
     }
-    let secp = Secp256k1::new();
+    for commitment in outputs {
+        verify_range(&commitment.commitment, &commitment.proof)?;
+    }
     // sum_in(C) - sum_out(C) - fee*G must equal the balance proof's point.
-    let mut acc: Option<PublicKey> = None;
+    let mut acc: Pt = None;
     for commitment in inputs {
-        let p = parse_point(&commitment.commitment)?;
-        acc = Some(match acc {
-            None => p,
-            Some(existing) => existing.combine(&p).map_err(|_| CtError::BadPoint)?,
-        });
+        acc = add_opt(acc, Some(parse_point(&commitment.commitment)?));
     }
     for commitment in outputs {
-        let p = parse_point(&commitment.commitment)?.negate(&secp);
-        acc = Some(match acc {
-            None => p,
-            Some(existing) => existing.combine(&p).map_err(|_| CtError::BadPoint)?,
-        });
+        acc = add_opt(acc, neg_opt(Some(parse_point(&commitment.commitment)?)));
     }
-    if fee > 0 {
-        let fee_sk = scalar_to_secret(fee)?;
-        let p = PublicKey::from_secret_key(&secp, &fee_sk).negate(&secp);
-        acc = Some(match acc {
-            None => p,
-            Some(existing) => existing.combine(&p).map_err(|_| CtError::BadPoint)?,
-        });
-    }
-    let c_bal = acc.ok_or(CtError::BalanceProof)?.serialize();
-    let r_pub = parse_point(&balance_proof.r_pub)?;
-    let transcript = challenge_scalar(&[TRANSCRIPT_BALANCE, context, &c_bal, &balance_proof.r_pub]);
+    let fee_g = mul_opt(Some(g_generator()), &u64_to_scalar(fee))?;
+    acc = add_opt(acc, neg_opt(fee_g));
+    // Point at infinity: no valid proof of knowledge exists; reject.
+    let c_bal_point = acc.ok_or(CtError::BalanceProof)?;
+    let c_bal = c_bal_point.serialize();
+    let r_pub = parse_point(&balance_proof.r_pub).map_err(|_| CtError::BalanceProof)?;
+    let e = balance_challenge(context, &c_bal, &balance_proof.r_pub);
     // z*H == R + e*C_bal
-    let left = scalar_mul(h_generator(), &balance_proof.z)?;
-    let right = r_pub
-        .combine(&scalar_mul(parse_point(&c_bal)?, &transcript)?)
-        .map_err(|_| CtError::BadPoint)?;
-    if left != right {
-        return Err(CtError::BalanceProof);
+    let left = mul_opt(Some(h_generator()), &balance_proof.z).map_err(|_| CtError::BalanceProof)?;
+    let right = add_opt(
+        Some(r_pub),
+        mul_opt(Some(c_bal_point), &e).map_err(|_| CtError::BalanceProof)?,
+    );
+    match (left, right) {
+        (Some(l), Some(r)) if l == r => Ok(()),
+        _ => Err(CtError::BalanceProof),
     }
-    Ok(())
 }
 
-/// Confidential output script: `OP_RETURN 0x01 <commitment:33> <pubkey_hash:20> <range_proof:6272>`.
+/// Confidential output script:
+/// `OP_RETURN 0x01 <commitment:33> <pubkey_hash:20> PUSHDATA2(<range_proof>)`.
 /// Value must be 0 (the amount is hidden in the commitment).
 pub struct CtOutputData {
     pub commitment: [u8; 33],
@@ -463,6 +583,9 @@ pub struct CtOutputData {
 }
 
 pub fn encode_ct_script(data: &CtOutputData) -> Result<btc_primitives::ScriptBuf, CtError> {
+    if data.proof.bit_commitments.len() != VALUE_BITS || data.proof.bit_proofs.len() != VALUE_BITS {
+        return Err(CtError::RangeProof);
+    }
     let mut buf = vec![0x6a, 0x01];
     buf.extend_from_slice(&data.commitment);
     buf.extend_from_slice(&data.pubkey_hash);
@@ -484,6 +607,10 @@ fn push_data(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(data);
 }
 
+/// Decodes and fully verifies a CT output script. Only a script carrying
+/// a complete, valid 64-bit range proof of exactly [`RANGE_PROOF_BYTES`]
+/// bytes decodes; everything else (including empty or short proofs) is
+/// `None`.
 pub fn decode_ct_script(script: &[u8]) -> Option<CtOutputData> {
     let len = script.len();
     if len < 2 || script[0] != 0x6a || script[1] != 0x01 {
@@ -494,7 +621,7 @@ pub fn decode_ct_script(script: &[u8]) -> Option<CtOutputData> {
     let pubkey_hash: [u8; 20] = script.get(35..55)?.try_into().ok()?;
     let proof_data = parse_push(script.get(55..)?)?;
     let proof = deserialize_range_proof(proof_data)?;
-    if !verify_range(&commitment, &proof).is_ok() {
+    if verify_range(&commitment, &proof).is_err() {
         return None;
     }
     Some(CtOutputData {
@@ -525,20 +652,20 @@ fn parse_push(data: &[u8]) -> Option<&[u8]> {
 }
 
 fn serialize_range_proof(proof: &RangeProof) -> Vec<u8> {
-    let mut out = Vec::with_capacity(VALUE_BITS * (33 + 65));
+    let mut out = Vec::with_capacity(RANGE_PROOF_BYTES);
     for commitment in &proof.bit_commitments {
         out.extend_from_slice(commitment);
     }
     for bp in &proof.bit_proofs {
-        out.extend_from_slice(&bp.commit);
-        out.extend_from_slice(&bp.response);
+        out.extend_from_slice(&bp.e0);
+        out.extend_from_slice(&bp.z0);
+        out.extend_from_slice(&bp.z1);
     }
     out
 }
 
 fn deserialize_range_proof(data: &[u8]) -> Option<RangeProof> {
-    let expected = VALUE_BITS * (33 + 65);
-    if data.len() != expected {
+    if data.len() != RANGE_PROOF_BYTES {
         return None;
     }
     let mut bit_commitments = Vec::with_capacity(VALUE_BITS);
@@ -548,10 +675,11 @@ fn deserialize_range_proof(data: &[u8]) -> Option<RangeProof> {
     let mut bit_proofs = Vec::with_capacity(VALUE_BITS);
     let tail = &data[VALUE_BITS * 33..];
     for i in 0..VALUE_BITS {
-        let entry = &tail[i * 65..(i + 1) * 65];
+        let entry = &tail[i * 96..(i + 1) * 96];
         bit_proofs.push(BitProof {
-            commit: entry[..33].try_into().ok()?,
-            response: entry[33..].try_into().ok()?,
+            e0: entry[..32].try_into().ok()?,
+            z0: entry[32..64].try_into().ok()?,
+            z1: entry[64..].try_into().ok()?,
         });
     }
     Some(RangeProof {
@@ -601,7 +729,7 @@ pub fn is_shield_marker(script: &btc_primitives::ScriptBuf) -> bool {
     bytes.len() == 4 + 106
         && bytes[0] == 0x6a
         && bytes[1] == 0x4d
-        && u16::from_le_bytes(bytes[2..4].try_into().unwrap()) == 106
+        && u16::from_le_bytes([bytes[2], bytes[3]]) == 106
         && bytes[4] == 0x51
 }
 
@@ -627,7 +755,9 @@ pub fn proof_fee(data: &[u8]) -> u64 {
     if data.len() != 73 {
         return 0;
     }
-    u64::from_le_bytes(data[..8].try_into().expect("8 bytes"))
+    let mut fee = [0u8; 8];
+    fee.copy_from_slice(&data[..8]);
+    u64::from_le_bytes(fee)
 }
 
 pub fn deserialize_balance_proof(data: &[u8]) -> Option<BalanceProof> {
@@ -673,7 +803,7 @@ pub fn shield_markers(tx: &btc_primitives::Tx) -> Vec<(Vec<u8>, Vec<u8>)> {
         if bytes.len() == 4 + 106
             && bytes[0] == 0x6a
             && bytes[1] == 0x4d
-            && u16::from_le_bytes(bytes[2..4].try_into().unwrap()) == 106
+            && u16::from_le_bytes([bytes[2], bytes[3]]) == 106
             && bytes[4] == 0x51
         {
             let payload = &bytes[4..];
@@ -967,7 +1097,7 @@ mod tests {
     #[test]
     fn tampered_range_proof_fails() {
         let mut c = create_commitment(1_00000000, blinding(3)).unwrap();
-        c.proof.bit_proofs[0].response[0] ^= 1;
+        c.proof.bit_proofs[0].z0[0] ^= 1;
         assert!(verify_range(&c.commitment, &c.proof).is_err());
     }
 
@@ -1002,5 +1132,413 @@ mod tests {
         let honest = create_commitment(50_00000000, blinding(23)).unwrap();
         assert!(verify_ct_transaction(&[input], &[honest], 0, &proof, b"forge").is_err());
         let _ = out;
+    }
+
+    // ---------------------------------------------------------------
+    // Regression: inflation attack against the legacy H = h*G (public h).
+    // ---------------------------------------------------------------
+
+    /// n - 2 (secp256k1 group order minus two), big-endian: Fermat exponent.
+    const N_MINUS_2: [u8; 32] = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFE, 0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36,
+        0x41, 0x3F,
+    ];
+
+    /// Modular inverse via Fermat exponentiation `x^(n-2) mod n`.
+    fn scalar_inverse_for_test(x: &[u8; 32]) -> [u8; 32] {
+        let mut result = {
+            let mut one = [0u8; 32];
+            one[31] = 1;
+            one
+        };
+        let mut base = *x;
+        for byte in N_MINUS_2.iter().rev() {
+            for bit in 0..8 {
+                if (byte >> bit) & 1 == 1 {
+                    result = scalar_mul_bytes(&result, &base).unwrap();
+                }
+                base = scalar_mul_bytes(&base, &base).unwrap();
+            }
+        }
+        result
+    }
+
+    fn u64_scalar(v: u64) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        b[24..].copy_from_slice(&v.to_be_bytes());
+        b
+    }
+
+    /// Builds the forged transaction: spends a value-10 input into a
+    /// value-10^15 output (with a perfectly valid range proof) and signs the
+    /// balance proof with the witness `d' = (r_in - r_out) + dv * h^-1` that
+    /// only exists if the attacker knows `h = log_G(H)` of the *legacy* H.
+    fn forge_with_legacy_h() -> Result<(), CtError> {
+        let legacy_h: [u8; 32] = sha256::Hash::hash(b"AnonCoin-H-v1").to_byte_array();
+        let h_inv = scalar_inverse_for_test(&legacy_h);
+        let (v_in, v_out, fee) = (10u64, 1_000_000_000_000_000u64, 0u64);
+        let (r_in, r_out) = (blinding(41), blinding(42));
+        let input = create_commitment(v_in, r_in).unwrap();
+        let output = create_commitment(v_out, r_out).unwrap();
+        // dv = v_in - v_out - fee (mod n)  =  -(v_out + fee - v_in)
+        let dv_neg = u64_scalar(v_out + fee - v_in);
+        let dv = secret_from_bytes(dv_neg).unwrap().negate().secret_bytes();
+        let dr = scalar_sub(&r_in, &r_out).unwrap();
+        let witness = scalar_add(&dr, &scalar_mul_bytes(&dv, &h_inv).unwrap()).unwrap();
+        // The balance prover signs `witness*H`; it only matches the real
+        // sum_in - sum_out - fee*G when H = h*G with h known.
+        let (proof, _) = create_balance_proof(&[witness], &[], fee as u64, b"forge-ctx").unwrap();
+        verify_ct_transaction(&[input], &[output], fee, &proof, b"forge-ctx")
+    }
+
+    #[test]
+    fn exploit_inflation_via_public_dlog_of_h_is_rejected() {
+        // 10 coins in, 10^15 out. Must NOT verify.
+        assert_eq!(
+            forge_with_legacy_h(),
+            Err(CtError::BalanceProof),
+            "inflation forgery must be rejected: log_G(H) must be unknown"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // NUMS generator
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn h_constant_matches_nums_derivation() {
+        assert_eq!(derive_h_nums().serialize(), H_COMPRESSED);
+        assert_eq!(h_generator().serialize(), H_COMPRESSED);
+        assert_ne!(h_generator(), g_generator());
+        // Not the old SHA256-multiple-of-G generator.
+        let old = sha256::Hash::hash(b"AnonCoin-H-v1").to_byte_array();
+        let old_h = PublicKey::from_secret_key(secp(), &SecretKey::from_slice(&old).unwrap());
+        assert_ne!(h_generator(), old_h);
+        assert_eq!(H_DOMAIN, b"AnonCoin-H-v2");
+    }
+
+    // ---------------------------------------------------------------
+    // Range proof soundness
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn range_proof_edge_values_round_trip() {
+        for v in [0u64, 1, 2, u64::MAX, 1 << 63, 21_000_000 * 100_000_000] {
+            let c = create_commitment(v, blinding(50)).unwrap();
+            verify_range(&c.commitment, &c.proof).unwrap();
+            assert_eq!(c.commitment, commitment_point(v, blinding(50)).unwrap());
+        }
+    }
+
+    #[test]
+    fn every_bit_proof_field_is_enforced() {
+        let c = create_commitment(0xDEAD_BEEF, blinding(51)).unwrap();
+        for i in [0usize, 1, 31, 63] {
+            for field in 0..3 {
+                let mut bad = c.proof.clone();
+                match field {
+                    0 => bad.bit_proofs[i].e0[5] ^= 1,
+                    1 => bad.bit_proofs[i].z0[5] ^= 1,
+                    _ => bad.bit_proofs[i].z1[5] ^= 1,
+                }
+                assert!(verify_range(&c.commitment, &bad).is_err(), "bit {i} field {field}");
+            }
+        }
+    }
+
+    #[test]
+    fn challenge_chain_is_enforced_by_e0() {
+        // A fresh e0 breaks the closure e0' == e0.
+        let c = create_commitment(77, blinding(52)).unwrap();
+        let mut bad = c.proof.clone();
+        bad.bit_proofs[3].e0 = random_scalar().unwrap();
+        assert_eq!(verify_range(&c.commitment, &bad), Err(CtError::RangeProof));
+        // Out-of-range scalar encodings are rejected, not reduced.
+        let mut bad = c.proof.clone();
+        bad.bit_proofs[3].z0 = [0xFF; 32];
+        assert!(verify_range(&c.commitment, &bad).is_err());
+    }
+
+    #[test]
+    fn out_of_range_bit_commitment_is_rejected() {
+        // Attacker bumps bit commitment 5 by 2*G (the "bit" would be 2) and
+        // shifts the total commitment so the weighted sum still holds.
+        let c = create_commitment(0, blinding(53)).unwrap();
+        let g = Some(g_generator());
+        let two_g = add_opt(g, g);
+        let c5 = add_opt(Some(parse_point(&c.proof.bit_commitments[5]).unwrap()), two_g);
+        let mut bad = c.proof.clone();
+        bad.bit_commitments[5] = ser(c5).unwrap();
+        let points: Vec<Pt> = bad
+            .bit_commitments
+            .iter()
+            .map(|b| Some(parse_point(b).unwrap()))
+            .collect();
+        let total = ser(weighted_sum(&points)).unwrap();
+        assert_eq!(verify_range(&total, &bad), Err(CtError::RangeProof));
+    }
+
+    #[test]
+    fn negative_value_wrap_is_rejected() {
+        // Shift C of a zero-value proof by -G (value -1 mod n).
+        let c = create_commitment(0, blinding(54)).unwrap();
+        let minus_g = neg_opt(Some(g_generator()));
+        let shifted = ser(add_opt(Some(parse_point(&c.commitment).unwrap()), minus_g)).unwrap();
+        assert!(verify_range(&shifted, &c.proof).is_err());
+    }
+
+    #[test]
+    fn bit_commitment_sum_is_checked() {
+        let c = create_commitment(0b1010, blinding(55)).unwrap();
+        let mut swapped = c.proof.clone();
+        swapped.bit_commitments.swap(0, 1);
+        swapped.bit_proofs.swap(0, 1);
+        assert!(verify_range(&c.commitment, &swapped).is_err());
+        // Another valid proof (different value) cannot be grafted onto C.
+        let other = create_commitment(0b0101, blinding(56)).unwrap();
+        assert!(verify_range(&c.commitment, &other.proof).is_err());
+    }
+
+    #[test]
+    fn range_proof_is_bound_to_total_commitment() {
+        let c = create_commitment(5, blinding(57)).unwrap();
+        let g = Some(g_generator());
+        let shifted = ser(add_opt(Some(parse_point(&c.commitment).unwrap()), g)).unwrap();
+        assert!(verify_range(&shifted, &c.proof).is_err());
+    }
+
+    #[test]
+    fn short_or_empty_range_proofs_are_rejected() {
+        let c = create_commitment(9, blinding(58)).unwrap();
+        let empty = RangeProof { bit_commitments: vec![], bit_proofs: vec![] };
+        assert!(verify_range(&c.commitment, &empty).is_err());
+        let mut short = c.proof.clone();
+        short.bit_commitments.pop();
+        short.bit_proofs.pop();
+        assert!(verify_range(&c.commitment, &short).is_err());
+        let mut long = c.proof.clone();
+        long.bit_commitments.push(long.bit_commitments[0]);
+        long.bit_proofs.push(long.bit_proofs[0].clone());
+        assert!(verify_range(&c.commitment, &long).is_err());
+    }
+
+    #[test]
+    fn garbage_points_error_instead_of_panicking() {
+        let c = create_commitment(9, blinding(59)).unwrap();
+        assert!(verify_range(&[0u8; 33], &c.proof).is_err());
+        let mut bad = c.proof.clone();
+        bad.bit_commitments[7] = [0u8; 33];
+        assert!(verify_range(&c.commitment, &bad).is_err());
+        let proof = BalanceProof { r_pub: [0u8; 33], z: [0xFF; 32] };
+        assert!(verify_ct_transaction(&[c.clone()], &[c.clone()], 0, &proof, b"x").is_err());
+        assert!(commitment_point(1, [0u8; 32]).is_err());
+        assert!(commitment_point(1, [0xFF; 32]).is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // CT script decoding: only full 64-bit proofs
+    // ---------------------------------------------------------------
+
+    fn script_with_proof_bytes(commitment: [u8; 33], proof_bytes: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0x6a, 0x01];
+        buf.extend_from_slice(&commitment);
+        buf.extend_from_slice(&[7u8; 20]);
+        push_data(&mut buf, proof_bytes);
+        buf
+    }
+
+    #[test]
+    fn ct_script_size_is_below_script_limit() {
+        let c = create_commitment(1, blinding(60)).unwrap();
+        let script = encode_ct_script(&CtOutputData {
+            commitment: c.commitment,
+            pubkey_hash: [1u8; 20],
+            proof: c.proof,
+        })
+        .unwrap();
+        assert_eq!(script.as_bytes().len(), 2 + 33 + 20 + 3 + RANGE_PROOF_BYTES);
+        assert!(script.as_bytes().len() <= 10_000);
+    }
+
+    #[test]
+    fn decode_rejects_empty_short_and_long_proofs() {
+        let c = create_commitment(3, blinding(61)).unwrap();
+        let full = serialize_range_proof(&c.proof);
+        assert!(decode_ct_script(&script_with_proof_bytes(c.commitment, &full)).is_some());
+        // Empty proof.
+        assert!(decode_ct_script(&script_with_proof_bytes(c.commitment, &[])).is_none());
+        // Missing push entirely.
+        let mut no_push = vec![0x6a, 0x01];
+        no_push.extend_from_slice(&c.commitment);
+        no_push.extend_from_slice(&[7u8; 20]);
+        assert!(decode_ct_script(&no_push).is_none());
+        // 63 bits only.
+        let short = &full[..full.len() - 96];
+        assert!(decode_ct_script(&script_with_proof_bytes(c.commitment, short)).is_none());
+        // Trailing byte.
+        let mut long = full.clone();
+        long.push(0);
+        assert!(decode_ct_script(&script_with_proof_bytes(c.commitment, &long)).is_none());
+        // Proof for the wrong commitment.
+        let other = create_commitment(4, blinding(62)).unwrap();
+        assert!(decode_ct_script(&script_with_proof_bytes(other.commitment, &full)).is_none());
+        // Truncated scripts never panic.
+        let script = script_with_proof_bytes(c.commitment, &full);
+        for n in 0..70 {
+            assert!(decode_ct_script(&script[..n]).is_none());
+        }
+    }
+
+    #[test]
+    fn encode_rejects_incomplete_proof() {
+        let c = create_commitment(3, blinding(63)).unwrap();
+        let mut proof = c.proof.clone();
+        proof.bit_commitments.clear();
+        proof.bit_proofs.clear();
+        assert!(encode_ct_script(&CtOutputData {
+            commitment: c.commitment,
+            pubkey_hash: [0u8; 20],
+            proof,
+        })
+        .is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // verify_ct_transaction: range-proof policy
+    // ---------------------------------------------------------------
+
+    fn empty_proof() -> RangeProof {
+        RangeProof { bit_commitments: Vec::new(), bit_proofs: Vec::new() }
+    }
+
+    #[test]
+    fn output_with_empty_range_proof_is_rejected() {
+        // Balanced on paper (10 in = 10 out), but the output has no range proof.
+        let (r_in, r_out) = (blinding(64), blinding(65));
+        let input = create_commitment(10, r_in).unwrap();
+        let output = AmountCommitment {
+            commitment: commitment_point(10, r_out).unwrap(),
+            proof: empty_proof(),
+        };
+        let (proof, _) = create_balance_proof(&[r_in], &[r_out], 0, b"ctx").unwrap();
+        assert_eq!(
+            verify_ct_transaction(&[input], &[output], 0, &proof, b"ctx"),
+            Err(CtError::RangeProof)
+        );
+    }
+
+    #[test]
+    fn output_with_short_range_proof_is_rejected() {
+        let (r_in, r_out) = (blinding(66), blinding(67));
+        let input = create_commitment(10, r_in).unwrap();
+        let mut output = create_commitment(10, r_out).unwrap();
+        output.proof.bit_commitments.truncate(63);
+        output.proof.bit_proofs.truncate(63);
+        let (proof, _) = create_balance_proof(&[r_in], &[r_out], 0, b"ctx").unwrap();
+        assert!(verify_ct_transaction(&[input], &[output], 0, &proof, b"ctx").is_err());
+    }
+
+    #[test]
+    fn short_non_empty_input_proof_is_rejected_but_plaintext_input_allowed() {
+        let (r_in, r_out) = (blinding(68), blinding(69));
+        let output = create_commitment(10, r_out).unwrap();
+        let (proof, _) = create_balance_proof(&[r_in], &[r_out], 0, b"ctx").unwrap();
+        // Verifier-rebuilt plaintext commitment (empty proof) is accepted.
+        let plain = AmountCommitment {
+            commitment: commitment_point(10, r_in).unwrap(),
+            proof: empty_proof(),
+        };
+        verify_ct_transaction(&[plain], &[output.clone()], 0, &proof, b"ctx").unwrap();
+        // The same commitment with a partial proof is not.
+        let mut partial = create_commitment(10, r_in).unwrap();
+        partial.proof.bit_commitments.truncate(10);
+        partial.proof.bit_proofs.truncate(10);
+        assert!(verify_ct_transaction(&[partial], &[output.clone()], 0, &proof, b"ctx").is_err());
+        // Plaintext input of a different value does not balance.
+        let wrong = AmountCommitment {
+            commitment: commitment_point(11, r_in).unwrap(),
+            proof: empty_proof(),
+        };
+        assert!(verify_ct_transaction(&[wrong], &[output], 0, &proof, b"ctx").is_err());
+    }
+
+    #[test]
+    fn no_inputs_is_rejected() {
+        let r = blinding(70);
+        let output = create_commitment(1, r).unwrap();
+        let (proof, _) = create_balance_proof(&[r], &[], 0, b"ctx").unwrap();
+        assert!(verify_ct_transaction(&[], &[output], 0, &proof, b"ctx").is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // Balance proof
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn balance_proof_binds_context_fee_and_r() {
+        let (r_in, r_out) = (blinding(71), blinding(72));
+        let input = create_commitment(50, r_in).unwrap();
+        let output = create_commitment(40, r_out).unwrap();
+        let (proof, _) = create_balance_proof(&[r_in], &[r_out], 10, b"ctx-a").unwrap();
+        let ins = [input];
+        let outs = [output];
+        verify_ct_transaction(&ins, &outs, 10, &proof, b"ctx-a").unwrap();
+        // Other context.
+        assert!(verify_ct_transaction(&ins, &outs, 10, &proof, b"ctx-b").is_err());
+        // Other fee.
+        assert!(verify_ct_transaction(&ins, &outs, 9, &proof, b"ctx-a").is_err());
+        assert!(verify_ct_transaction(&ins, &outs, 0, &proof, b"ctx-a").is_err());
+        // Tampered z / R.
+        let mut bad = proof.clone();
+        bad.z[31] ^= 1;
+        assert!(verify_ct_transaction(&ins, &outs, 10, &bad, b"ctx-a").is_err());
+        let mut bad = proof.clone();
+        bad.r_pub = commitment_point(1, blinding(73)).unwrap();
+        assert!(verify_ct_transaction(&ins, &outs, 10, &bad, b"ctx-a").is_err());
+        // z = 0 and z >= n are errors, never panics.
+        let mut bad = proof.clone();
+        bad.z = [0u8; 32];
+        assert!(verify_ct_transaction(&ins, &outs, 10, &bad, b"ctx-a").is_err());
+        bad.z = [0xFF; 32];
+        assert!(verify_ct_transaction(&ins, &outs, 10, &bad, b"ctx-a").is_err());
+    }
+
+    #[test]
+    fn point_at_infinity_balance_is_rejected_without_panic() {
+        // input == output with the same blinding and zero fee: the balance
+        // point is the point at infinity.
+        let r = blinding(74);
+        let input = create_commitment(5, r).unwrap();
+        let output = input.clone();
+        // The honest prover cannot even create the proof...
+        assert!(create_balance_proof(&[r], &[r], 0, b"ctx").is_err());
+        // ...and any proof the attacker invents is rejected.
+        let junk = BalanceProof {
+            r_pub: commitment_point(1, blinding(75)).unwrap(),
+            z: blinding(76),
+        };
+        assert!(verify_ct_transaction(&[input], &[output], 0, &junk, b"ctx").is_err());
+    }
+
+    #[test]
+    fn fee_is_added_as_fee_times_g() {
+        let (r_in, r_out) = (blinding(77), blinding(78));
+        let input = create_commitment(1_000, r_in).unwrap();
+        let output = create_commitment(900, r_out).unwrap();
+        let (proof, _) = create_balance_proof(&[r_in], &[r_out], 100, b"ctx").unwrap();
+        verify_ct_transaction(&[input.clone()], &[output.clone()], 100, &proof, b"ctx").unwrap();
+        // Claiming a smaller fee than the true one fails.
+        assert!(verify_ct_transaction(&[input], &[output], 99, &proof, b"ctx").is_err());
+    }
+
+    #[test]
+    fn scalar_helpers_handle_zero_results() {
+        let a = blinding(80);
+        assert_eq!(scalar_add(&a, &scalar_neg(&a).unwrap()).unwrap(), ZERO);
+        assert_eq!(scalar_sub(&a, &a).unwrap(), ZERO);
+        assert_eq!(scalar_mul_bytes(&a, &ZERO).unwrap(), ZERO);
+        assert_eq!(scalar_neg(&ZERO).unwrap(), ZERO);
+        assert!(scalar_add(&[0xFF; 32], &a).is_err());
     }
 }
