@@ -303,6 +303,14 @@ impl WalletRpc for MockWallet {
         Ok(Txid::from_byte_array([8u8; 32]))
     }
 
+    fn send_ct_to_stealth(&self, _address_hex: String, _amount: i64, _fee: i64) -> Result<Txid, String> {
+        Ok(Txid::from_byte_array([9u8; 32]))
+    }
+
+    fn get_ct_balance(&self) -> i64 {
+        0
+    }
+
     fn create_pool_note(&self, _amount: i64, _fee: i64) -> Result<String, String> {
         Ok("aa".repeat(32))
     }

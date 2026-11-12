@@ -109,6 +109,15 @@ impl StealthKeys {
         }
     }
 
+    /// ECDH shared secret with a sender's ephemeral key
+    /// (`SHA256(ECDH(scan_secret, E))`). For confidential outputs this is
+    /// the secret the blinding and value mask derive from
+    /// (`btc_chain::confidential::ct_derive_blinding`); knowing the scan
+    /// secret is enough, no spending secret is involved.
+    pub fn ecdh_shared(&self, ephemeral_pub: &PublicKey) -> [u8; 32] {
+        SharedSecret::new(ephemeral_pub, &self.scan).secret_bytes()
+    }
+
     /// Scans an output's HASH160 against `ephemeral_pub` (first stealth
     /// output of that ephemeral key, plus the legacy un-indexed derivation
     /// so earlier payments stay recoverable). Returns the one-time secret
@@ -188,6 +197,12 @@ impl ViewKey {
         })
     }
 
+    /// See [`StealthKeys::ecdh_shared`]: a view key can recover the
+    /// amounts of confidential outputs paid to the wallet.
+    pub fn ecdh_shared(&self, ephemeral_pub: &PublicKey) -> [u8; 32] {
+        SharedSecret::new(ephemeral_pub, &self.scan).secret_bytes()
+    }
+
     /// The one-time public key paid by `ephemeral_pub` at `index` if
     /// `candidate` matches it (legacy derivation tried for index 0).
     pub fn scan_output(
@@ -257,6 +272,12 @@ impl StealthAddress {
             scan_pub: PublicKey::from_slice(&bytes[33..])
                 .map_err(|_| StealthError::InvalidPublicKey)?,
         })
+    }
+
+    /// Sender side of [`StealthKeys::ecdh_shared`]:
+    /// `SHA256(ECDH(ephemeral, scan_pub))`.
+    pub fn ecdh_shared(&self, ephemeral: &SecretKey) -> [u8; 32] {
+        SharedSecret::new(&self.scan_pub, ephemeral).secret_bytes()
     }
 
     /// Derives the one-time payment address for `ephemeral` (output 0).
@@ -435,6 +456,18 @@ mod tests {
         )
         .unwrap();
         assert!(stranger.scan_output(&payment.ephemeral_pub, &hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn sender_and_recipient_agree_on_the_ct_shared_secret() {
+        let keys = StealthKeys::generate().unwrap();
+        let eph = random_secret().unwrap();
+        let payment = keys.address().payment_indexed(&eph, 2).unwrap();
+        let sender = keys.address().ecdh_shared(&eph);
+        assert_eq!(keys.ecdh_shared(&payment.ephemeral_pub), sender);
+        assert_eq!(keys.view_key().ecdh_shared(&payment.ephemeral_pub), sender);
+        let stranger = StealthKeys::generate().unwrap();
+        assert_ne!(stranger.ecdh_shared(&payment.ephemeral_pub), sender);
     }
 
     #[test]

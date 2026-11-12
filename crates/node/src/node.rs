@@ -210,6 +210,34 @@ impl Node {
         Ok(txid)
     }
 
+    /// `sendct`: confidential payment of `amount` to a stealth address
+    /// from the wallet's CT coins. The recipient's wallet recovers the
+    /// hidden amount through its scan key; change returns to this
+    /// wallet's own stealth address.
+    pub fn wallet_send_ct_payment(
+        &mut self,
+        address: btc_wallet::stealth::StealthAddress,
+        amount: u64,
+        fee: i64,
+    ) -> Result<Txid, String> {
+        if amount == 0 {
+            return Err("Invalid amount for send".to_string());
+        }
+        let tip = self.chainstate.height();
+        let wallet = self.wallet.as_mut().ok_or("wallet disabled")?;
+        let (tx, _own_outputs) = wallet
+            .create_ct_payment(tip, &[(address, amount)], fee)
+            .map_err(wallet_error_message)?;
+        let txid = self
+            .submit_tx(tx.clone())
+            .map_err(|e| format!("transaction rejected: {e:?}"))?;
+        if let Some(w) = self.wallet.as_mut() {
+            // Adopts the change output (recovered by scanning).
+            w.commit_transaction(&tx).map_err(wallet_error_message)?;
+        }
+        Ok(txid)
+    }
+
     /// `createpoolnote`: shields plaintext into a pool note.
     pub fn wallet_create_pool_note(&mut self, amount: u64, fee: i64) -> Result<String, String> {
         if amount == 0 {

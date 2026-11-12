@@ -528,6 +528,23 @@ impl WalletRpc for NodeRpc {
         self.with_node(|n| n.wallet_send_ct(amount.max(0) as u64, fee))
     }
 
+    fn send_ct_to_stealth(&self, address_hex: String, amount: i64, fee: i64) -> Result<Txid, String> {
+        use bitcoin::hex::FromHex;
+        let bytes = Vec::<u8>::from_hex(&address_hex)
+            .map_err(|_| "Invalid stealth address: expected 66 bytes as hex".to_string())?;
+        let address = btc_wallet::stealth::StealthAddress::from_bytes(&bytes)
+            .map_err(|_| "Invalid stealth address: expected 66 bytes as hex".to_string())?;
+        self.with_node(|n| n.wallet_send_ct_payment(address, amount.max(0) as u64, fee))
+    }
+
+    fn get_ct_balance(&self) -> i64 {
+        self.with_node(|n| {
+            n.wallet
+                .as_ref()
+                .map_or(0, |w| w.ct_balance(n.chainstate.height()))
+        })
+    }
+
     fn create_pool_note(&self, amount: i64, fee: i64) -> Result<String, String> {
         self.with_node(|n| n.wallet_create_pool_note(amount.max(0) as u64, fee))
     }

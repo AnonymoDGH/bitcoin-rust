@@ -107,8 +107,40 @@ protects the middle; the edges must be designed for too.
   `AcceptToMemoryPool` verify CT transactions (range proofs, balance
   proof, per-input owner signatures), CT outputs are spendable UTXOs
   (value 0 in the ledger), and the CT output script
-  `OP_RETURN 0x01 <commitment> <pubkey_hash> <range_proof>` is defined
-  in `crates/chain/src/confidential.rs`.
+  `OP_RETURN 0x01 <commitment:33> <pubkey_hash:20> <E:33> <v_enc:8>
+  PUSHDATA2(<range_proof:8256>)` (fixed 8355 bytes, <= MAX_SCRIPT_SIZE)
+  is defined in `crates/chain/src/confidential.rs`.
+- **CT recipient recovery (fixed: received CT coins were unspendable).**
+  The blinding used to be chosen by the sender and never communicated,
+  so only the sender could build the balance proof. Now every CT output
+  is addressed to a stealth address: the sender draws a fresh ephemeral
+  `e`, publishes `E = e*G` in the output, and derives
+  `s = SHA256(ECDH(e, scan_pub))`. The one-time owner key is the stealth
+  key for output index `idx` (hash160 in `pubkey_hash`), the blinding is
+  `r = H("AnonCoin/ct-blind/v1" || s || idx)` (re-hashed until a valid
+  scalar) and the amount is `v_enc = v XOR
+  H("AnonCoin/ct-value/v1" || s || idx)[..8]`. The recipient's wallet
+  (block scan, mempool) recognises the output via its scan key, recomputes
+  `(v, r)` and adopts it ONLY if `C == v*G + r*H`; the ciphertext is never
+  trusted on its own (tampered `v_enc`, wrong recipient, wrong index are
+  all rejected). Consensus only requires `E` to be a curve point. Senders
+  learn the recipient's scan key from the stealth address
+  (`getnewstealthaddress`); `sendct <stealth_address> <amount> [fee]`
+  pays it from CT coins, change goes to the sender's own stealth address,
+  `shieldtoct` shields into the wallet's own stealth address and
+  `getctbalance` shows recovered CT coins. Limitation: an encrypted
+  wallet that is locked cannot derive its scan key, so CT payments that
+  arrive while it is locked are not recognised until the blocks are
+  rescanned.
+- **Cheap parsing, single range verification (fixed DoS).**
+  `decode_ct_script` / `is_ct_script` only check structure (exact length,
+  tag, point prefixes, PUSHDATA2 header); they never verify proofs and are
+  called freely. Range proofs are verified exactly once per input and
+  output inside `verify_ct_transaction` (via `verify_ct_tx_block`), which
+  both ConnectBlock and `accept_to_mempool` call for every tx that has a
+  CT-shaped input or output. CT inputs are re-verified at spend because a
+  coinbase may carry unverified CT-shaped outputs. A well-formed script
+  with a corrupted proof is rejected by both paths (tests).
   Bootstrap note: CT transactions must be all-CT (all inputs and
   outputs confidential) — mixing plaintext inputs/outputs is rejected
   by the value ledger (`InputsBelowOutputs`, 0 vs >0). Hybrid shield
