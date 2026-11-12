@@ -411,32 +411,14 @@ impl Wallet {
                 available: self.balance(tip_height, 0),
             })?;
 
-        // Fresh owner key for the CT output.
-        let owner_script = self.new_script(ScriptKind::P2wpkh)?;
-        let (owner_id, _) = self
-            .script_index
-            .get(&owner_script)
-            .cloned()
-            .ok_or(WalletError::NotMine)?;
-        let owner_key = self
-            .keys
-            .private_key(&owner_id)
-            .ok_or(WalletError::Locked)?;
-        let owner_secret = owner_key.inner.secret_bytes();
-        let pubkey_hash: [u8; 20] = bitcoin::PubkeyHash::from(owner_id.clone()).to_byte_array();
-        let mut r_out = [0u8; 32];
-        getrandom::getrandom(&mut r_out)
-            .map_err(|_| WalletError::Build("ct output blinding failed".into()))?;
-        let ct = btc_chain::confidential::create_commitment(amount, r_out)
-            .map_err(|_| WalletError::Build("ct commitment failed".into()))?;
-        let out_data = btc_chain::confidential::CtOutputData {
-            commitment: ct.commitment,
-            pubkey_hash,
-            proof: ct.proof,
-        };
-        let ct_script = btc_chain::confidential::encode_ct_script(&out_data)
-            .map_err(|_| WalletError::Build("ct script failed".into()))?;
-
+        // The CT output is addressed to this wallet's own stealth address:
+        // a fresh one-time owner key and an ECDH-derived blinding/value,
+        // so the wallet recovers it by scanning like any other recipient.
+        let stealth = self.stealth_keys()?;
+        let (ct_script, r_out) = build_ct_output(&stealth.address(), amount, 0)?;
+        let own_info = scan_ct_output(&stealth, ct_script.as_bytes(), 0)
+            .filter(|info| info.blinding == r_out && info.value == amount)
+            .ok_or_else(|| WalletError::Build("own ct output not recoverable".into()))?;
         let mut r_in = [0u8; 32];
         getrandom::getrandom(&mut r_in)
             .map_err(|_| WalletError::Build("ct input blinding failed".into()))?;
@@ -470,44 +452,72 @@ impl Wallet {
         // witness stays empty so consensus lets the input through).
         crate::signer::sign_transaction(&mut tx, &[spent.clone()], &self.keys)
             .map_err(|e| WalletError::Build(e.to_string()))?;
-        let info = CtCoinInfo {
-            value: amount,
-            blinding: r_out,
-            secret: owner_secret,
-            pubkey_hash,
-        };
         let txid = tx.txid();
-        Ok((tx, info, OutPoint::new(txid, 0)))
+        Ok((tx, own_info, OutPoint::new(txid, 0)))
     }
 
-    /// Builds a confidential spend of wallet-held CT coins: CT inputs are
-    /// authorised by a Schnorr signature of the owner key (witness
-    /// `[sig, pubkey]`; input 0 additionally leads with the balance
-    /// proof), amounts stay hidden, and a balance proof ties inputs to
-    /// outputs plus the public fee. No sender ambiguity is provided.
-    /// Returns the transaction plus blinding records for its outputs.
+    /// Builds a confidential spend of wallet-held CT coins paying this
+    /// wallet's own stealth address (`amounts`, one output each, plus
+    /// change). See [`create_ct_payment`](Self::create_ct_payment).
+    /// Returns the transaction plus the records and outpoints of every
+    /// output (all of them are ours here).
     pub fn create_ct_spend(
         &mut self,
         tip_height: u32,
         amounts: &[u64],
         fee: i64,
     ) -> Result<(Tx, Vec<CtCoinInfo>, Vec<OutPoint>), WalletError> {
+        let own = self.stealth_address()?;
+        let recipients: Vec<(crate::stealth::StealthAddress, u64)> =
+            amounts.iter().map(|a| (own, *a)).collect();
+        let (tx, own_outputs) = self.create_ct_payment(tip_height, &recipients, fee)?;
+        let (outpoints, infos): (Vec<OutPoint>, Vec<CtCoinInfo>) = own_outputs.into_iter().unzip();
+        Ok((tx, infos, outpoints))
+    }
+
+    /// Builds a confidential payment: wallet-held CT coins are spent
+    /// (owner Schnorr signatures, witness `[sig, pubkey]`; input 0 also
+    /// leads with the balance proof) and every output is a CT output
+    /// addressed to a stealth address. Each output carries a fresh
+    /// ephemeral key `E`; its blinding and encrypted value derive from
+    /// `ECDH(e, scan_pub)` so the recipient's wallet recovers the
+    /// opening by scanning the chain (see
+    /// `btc_chain::confidential::CtOutputData`). Surplus input value
+    /// above `sum(recipients) + fee` returns to this wallet as a change
+    /// output (own stealth address, same mechanism). The public fee goes
+    /// into the balance proof prefix. No sender ambiguity is provided.
+    ///
+    /// Returns the transaction and the `(outpoint, record)` of every
+    /// output that belongs to this wallet (change, self-payments). The
+    /// wallet adopts those automatically when it sees the transaction
+    /// (`commit_transaction` / `block_connected`).
+    pub fn create_ct_payment(
+        &mut self,
+        tip_height: u32,
+        recipients: &[(crate::stealth::StealthAddress, u64)],
+        fee: i64,
+    ) -> Result<(Tx, Vec<(OutPoint, CtCoinInfo)>), WalletError> {
         use btc_chain::confidential::{
-            create_balance_proof, create_commitment, ct_context, encode_ct_script,
-            serialize_balance_proof, with_fee, CtOutputData,
+            create_balance_proof, ct_context, serialize_balance_proof, with_fee,
         };
-        if amounts.is_empty() {
+        self.check_unlocked()?;
+        if recipients.is_empty() {
             return Err(WalletError::Build("CT spend needs at least one output".into()));
         }
-        if amounts.iter().any(|a| *a == 0) {
+        if recipients.iter().any(|(_, a)| *a == 0) {
             return Err(WalletError::Build("CT amount must be positive".into()));
         }
         if fee < 0 {
             return Err(WalletError::Build("CT fee must be non-negative".into()));
         }
+        let total_out: u64 = recipients
+            .iter()
+            .try_fold(0u64, |acc, (_, a)| acc.checked_add(*a))
+            .ok_or_else(|| WalletError::Build("CT amount overflow".into()))?;
+        let needed = total_out
+            .checked_add(fee as u64)
+            .ok_or_else(|| WalletError::Build("CT amount overflow".into()))?;
         // Collect spendable CT coins, largest first.
-        let total_out: u64 = amounts.iter().sum();
-        let total_i64 = total_out as i64 + fee;
         let mut candidates: Vec<(OutPoint, CtCoinInfo, TxOut)> = self
             .coins
             .iter()
@@ -520,54 +530,40 @@ impl Wallet {
         let mut inputs_meta: Vec<(OutPoint, CtCoinInfo, TxOut)> = Vec::new();
         let mut in_value = 0u64;
         for (outpoint, info, txout) in candidates {
-            if in_value >= total_out + fee.max(0) as u64 {
+            if in_value >= needed {
                 break;
             }
-            in_value += info.value;
+            in_value = in_value
+                .checked_add(info.value)
+                .ok_or_else(|| WalletError::Build("CT input overflow".into()))?;
             inputs_meta.push((outpoint, info, txout));
         }
-        if inputs_meta.is_empty() || in_value < total_out + fee.max(0) as u64 {
+        if inputs_meta.is_empty() || in_value < needed {
             return Err(WalletError::InsufficientFunds {
-                required: total_i64,
-                available: self.balance(tip_height, 0),
+                required: needed.min(i64::MAX as u64) as i64,
+                available: self.ct_balance(tip_height),
             });
         }
+        let change = in_value - needed;
 
-        // Outputs: fresh owner keys, fresh blindings, one CT script each.
-        let mut output_infos: Vec<CtCoinInfo> = Vec::with_capacity(amounts.len());
-        let mut vout: Vec<TxOut> = Vec::with_capacity(amounts.len());
-        for amount in amounts {
-            let owner_script = self.new_script(ScriptKind::P2wpkh)?;
-            let (owner_id, _) = self
-                .script_index
-                .get(&owner_script)
-                .cloned()
-                .ok_or(WalletError::NotMine)?;
-            let owner_key = self
-                .keys
-                .private_key(&owner_id)
-                .ok_or(WalletError::Locked)?;
-            let owner_secret = owner_key.inner.secret_bytes();
-            let pubkey_hash: [u8; 20] =
-                bitcoin::PubkeyHash::from(owner_id.clone()).to_byte_array();
-            let mut r_out = [0u8; 32];
-            getrandom::getrandom(&mut r_out)
-                .map_err(|_| WalletError::Build("ct output blinding failed".into()))?;
-            let ct = create_commitment(*amount, r_out)
-                .map_err(|_| WalletError::Build("ct commitment failed".into()))?;
-            let data = CtOutputData {
-                commitment: ct.commitment,
-                pubkey_hash,
-                proof: ct.proof,
-            };
-            vout.push(TxOut::new(0, encode_ct_script(&data)
-                .map_err(|_| WalletError::Build("ct script failed".into()))?));
-            output_infos.push(CtCoinInfo {
-                value: *amount,
-                blinding: r_out,
-                secret: owner_secret,
-                pubkey_hash,
-            });
+        // Outputs: one stealth-addressed CT output per recipient, then
+        // the change output to our own stealth address.
+        let own_keys = self.stealth_keys()?;
+        let mut payments: Vec<(crate::stealth::StealthAddress, u64)> = recipients.to_vec();
+        if change > 0 {
+            payments.push((own_keys.address(), change));
+        }
+        let mut vout: Vec<TxOut> = Vec::with_capacity(payments.len());
+        let mut output_blindings: Vec<[u8; 32]> = Vec::with_capacity(payments.len());
+        let mut own_infos: Vec<(u32, CtCoinInfo)> = Vec::new();
+        for (index, (address, amount)) in payments.iter().enumerate() {
+            let index = index as u32;
+            let (script, blinding) = build_ct_output(address, *amount, index)?;
+            output_blindings.push(blinding);
+            if let Some(info) = scan_ct_output(&own_keys, script.as_bytes(), index) {
+                own_infos.push((index, info));
+            }
+            vout.push(TxOut::new(0, script));
         }
 
         // Witness layout (see verify_ct_tx_block):
@@ -580,10 +576,9 @@ impl Wallet {
         let mut tx = Tx::new(2, vin, vout, 0);
         let context = ct_context(&tx);
         let input_blindings: Vec<[u8; 32]> = inputs_meta.iter().map(|(_, info, _)| info.blinding).collect();
-        let output_blindings: Vec<[u8; 32]> = output_infos.iter().map(|info| info.blinding).collect();
-        let (proof, _) = create_balance_proof(&input_blindings, &output_blindings, fee.max(0) as u64, &context)
+        let (proof, _) = create_balance_proof(&input_blindings, &output_blindings, fee as u64, &context)
             .map_err(|_| WalletError::Build("ct balance failed".into()))?;
-        let balance_bytes = with_fee(serialize_balance_proof(&proof), fee.max(0) as u64);
+        let balance_bytes = with_fee(serialize_balance_proof(&proof), fee as u64);
         for (i, (_outpoint, info, txout)) in inputs_meta.iter().enumerate() {
             // Owner authorisation: BIP340 Schnorr signature by the key whose
             // hash160 is the spent output's pubkey_hash.
@@ -605,10 +600,21 @@ impl Wallet {
                     bitcoin::Witness::from_slice(&[sig.to_vec(), pubkey.to_vec()]);
             }
         }
-        let outpoints: Vec<OutPoint> = (0..tx.vout.len() as u32)
-            .map(|vout| OutPoint::new(tx.txid(), vout))
+        let txid = tx.txid();
+        let own_outputs = own_infos
+            .into_iter()
+            .map(|(index, info)| (OutPoint::new(txid, index), info))
             .collect();
-        Ok((tx, output_infos, outpoints))
+        Ok((tx, own_outputs))
+    }
+
+    /// Total value of spendable confidential coins (recovered openings).
+    pub fn ct_balance(&self, tip: u32) -> i64 {
+        self.coins
+            .iter()
+            .filter(|(op, coin)| coin.ct.is_some() && self.is_spendable(op, coin, tip))
+            .map(|(_, coin)| coin.ct.as_ref().map_or(0, |c| c.value))
+            .fold(0i64, |acc, v| acc.saturating_add(v.min(i64::MAX as u64) as i64))
     }
 
     /// Imports a WIF private key. Importing a known key changes nothing.
@@ -1323,24 +1329,30 @@ impl Wallet {
         }
 
         let mut received = 0i64;
+        let mut ct_received = false;
+        // Stealth keys are only needed (and derived) when the transaction
+        // has CT-shaped outputs. While an encrypted wallet is locked they
+        // are unavailable and incoming CT payments cannot be recognised.
+        let has_ct_output = tx
+            .vout
+            .iter()
+            .any(|o| btc_chain::confidential::is_ct_script(o.script_pubkey.as_bytes()));
+        let scan_keys = if has_ct_output { self.stealth_keys().ok() } else { None };
         for (n, out) in tx.vout.iter().enumerate() {
-            // Confidential outputs are adopted when their embedded
-            // pubkey_hash belongs to one of our keys (the fresh key the
-            // output was committed to). The amount is hidden: value stays
-            // 0 in the ledger until the owner re-derives it locally.
-            let ct_ours = btc_chain::confidential::decode_ct_script(
-                out.script_pubkey.as_bytes(),
-            )
-            .map(|data| {
-                self.keys
-                    .key_ids()
-                    .any(|id| id.to_byte_array() == data.pubkey_hash)
-            })
-            .unwrap_or(false);
-            if !self.script_index.contains_key(&out.script_pubkey) && !ct_ours {
+            // Confidential outputs are adopted only when the wallet can
+            // recover their opening: the one-time key is derived for our
+            // stealth keys from the output's ephemeral key AND the
+            // ECDH-derived (value, blinding) opens the Pedersen
+            // commitment. An output we cannot open is unspendable for us
+            // and is ignored (never trust the value ciphertext alone).
+            let ct_info = scan_keys
+                .as_ref()
+                .and_then(|keys| scan_ct_output(keys, out.script_pubkey.as_bytes(), n as u32));
+            if !self.script_index.contains_key(&out.script_pubkey) && ct_info.is_none() {
                 continue;
             }
             received += out.value;
+            ct_received |= ct_info.is_some();
             let coin = self
                 .coins
                 .entry(OutPoint::new(txid, n as u32))
@@ -1349,16 +1361,16 @@ impl Wallet {
                     height: None,
                     is_coinbase,
                     spent_by: None,
-                    // Blinding is known only to the wallet that created the
-                    // output (recorded via `record_ct_coin`); blindings of
-                    // incoming CT outputs are not recoverable here.
                     ct: None,
                     note: None,
                 });
+            if coin.ct.is_none() {
+                coin.ct = ct_info;
+            }
             coin.height = conf.height;
         }
 
-        if ours_in == 0 && received == 0 {
+        if ours_in == 0 && received == 0 && !ct_received {
             return;
         }
         let record = WalletTxRecord {
@@ -2062,6 +2074,65 @@ struct TxFile {
 struct BestBlockFile {
     hash: String,
     height: u32,
+}
+
+/// Builds one recipient-recoverable CT output script paying `amount` to
+/// `recipient` at output position `index` of the transaction. A fresh
+/// ephemeral key `e` is drawn per output: `E = e*G` goes into the
+/// script, the one-time owner key is the stealth key
+/// `spending_pub + H(ECDH(e, scan_pub), idx)*G` and the blinding / value
+/// ciphertext derive from the same ECDH (see
+/// `btc_chain::confidential::CtOutputData`). Returns the script and the
+/// blinding (the sender needs it for the balance proof).
+pub fn build_ct_output(
+    recipient: &crate::stealth::StealthAddress,
+    amount: u64,
+    index: u32,
+) -> Result<(ScriptBuf, [u8; 32]), WalletError> {
+    use bitcoin_hashes::hash160;
+    let ephemeral = crate::stealth::ephemeral_secret()?;
+    let payment = recipient.payment_indexed(&ephemeral, index)?;
+    let pubkey_hash: [u8; 20] =
+        hash160::Hash::hash(&payment.one_time_pub.serialize()).to_byte_array();
+    let shared = recipient.ecdh_shared(&ephemeral);
+    let (data, blinding) = btc_chain::confidential::create_addressed_output(
+        amount,
+        &shared,
+        index,
+        pubkey_hash,
+        payment.ephemeral_pub.serialize(),
+    )
+    .map_err(|_| WalletError::Build("ct commitment failed".into()))?;
+    let script = btc_chain::confidential::encode_ct_script(&data)
+        .map_err(|_| WalletError::Build("ct script failed".into()))?;
+    Ok((script, blinding))
+}
+
+/// Recipient side: if the CT output `script` at position `index` pays
+/// the stealth keys `keys`, recovers its opening and the one-time
+/// signing secret. Three checks, all must pass: the output's
+/// `pubkey_hash` is a one-time key derived for us from `E`, the
+/// ECDH-derived blinding/value decrypt, and the Pedersen commitment
+/// really opens to the recovered `(value, blinding)` (the value
+/// ciphertext is never trusted on its own). Cheap: no range proof is
+/// touched (consensus verified it once).
+pub fn scan_ct_output(
+    keys: &crate::stealth::StealthKeys,
+    script: &[u8],
+    index: u32,
+) -> Option<CtCoinInfo> {
+    let data = btc_chain::confidential::ct_script_header(script)?;
+    let ephemeral = bitcoin::secp256k1::PublicKey::from_slice(&data.ephemeral_pub).ok()?;
+    let candidate = bitcoin::PubkeyHash::from_byte_array(data.pubkey_hash);
+    let secret = keys.scan_output_indexed(&ephemeral, index, &candidate).ok()??;
+    let shared = keys.ecdh_shared(&ephemeral);
+    let (value, blinding) = btc_chain::confidential::ct_recover_opening(&data, &shared, index)?;
+    Some(CtCoinInfo {
+        value,
+        blinding,
+        secret: secret.secret_bytes(),
+        pubkey_hash: data.pubkey_hash,
+    })
 }
 
 fn corrupt(msg: String) -> WalletError {

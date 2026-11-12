@@ -199,6 +199,14 @@ const WALLET_METHODS: &[Method] = &[
         ],
     },
     Method {
+        name: "sendct",
+        params: &[("stealth_address", true), ("amount", true), ("fee", false)],
+    },
+    Method {
+        name: "getctbalance",
+        params: &[],
+    },
+    Method {
         name: "shieldtoct",
         params: &[("amount", true), ("fee", false)],
     },

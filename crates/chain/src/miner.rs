@@ -651,11 +651,7 @@ mod tests {
             vec![
                 TxOut::new(
                     0,
-                    encode_ct_script(&CtOutputData {
-                        commitment: c_out.commitment,
-                        pubkey_hash: own_hash20,
-                        proof: c_out.proof,
-                    })
+                    encode_ct_script(&CtOutputData::unaddressed(c_out.commitment, own_hash20, c_out.proof))
                     .unwrap(),
                 ),
                 TxOut::new(
@@ -696,11 +692,7 @@ mod tests {
             vec![TxIn::new(ct_prevout)],
             vec![TxOut::new(
                 0,
-                encode_ct_script(&CtOutputData {
-                    commitment: c2.commitment,
-                    pubkey_hash: own_hash20,
-                    proof: c2.proof,
-                })
+                encode_ct_script(&CtOutputData::unaddressed(c2.commitment, own_hash20, c2.proof))
                 .unwrap(),
             )],
             0,

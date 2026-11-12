@@ -640,11 +640,7 @@ mod tests {
         use bitcoin_hashes::Hash as _;
         let _ = value_in;
         let out_c = create_commitment(value_out, r_out).unwrap();
-        let out_data = CtOutputData {
-            commitment: out_c.commitment,
-            pubkey_hash: [7u8; 20],
-            proof: out_c.proof,
-        };
+        let out_data = CtOutputData::unaddressed(out_c.commitment, [7u8; 20], out_c.proof);
         let out_script = encode_ct_script(&out_data).unwrap();
         let mut input = TxIn::new(prevout);
         input.sequence = Sequence(Sequence::MAX.0);
@@ -691,11 +687,7 @@ mod tests {
         let own_hash = bitcoin_hashes::hash160::Hash::hash(&pubs[own]).to_byte_array();
         let mut own_hash20 = [0u8; 20];
         own_hash20.copy_from_slice(&own_hash[..20]);
-        let in_data = CtOutputData {
-            commitment: in_c.commitment,
-            pubkey_hash: own_hash20,
-            proof: in_c.proof,
-        };
+        let in_data = CtOutputData::unaddressed(in_c.commitment, own_hash20, in_c.proof);
         let in_script = encode_ct_script(&in_data).unwrap();
         let coin_outpoint = OutPoint {
             txid: bitcoin::Txid::from_slice(&[99u8; 32]).unwrap(),
@@ -756,11 +748,7 @@ mod tests {
         let own_hash = bitcoin_hashes::hash160::Hash::hash(&pubs[own]).to_byte_array();
         let mut own_hash20 = [0u8; 20];
         own_hash20.copy_from_slice(&own_hash[..20]);
-        let in_data = CtOutputData {
-            commitment: in_c.commitment,
-            pubkey_hash: own_hash20,
-            proof: in_c.proof,
-        };
+        let in_data = CtOutputData::unaddressed(in_c.commitment, own_hash20, in_c.proof);
         let in_script = encode_ct_script(&in_data).unwrap();
         let coin_outpoint = OutPoint {
             txid: bitcoin::Txid::from_slice(&[88u8; 32]).unwrap(),
@@ -817,11 +805,7 @@ mod tests {
         let in_c = create_commitment(5_00000000u64, r_in).unwrap();
         let mut victim_hash = [0u8; 20];
         victim_hash.copy_from_slice(&bitcoin_hashes::hash160::Hash::hash(&victim_pub).to_byte_array()[..20]);
-        let in_script = encode_ct_script(&CtOutputData {
-            commitment: in_c.commitment,
-            pubkey_hash: victim_hash,
-            proof: in_c.proof,
-        })
+        let in_script = encode_ct_script(&CtOutputData::unaddressed(in_c.commitment, victim_hash, in_c.proof))
         .unwrap();
         let coin_outpoint = OutPoint {
             txid: bitcoin::Txid::from_slice(&[77u8; 32]).unwrap(),
@@ -843,5 +827,80 @@ mod tests {
             ValidationError::BadCt
         );
         assert!(f.base.get_coin(&coin_outpoint).is_some(), "victim coin untouched");
+    }
+
+    /// A CT output whose range proof is corrupted but whose script is
+    /// still well-formed (right length/tag/points) is rejected by
+    /// ConnectBlock. The corruption is applied before the balance proof
+    /// and the owner signature are made, so the range proof is the only
+    /// thing wrong; an untouched control spend connects.
+    #[test]
+    fn ct_output_with_corrupted_range_proof_is_rejected_in_block() {
+        use crate::confidential::{
+            create_balance_proof, create_commitment, ct_context, encode_ct_script, is_ct_script,
+            serialize_balance_proof, with_fee, CtOutputData, RANGE_PROOF_BYTES,
+        };
+        use btc_validation::coins::Coin;
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        use bitcoin::Witness;
+        let secp = Secp256k1::new();
+        let mut owner = [0u8; 32];
+        owner[0] = 3;
+        owner[31] = 5;
+        let owner_pub = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&owner).unwrap()).serialize();
+        let mut owner_hash = [0u8; 20];
+        owner_hash.copy_from_slice(&bitcoin_hashes::hash160::Hash::hash(&owner_pub).to_byte_array()[..20]);
+        let (r_in, r_out) = ([11u8; 32], [22u8; 32]);
+        let in_c = create_commitment(5_00000000u64, r_in).unwrap();
+        let in_script =
+            encode_ct_script(&CtOutputData::unaddressed(in_c.commitment, owner_hash, in_c.proof)).unwrap();
+
+        for corrupt in [false, true] {
+            let mut f = Fixture::new(1);
+            let mut params = f.params.clone();
+            params.ct_enabled = true;
+            let coin_outpoint = OutPoint {
+                txid: bitcoin::Txid::from_slice(&[66u8; 32]).unwrap(),
+                vout: 0,
+            };
+            f.base.batch_write(vec![(
+                coin_outpoint,
+                Some(Coin { txout: TxOut::new(0, in_script.clone()), height: 1, is_coinbase: false }),
+            )]);
+            let out_c = create_commitment(4_99990000u64, r_out).unwrap();
+            let mut out_bytes =
+                encode_ct_script(&CtOutputData::unaddressed(out_c.commitment, [7u8; 20], out_c.proof))
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec();
+            if corrupt {
+                // Last byte of the first bit-proof's z0 response.
+                let off = out_bytes.len() - RANGE_PROOF_BYTES + 64 * 33 + 63;
+                out_bytes[off] ^= 1;
+                assert!(is_ct_script(&out_bytes), "corrupted script is still well-formed");
+            }
+            let mut tx = Tx::new(
+                2,
+                vec![TxIn::new(coin_outpoint)],
+                vec![TxOut::new(0, ScriptBuf::from_bytes(out_bytes))],
+                0,
+            );
+            let context = ct_context(&tx);
+            let (proof, _) = create_balance_proof(&[r_in], &[r_out], 10_000, &context).unwrap();
+            let balance = with_fee(serialize_balance_proof(&proof), 10_000);
+            let sighash = crate::confidential::ct_input_sighash(&context, 0, in_script.as_bytes());
+            let (sig, pubkey) = crate::confidential::sign_ct_input(&sighash, &owner).unwrap();
+            tx.vin[0].witness = Witness::from_slice(&[balance, sig.to_vec(), pubkey.to_vec()]);
+            let height = f.tree.get(f.tip).height + 1;
+            let cb = coinbase_tx(height, f.params.block_subsidy(height) + 10_000);
+            let (id, block) = next_block(&mut f.tree, f.tip, vec![cb, tx], height);
+            let result = connect(&mut f.base, &f.tree, &params, id, &block);
+            if corrupt {
+                assert_eq!(result.unwrap_err(), ValidationError::BadCt);
+                assert!(f.base.get_coin(&coin_outpoint).is_some(), "input untouched");
+            } else {
+                result.expect("control spend with a valid range proof connects");
+            }
+        }
     }
 }

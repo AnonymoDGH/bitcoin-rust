@@ -57,6 +57,25 @@ pub(crate) fn call(backend: &dyn RpcBackend, method: &str, args: &Args) -> RpcRe
                 .map_err(wallet_error)?;
             Ok(json!(txid.to_string()))
         }
+        "sendct" => {
+            let address = args.str_req(0, "stealth_address")?;
+            let sats = args.amount_req(1, "amount")?;
+            if sats <= 0 {
+                return Err(RpcError::new(RPC_TYPE_ERROR, "Invalid amount for send"));
+            }
+            let fee = match args.scaled(2, 8)? {
+                Some(sats) => sats,
+                None => 10_000,
+            };
+            if fee < 0 {
+                return Err(RpcError::new(RPC_TYPE_ERROR, "Invalid fee for send"));
+            }
+            let txid = wallet
+                .send_ct_to_stealth(address.to_owned(), sats, fee)
+                .map_err(wallet_error)?;
+            Ok(json!(txid.to_string()))
+        }
+        "getctbalance" => Ok(amount(wallet.get_ct_balance())),
         "shieldtoct" => {
             let sats = args.amount_req(0, "amount")?;
             if sats <= 0 {

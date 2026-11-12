@@ -752,4 +752,68 @@ mod tests {
         assert!(!pool.contains(&pool_txid));
         assert!(pool.is_empty());
     }
+
+    /// A CT output whose range proof is corrupted but whose script is
+    /// still well-formed is rejected by `accept_to_mempool`; the
+    /// untouched control shield is accepted. The corruption is applied
+    /// before the balance proof is made, so the range proof is the only
+    /// defect.
+    #[test]
+    fn ct_output_with_corrupted_range_proof_is_rejected_by_mempool() {
+        use crate::confidential::{
+            create_balance_proof, create_commitment, ct_context, encode_ct_script,
+            encode_shield_marker, is_ct_script, serialize_balance_proof, with_fee, CtOutputData,
+            RANGE_PROOF_BYTES,
+        };
+
+        for corrupt in [false, true] {
+            let mut params = ChainParams::regtest();
+            params.ct_enabled = true;
+            let mut cs = Chainstate::new(
+                params,
+                regtest_genesis(),
+                Box::new(CoinsViewMemory::new()),
+                Box::new(MemBlockStore::default()),
+            )
+            .expect("regtest genesis loads");
+            let main = extend(&mut cs, genesis_hash(), 101, 0);
+
+            let (r_in, r_out) = ([11u8; 32], [22u8; 32]);
+            let fee: u64 = 10_000;
+            let value = subsidy(1) as u64 - fee;
+            let out_c = create_commitment(value, r_out).unwrap();
+            let mut out_bytes =
+                encode_ct_script(&CtOutputData::unaddressed(out_c.commitment, [7u8; 20], out_c.proof))
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec();
+            if corrupt {
+                let off = out_bytes.len() - RANGE_PROOF_BYTES + 64 * 33 + 63;
+                out_bytes[off] ^= 1;
+                assert!(is_ct_script(&out_bytes), "corrupted script is still well-formed");
+            }
+            let mut tx = Tx::new(
+                2,
+                vec![TxIn::new(coinbase_outpoint(&main[0]))],
+                vec![
+                    TxOut::new(0, ScriptBuf::from_bytes(out_bytes)),
+                    TxOut::new(0, ScriptBuf::from_bytes(encode_shield_marker(&r_in, &[0u8; 73]))),
+                ],
+                0,
+            );
+            let context = ct_context(&tx);
+            let (proof, _) = create_balance_proof(&[r_in], &[r_out], fee, &context).unwrap();
+            let balance = with_fee(serialize_balance_proof(&proof), fee);
+            tx.vout[1] = TxOut::new(0, ScriptBuf::from_bytes(encode_shield_marker(&r_in, &balance)));
+
+            let mut pool = Mempool::new(100);
+            let result = accept_to_mempool(&cs, &mut pool, tx);
+            if corrupt {
+                assert_eq!(result, Err(MempoolReject::Consensus("bad-ct-tx".into())));
+                assert!(pool.is_empty());
+            } else {
+                result.expect("control shield with a valid range proof is accepted");
+            }
+        }
+    }
 }

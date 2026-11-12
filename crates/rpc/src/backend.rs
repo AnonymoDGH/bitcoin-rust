@@ -132,6 +132,17 @@ pub trait WalletRpc: Send + Sync {
     /// output (hybrid spend: P2PKH input, CT output, public fee).
     fn send_to_confidential(&self, amount: i64, fee: i64) -> Result<Txid, String>;
 
+    /// Pays `amount` satoshis confidentially from the wallet's CT coins
+    /// to a stealth address (66 bytes hex). The output carries an
+    /// ephemeral key and an encrypted value so the recipient wallet
+    /// recovers the hidden amount by scanning; change returns to the
+    /// sender's own stealth address.
+    fn send_ct_to_stealth(&self, address_hex: String, amount: i64, fee: i64) -> Result<Txid, String>;
+
+    /// Total of the wallet's spendable confidential coins (those whose
+    /// opening the wallet recovered).
+    fn get_ct_balance(&self) -> i64;
+
     /// Shields plaintext into a pool note; returns the note commitment hex.
     fn create_pool_note(&self, amount: i64, fee: i64) -> Result<String, String>;
 

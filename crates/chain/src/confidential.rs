@@ -404,6 +404,13 @@ pub fn prove_range_with_blinding(value: u64, blinding: [u8; 32]) -> Result<Range
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Number of `verify_range` calls on this thread (tests assert that
+    /// each CT input/output is verified exactly once per transaction).
+    static RANGE_VERIFY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Verifies one bit proof.
 fn verify_bit(
     total: &[u8; 33],
@@ -430,6 +437,8 @@ fn verify_bit(
 /// Verifies `commitment == sum_i 2^i * C_i` and every bit proof. Anything
 /// but exactly [`VALUE_BITS`] bit commitments and proofs is rejected.
 pub fn verify_range(commitment: &[u8; 33], proof: &RangeProof) -> Result<(), CtError> {
+    #[cfg(test)]
+    RANGE_VERIFY_CALLS.with(|c| c.set(c.get() + 1));
     if proof.bit_commitments.len() != VALUE_BITS || proof.bit_proofs.len() != VALUE_BITS {
         return Err(CtError::RangeProof);
     }
@@ -521,9 +530,15 @@ fn blinding_difference(inputs: &[[u8; 32]], outputs: &[[u8; 32]]) -> Result<[u8;
 /// - an INPUT with a completely empty proof is a verifier-rebuilt
 ///   plaintext-derived commitment (`v*G + r*H` for a spent plaintext
 ///   coin whose value the ledger already range-checked) and is exempt.
-///   Inputs that come from CT scripts always carry a full proof because
-///   [`decode_ct_script`] cannot return anything else. Any non-empty
+///   Inputs that come from CT scripts always carry a full-length proof
+///   (length is enforced by the parser) which is verified here. Any non-empty
 ///   input proof must verify completely.
+///
+/// This is the single place where range proofs of CT outputs (and of CT
+/// inputs, re-checked at spend time: a coinbase can create CT-shaped
+/// outputs that no transaction verification ever saw) are verified;
+/// [`decode_ct_script`] only parses. Each input and each output proof is
+/// verified exactly once here.
 pub fn verify_ct_transaction(
     inputs: &[AmountCommitment],
     outputs: &[AmountCommitment],
@@ -573,24 +588,180 @@ pub fn verify_ct_transaction(
     }
 }
 
-/// Confidential output script:
-/// `OP_RETURN 0x01 <commitment:33> <pubkey_hash:20> PUSHDATA2(<range_proof>)`.
+/// Confidential output script (consensus layout, fixed length):
+///
+/// ```text
+/// offset  len   field
+///   0      1    OP_RETURN (0x6a)
+///   1      1    CT tag 0x01
+///   2     33    commitment C = v*G + r*H        (compressed point)
+///  35     20    pubkey_hash  (hash160 of the owner's one-time key)
+///  55     33    E, ephemeral public key          (compressed point)
+///  88      8    v_enc = v (LE) XOR mask(s, idx)  (value ciphertext)
+///  96      3    OP_PUSHDATA2 0x4d, len = 8256 (LE: 0x40 0x20)
+///  99   8256    range proof (64 bit commitments + 64 ring proofs)
+/// total 8355 bytes (<= MAX_SCRIPT_SIZE = 10,000)
+/// ```
+///
 /// Value must be 0 (the amount is hidden in the commitment).
+///
+/// Recipient recovery: the sender picks a fresh ephemeral secret `e`,
+/// publishes `E = e*G` and derives the shared secret
+/// `s = SHA256(ECDH(e, scan_pub))` (the same ECDH the stealth address
+/// uses, so `E` doubles as the stealth ephemeral of the one-time
+/// `pubkey_hash`). With the output index `idx` in the transaction:
+/// blinding `r = H("AnonCoin/ct-blind/v1" || s || idx)` (re-hashed with a
+/// counter until it is a valid scalar) and `v_enc = v XOR
+/// H("AnonCoin/ct-value/v1" || s || idx)[..8]`. The recipient recomputes
+/// `s = ECDH(scan_secret, E)` and MUST check `C == v*G + r*H` before
+/// trusting `v_enc`: the ciphertext is not authenticated, the Pedersen
+/// opening is. Consensus does not look at `E`/`v_enc` beyond requiring
+/// `E` to be a valid curve point.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CtOutputData {
     pub commitment: [u8; 33],
     pub pubkey_hash: [u8; 20],
+    /// Ephemeral public key `E` for the recipient's ECDH.
+    pub ephemeral_pub: [u8; 33],
+    /// Value encrypted under the ECDH-derived mask.
+    pub value_enc: [u8; 8],
     pub proof: RangeProof,
+}
+
+/// Length of the CT script: `2 + 33 + 20 + 33 + 8 + 3 + RANGE_PROOF_BYTES`.
+pub const CT_SCRIPT_BYTES: usize = 2 + 33 + 20 + 33 + 8 + 3 + RANGE_PROOF_BYTES;
+
+const CT_OFF_COMMITMENT: usize = 2;
+const CT_OFF_PKH: usize = 35;
+const CT_OFF_EPHEMERAL: usize = 55;
+const CT_OFF_VALUE_ENC: usize = 88;
+const CT_OFF_PUSH: usize = 96;
+const CT_OFF_PROOF: usize = 99;
+
+/// Domain tags of the recipient-recoverable blinding / value mask.
+pub const CT_BLIND_DOMAIN: &[u8] = b"AnonCoin/ct-blind/v1";
+pub const CT_VALUE_DOMAIN: &[u8] = b"AnonCoin/ct-value/v1";
+
+impl CtOutputData {
+    /// Output that is not addressed to a scanning recipient: `E` is the
+    /// generator `G` and `v_enc` is zero. Only useful where the opening
+    /// is communicated out of band (chain-level tests).
+    pub fn unaddressed(commitment: [u8; 33], pubkey_hash: [u8; 20], proof: RangeProof) -> Self {
+        Self {
+            commitment,
+            pubkey_hash,
+            ephemeral_pub: g_generator().serialize(),
+            value_enc: [0u8; 8],
+            proof,
+        }
+    }
+}
+
+fn ct_hash(domain: &[u8], shared: &[u8; 32], index: u32, counter: u8) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(domain.len() + 32 + 4 + 1);
+    buf.extend_from_slice(domain);
+    buf.extend_from_slice(shared);
+    buf.extend_from_slice(&index.to_be_bytes());
+    if counter > 0 {
+        buf.push(counter);
+    }
+    sha256::Hash::hash(&buf).to_byte_array()
+}
+
+/// Blinding of the output at `index` from the ECDH shared secret:
+/// `H("AnonCoin/ct-blind/v1" || s || idx)`, re-hashed with a counter on
+/// the (negligible) chance it is zero or `>= n`.
+pub fn ct_derive_blinding(shared: &[u8; 32], index: u32) -> [u8; 32] {
+    let mut counter = 0u8;
+    loop {
+        let hashed = ct_hash(CT_BLIND_DOMAIN, shared, index, counter);
+        if SecretKey::from_slice(&hashed).is_ok() {
+            return hashed;
+        }
+        counter = counter.wrapping_add(1);
+    }
+}
+
+fn ct_value_mask(shared: &[u8; 32], index: u32) -> [u8; 8] {
+    let hashed = ct_hash(CT_VALUE_DOMAIN, shared, index, 0);
+    let mut mask = [0u8; 8];
+    mask.copy_from_slice(&hashed[..8]);
+    mask
+}
+
+/// `v_enc = v (LE) XOR H("AnonCoin/ct-value/v1" || s || idx)[..8]`.
+pub fn ct_encrypt_value(value: u64, shared: &[u8; 32], index: u32) -> [u8; 8] {
+    let mask = ct_value_mask(shared, index);
+    let mut out = value.to_le_bytes();
+    for (b, m) in out.iter_mut().zip(mask) {
+        *b ^= m;
+    }
+    out
+}
+
+/// Inverse of [`ct_encrypt_value`]. The result is only a candidate until
+/// [`ct_recover_opening`] checks it against the commitment.
+pub fn ct_decrypt_value(value_enc: &[u8; 8], shared: &[u8; 32], index: u32) -> u64 {
+    let mask = ct_value_mask(shared, index);
+    let mut bytes = *value_enc;
+    for (b, m) in bytes.iter_mut().zip(mask) {
+        *b ^= m;
+    }
+    u64::from_le_bytes(bytes)
+}
+
+/// Recipient side: recovers `(value, blinding)` of `data` at output
+/// `index` from the shared secret and returns it only if the Pedersen
+/// commitment opens to it (`C == v*G + r*H`). A tampered ciphertext or a
+/// wrong secret gives `None`.
+pub fn ct_recover_opening(
+    data: &CtOutputData,
+    shared: &[u8; 32],
+    index: u32,
+) -> Option<(u64, [u8; 32])> {
+    let value = ct_decrypt_value(&data.value_enc, shared, index);
+    let blinding = ct_derive_blinding(shared, index);
+    let expected = commitment_point(value, blinding).ok()?;
+    (expected == data.commitment).then_some((value, blinding))
+}
+
+/// Sender side: builds a recipient-recoverable output for `value` at
+/// output `index`, returning the data and the blinding used (the sender
+/// needs it for the balance proof).
+pub fn create_addressed_output(
+    value: u64,
+    shared: &[u8; 32],
+    index: u32,
+    pubkey_hash: [u8; 20],
+    ephemeral_pub: [u8; 33],
+) -> Result<(CtOutputData, [u8; 32]), CtError> {
+    let blinding = ct_derive_blinding(shared, index);
+    let ct = create_commitment(value, blinding)?;
+    Ok((
+        CtOutputData {
+            commitment: ct.commitment,
+            pubkey_hash,
+            ephemeral_pub,
+            value_enc: ct_encrypt_value(value, shared, index),
+            proof: ct.proof,
+        },
+        blinding,
+    ))
 }
 
 pub fn encode_ct_script(data: &CtOutputData) -> Result<btc_primitives::ScriptBuf, CtError> {
     if data.proof.bit_commitments.len() != VALUE_BITS || data.proof.bit_proofs.len() != VALUE_BITS {
         return Err(CtError::RangeProof);
     }
-    let mut buf = vec![0x6a, 0x01];
+    let mut buf = Vec::with_capacity(CT_SCRIPT_BYTES);
+    buf.extend_from_slice(&[0x6a, 0x01]);
     buf.extend_from_slice(&data.commitment);
     buf.extend_from_slice(&data.pubkey_hash);
+    buf.extend_from_slice(&data.ephemeral_pub);
+    buf.extend_from_slice(&data.value_enc);
     let proof_bytes = serialize_range_proof(&data.proof);
     push_data(&mut buf, &proof_bytes);
+    debug_assert_eq!(buf.len(), CT_SCRIPT_BYTES);
     Ok(btc_primitives::ScriptBuf::from_bytes(buf))
 }
 
@@ -607,48 +778,60 @@ fn push_data(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(data);
 }
 
-/// Decodes and fully verifies a CT output script. Only a script carrying
-/// a complete, valid 64-bit range proof of exactly [`RANGE_PROOF_BYTES`]
-/// bytes decodes; everything else (including empty or short proofs) is
-/// `None`.
+/// Cheap structural check: exact length, tag, plausible point prefixes
+/// and the exact PUSHDATA2 header. No elliptic-curve work and no
+/// allocation. It does NOT check any proof: range proofs are verified
+/// exactly once per output by [`verify_ct_transaction`] /
+/// [`verify_ct_tx_block`]; every consensus path that accepts a CT
+/// output goes through them.
+fn ct_script_well_formed(script: &[u8]) -> bool {
+    script.len() == CT_SCRIPT_BYTES
+        && script[0] == 0x6a
+        && script[1] == 0x01
+        && matches!(script[CT_OFF_COMMITMENT], 0x02 | 0x03)
+        && matches!(script[CT_OFF_EPHEMERAL], 0x02 | 0x03)
+        && script[CT_OFF_PUSH] == 0x4d
+        && u16::from_le_bytes([script[CT_OFF_PUSH + 1], script[CT_OFF_PUSH + 2]]) as usize
+            == RANGE_PROOF_BYTES
+}
+
+/// Parses a CT output script (structure and lengths only, no proof
+/// verification). Returns `None` for anything that is not exactly the
+/// layout documented on [`CtOutputData`]. The returned data still has
+/// to pass [`verify_ct_transaction`] before an output may be accepted.
 pub fn decode_ct_script(script: &[u8]) -> Option<CtOutputData> {
-    let len = script.len();
-    if len < 2 || script[0] != 0x6a || script[1] != 0x01 {
+    if !ct_script_well_formed(script) {
         return None;
     }
-    // [0x6a, 0x01, commitment:33, pubkey_hash:20, push(proof)]
-    let commitment: [u8; 33] = script.get(2..35)?.try_into().ok()?;
-    let pubkey_hash: [u8; 20] = script.get(35..55)?.try_into().ok()?;
-    let proof_data = parse_push(script.get(55..)?)?;
-    let proof = deserialize_range_proof(proof_data)?;
-    if verify_range(&commitment, &proof).is_err() {
-        return None;
-    }
+    let proof = deserialize_range_proof(&script[CT_OFF_PROOF..])?;
     Some(CtOutputData {
-        commitment,
-        pubkey_hash,
+        commitment: script[CT_OFF_COMMITMENT..CT_OFF_PKH].try_into().ok()?,
+        pubkey_hash: script[CT_OFF_PKH..CT_OFF_EPHEMERAL].try_into().ok()?,
+        ephemeral_pub: script[CT_OFF_EPHEMERAL..CT_OFF_VALUE_ENC].try_into().ok()?,
+        value_enc: script[CT_OFF_VALUE_ENC..CT_OFF_PUSH].try_into().ok()?,
         proof,
     })
 }
 
+/// True for a structurally well-formed CT output script. O(1): it says
+/// nothing about proof validity (see [`decode_ct_script`]).
 pub fn is_ct_script(script: &[u8]) -> bool {
-    decode_ct_script(script).is_some()
+    ct_script_well_formed(script)
 }
 
-fn parse_push(data: &[u8]) -> Option<&[u8]> {
-    let (len, header) = match data.first()? {
-        b if *b < 0x4c => (*b as usize, 1),
-        0x4c => (*data.get(1)? as usize, 2),
-        0x4d => {
-            let len = u16::from_le_bytes(data.get(1..3)?.try_into().ok()?) as usize;
-            (len, 3)
-        }
-        _ => return None,
-    };
-    if header + len != data.len() {
+/// Header of a CT script without copying the proof (wallet scanning):
+/// the returned `proof` is empty. Never use the result for verification.
+pub fn ct_script_header(script: &[u8]) -> Option<CtOutputData> {
+    if !ct_script_well_formed(script) {
         return None;
     }
-    Some(&data[header..])
+    Some(CtOutputData {
+        commitment: script[CT_OFF_COMMITMENT..CT_OFF_PKH].try_into().ok()?,
+        pubkey_hash: script[CT_OFF_PKH..CT_OFF_EPHEMERAL].try_into().ok()?,
+        ephemeral_pub: script[CT_OFF_EPHEMERAL..CT_OFF_VALUE_ENC].try_into().ok()?,
+        value_enc: script[CT_OFF_VALUE_ENC..CT_OFF_PUSH].try_into().ok()?,
+        proof: RangeProof { bit_commitments: Vec::new(), bit_proofs: Vec::new() },
+    })
 }
 
 fn serialize_range_proof(proof: &RangeProof) -> Vec<u8> {
@@ -1001,6 +1184,9 @@ pub fn verify_ct_tx_block(
         if output.value != 0 {
             return Err(CtError::BalanceProof);
         }
+        // `E` must be a real curve point so the recipient's ECDH is
+        // defined; the opening itself is checked by the recipient.
+        parse_point(&data.ephemeral_pub)?;
         outputs.push(AmountCommitment {
             commitment: data.commitment,
             proof: data.proof,
@@ -1071,18 +1257,22 @@ mod tests {
     #[test]
     fn ct_script_round_trips_and_rejects_tampering() {
         let c = create_commitment(10_00000000, blinding(5)).unwrap();
-        let data = CtOutputData {
-            commitment: c.commitment,
-            pubkey_hash: [7u8; 20],
-            proof: c.proof,
-        };
+        let data = CtOutputData::unaddressed(c.commitment, [7u8; 20], c.proof);
         let script = encode_ct_script(&data).unwrap();
         let back = decode_ct_script(script.as_bytes()).unwrap();
         assert_eq!(back.commitment, data.commitment);
         assert_eq!(back.pubkey_hash, [7u8; 20]);
+        assert_eq!(script.len(), CT_SCRIPT_BYTES);
+        assert!(CT_SCRIPT_BYTES <= 10_000, "must fit MAX_SCRIPT_SIZE");
+        assert_eq!(back.ephemeral_pub, data.ephemeral_pub);
+        assert_eq!(back.value_enc, data.value_enc);
+        assert_eq!(back, data);
+        // Parsing is structural: a flipped commitment byte still parses
+        // (cheaply) but the range proof then fails verification.
         let mut bytes = script.as_bytes().to_vec();
-        bytes[10] ^= 1; // inside the commitment: range proof must fail
-        assert!(decode_ct_script(&bytes).is_none());
+        bytes[10] ^= 1;
+        let tampered = decode_ct_script(&bytes).expect("structure unchanged");
+        assert!(verify_range(&tampered.commitment, &tampered.proof).is_err());
         assert!(!is_ct_script(&ScriptBuf::from_bytes(vec![0x6a]).as_bytes()));
     }
 
@@ -1110,11 +1300,7 @@ mod tests {
         let in_c = create_commitment(5_00000000u64, R_IN).unwrap();
         btc_primitives::TxOut::new(
             0,
-            encode_ct_script(&CtOutputData {
-                commitment: in_c.commitment,
-                pubkey_hash: owner_hash,
-                proof: in_c.proof,
-            })
+            encode_ct_script(&CtOutputData::unaddressed(in_c.commitment, owner_hash, in_c.proof))
             .unwrap(),
         )
     }
@@ -1123,11 +1309,7 @@ mod tests {
     /// selects the outpoint, `value_out` is the hidden output amount).
     fn unsigned_ct_tx(to_hash: [u8; 20], seed: u8, value_out: u64) -> btc_primitives::Tx {
         let out_c = create_commitment(value_out, R_OUT).unwrap();
-        let out_script = encode_ct_script(&CtOutputData {
-            commitment: out_c.commitment,
-            pubkey_hash: to_hash,
-            proof: out_c.proof,
-        })
+        let out_script = encode_ct_script(&CtOutputData::unaddressed(out_c.commitment, to_hash, out_c.proof))
         .unwrap();
         let prevout = btc_primitives::OutPoint {
             txid: bitcoin::Txid::from_slice(&[seed; 32]).unwrap(),
@@ -1545,6 +1727,8 @@ mod tests {
         let mut buf = vec![0x6a, 0x01];
         buf.extend_from_slice(&commitment);
         buf.extend_from_slice(&[7u8; 20]);
+        buf.extend_from_slice(&g_generator().serialize()); // E
+        buf.extend_from_slice(&[0u8; 8]); // v_enc
         push_data(&mut buf, proof_bytes);
         buf
     }
@@ -1552,13 +1736,11 @@ mod tests {
     #[test]
     fn ct_script_size_is_below_script_limit() {
         let c = create_commitment(1, blinding(60)).unwrap();
-        let script = encode_ct_script(&CtOutputData {
-            commitment: c.commitment,
-            pubkey_hash: [1u8; 20],
-            proof: c.proof,
-        })
+        let script = encode_ct_script(&CtOutputData::unaddressed(c.commitment, [1u8; 20], c.proof))
         .unwrap();
-        assert_eq!(script.as_bytes().len(), 2 + 33 + 20 + 3 + RANGE_PROOF_BYTES);
+        assert_eq!(script.as_bytes().len(), 2 + 33 + 20 + 33 + 8 + 3 + RANGE_PROOF_BYTES);
+        assert_eq!(script.as_bytes().len(), CT_SCRIPT_BYTES);
+        assert_eq!(script.as_bytes().len(), 8355);
         assert!(script.as_bytes().len() <= 10_000);
     }
 
@@ -1573,6 +1755,8 @@ mod tests {
         let mut no_push = vec![0x6a, 0x01];
         no_push.extend_from_slice(&c.commitment);
         no_push.extend_from_slice(&[7u8; 20]);
+        no_push.extend_from_slice(&g_generator().serialize());
+        no_push.extend_from_slice(&[0u8; 8]);
         assert!(decode_ct_script(&no_push).is_none());
         // 63 bits only.
         let short = &full[..full.len() - 96];
@@ -1581,9 +1765,12 @@ mod tests {
         let mut long = full.clone();
         long.push(0);
         assert!(decode_ct_script(&script_with_proof_bytes(c.commitment, &long)).is_none());
-        // Proof for the wrong commitment.
+        // Proof for the wrong commitment still PARSES (parsing is
+        // structural) but verification rejects it.
         let other = create_commitment(4, blinding(62)).unwrap();
-        assert!(decode_ct_script(&script_with_proof_bytes(other.commitment, &full)).is_none());
+        let mismatched = decode_ct_script(&script_with_proof_bytes(other.commitment, &full))
+            .expect("structurally valid");
+        assert!(verify_range(&mismatched.commitment, &mismatched.proof).is_err());
         // Truncated scripts never panic.
         let script = script_with_proof_bytes(c.commitment, &full);
         for n in 0..70 {
@@ -1597,12 +1784,7 @@ mod tests {
         let mut proof = c.proof.clone();
         proof.bit_commitments.clear();
         proof.bit_proofs.clear();
-        assert!(encode_ct_script(&CtOutputData {
-            commitment: c.commitment,
-            pubkey_hash: [0u8; 20],
-            proof,
-        })
-        .is_err());
+        assert!(encode_ct_script(&CtOutputData::unaddressed(c.commitment, [0u8; 20], proof)).is_err());
     }
 
     // ---------------------------------------------------------------
@@ -1741,5 +1923,163 @@ mod tests {
         assert_eq!(scalar_mul_bytes(&a, &ZERO).unwrap(), ZERO);
         assert_eq!(scalar_neg(&ZERO).unwrap(), ZERO);
         assert!(scalar_add(&[0xFF; 32], &a).is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // Recipient-recoverable blinding / value; single range verification
+    // ---------------------------------------------------------------
+
+    fn shared(seed: u8) -> [u8; 32] {
+        [seed; 32]
+    }
+
+    #[test]
+    fn recipient_recovers_value_and_blinding() {
+        let s = shared(9);
+        let (data, r) = create_addressed_output(42_00000000, &s, 3, [5u8; 20], g_generator().serialize()).unwrap();
+        // Blinding is the deterministic hash of (s, idx), not sender-random.
+        assert_eq!(r, ct_derive_blinding(&s, 3));
+        let (v, r2) = ct_recover_opening(&data, &s, 3).expect("recipient recovers");
+        assert_eq!((v, r2), (42_00000000, r));
+        // Round trips through the script.
+        let script = encode_ct_script(&data).unwrap();
+        let parsed = decode_ct_script(script.as_bytes()).unwrap();
+        assert_eq!(ct_recover_opening(&parsed, &s, 3), Some((42_00000000, r)));
+        // The header-only parser yields the same fields.
+        let head = ct_script_header(script.as_bytes()).unwrap();
+        assert_eq!(head.value_enc, data.value_enc);
+        assert_eq!(head.ephemeral_pub, data.ephemeral_pub);
+    }
+
+    #[test]
+    fn wrong_secret_or_index_cannot_recover() {
+        let s = shared(9);
+        let (data, _) = create_addressed_output(7, &s, 0, [5u8; 20], g_generator().serialize()).unwrap();
+        assert!(ct_recover_opening(&data, &shared(10), 0).is_none());
+        assert!(ct_recover_opening(&data, &s, 1).is_none());
+        assert!(ct_recover_opening(&data, &s, 0).is_some());
+    }
+
+    #[test]
+    fn tampered_value_ciphertext_is_detected_by_commitment_check() {
+        let s = shared(11);
+        let (mut data, _) = create_addressed_output(1_000, &s, 0, [5u8; 20], g_generator().serialize()).unwrap();
+        for i in 0..8 {
+            let original = data.value_enc;
+            data.value_enc[i] ^= 0x01;
+            assert!(ct_recover_opening(&data, &s, 0).is_none(), "byte {i}");
+            data.value_enc = original;
+        }
+        assert!(ct_recover_opening(&data, &s, 0).is_some());
+    }
+
+    #[test]
+    fn value_mask_and_blinding_are_domain_separated() {
+        let s = shared(12);
+        assert_ne!(
+            ct_derive_blinding(&s, 0)[..8],
+            ct_encrypt_value(0, &s, 0),
+            "mask and blinding come from different domains"
+        );
+        assert_ne!(ct_derive_blinding(&s, 0), ct_derive_blinding(&s, 1));
+        assert_eq!(ct_decrypt_value(&ct_encrypt_value(u64::MAX, &s, 5), &s, 5), u64::MAX);
+    }
+
+    #[test]
+    fn parsing_is_cheap_and_does_not_verify_proofs() {
+        let c = create_commitment(5, blinding(90)).unwrap();
+        let data = CtOutputData::unaddressed(c.commitment, [1u8; 20], c.proof);
+        let mut bytes = encode_ct_script(&data).unwrap().as_bytes().to_vec();
+        // Corrupt a response scalar inside the range proof: still a
+        // well-formed CT script.
+        bytes[CT_OFF_PROOF + VALUE_BITS * 33 + 63] ^= 1;
+        RANGE_VERIFY_CALLS.with(|c| c.set(0));
+        assert!(is_ct_script(&bytes));
+        let parsed = decode_ct_script(&bytes).expect("well-formed");
+        assert_eq!(RANGE_VERIFY_CALLS.with(|c| c.get()), 0, "parsing must not verify");
+        // ...and verification catches it.
+        assert!(verify_range(&parsed.commitment, &parsed.proof).is_err());
+        // Wrong lengths / tags are not CT scripts.
+        assert!(!is_ct_script(&bytes[..bytes.len() - 1]));
+        let mut long = bytes.clone();
+        long.push(0);
+        assert!(!is_ct_script(&long));
+        let mut bad_tag = bytes.clone();
+        bad_tag[1] = 0x02;
+        assert!(!is_ct_script(&bad_tag));
+    }
+
+    /// 1-in-1-out CT tx whose output script carries the given proof
+    /// corruption (applied BEFORE the balance proof / signature, so only
+    /// the range proof is wrong).
+    fn tx_with_output_proof(corrupt: bool) -> (btc_primitives::Tx, btc_primitives::TxOut) {
+        let (owner_secret, owner_pub) = test_key(3);
+        let spent = victim_output(hash20(&owner_pub));
+        let out_c = create_commitment(4_99990000, R_OUT).unwrap();
+        let mut out_script = encode_ct_script(&CtOutputData::unaddressed(out_c.commitment, [7u8; 20], out_c.proof))
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        if corrupt {
+            out_script[CT_OFF_PROOF + VALUE_BITS * 33 + 63] ^= 1;
+        }
+        let prevout = btc_primitives::OutPoint {
+            txid: bitcoin::Txid::from_slice(&[99; 32]).unwrap(),
+            vout: 0,
+        };
+        let mut tx = btc_primitives::Tx::new(
+            2,
+            vec![btc_primitives::TxIn::new(prevout)],
+            vec![btc_primitives::TxOut::new(0, ScriptBuf::from_bytes(out_script))],
+            0,
+        );
+        tx.vin[0].witness = auth_witness(&tx, &spent, &owner_secret, &owner_pub);
+        (tx, spent)
+    }
+
+    #[test]
+    fn corrupted_but_well_formed_output_proof_is_rejected() {
+        let (good, spent) = tx_with_output_proof(false);
+        assert!(accepts(&good, &spent), "control: untouched proof accepted");
+        let (bad, spent) = tx_with_output_proof(true);
+        assert!(is_ct_script(bad.vout[0].script_pubkey.as_bytes()), "still parses");
+        assert!(!accepts(&bad, &spent));
+        assert_eq!(
+            verify_ct_tx_block(&bad, &[spent], &|_t, _s, _i| Ok(())),
+            Err(CtError::RangeProof)
+        );
+    }
+
+    #[test]
+    fn each_input_and_output_proof_is_verified_exactly_once() {
+        let (tx, spent) = tx_with_output_proof(false);
+        RANGE_VERIFY_CALLS.with(|c| c.set(0));
+        verify_ct_tx_block(&tx, &[spent], &|_t, _s, _i| Ok(())).unwrap();
+        // One CT input + one CT output = two range verifications, no more.
+        assert_eq!(RANGE_VERIFY_CALLS.with(|c| c.get()), 2);
+    }
+
+    #[test]
+    fn invalid_ephemeral_point_is_rejected() {
+        let (owner_secret, owner_pub) = test_key(3);
+        let spent = victim_output(hash20(&owner_pub));
+        let out_c = create_commitment(4_99990000, R_OUT).unwrap();
+        let mut data = CtOutputData::unaddressed(out_c.commitment, [7u8; 20], out_c.proof);
+        data.ephemeral_pub = [0x02; 33]; // prefix ok, x not on the curve
+        data.ephemeral_pub[1..].fill(0xFF);
+        let script = encode_ct_script(&data).unwrap();
+        assert!(is_ct_script(script.as_bytes()));
+        let prevout = btc_primitives::OutPoint {
+            txid: bitcoin::Txid::from_slice(&[98; 32]).unwrap(),
+            vout: 0,
+        };
+        let mut tx = btc_primitives::Tx::new(
+            2,
+            vec![btc_primitives::TxIn::new(prevout)],
+            vec![btc_primitives::TxOut::new(0, script)],
+            0,
+        );
+        tx.vin[0].witness = auth_witness(&tx, &spent, &owner_secret, &owner_pub);
+        assert!(!accepts(&tx, &spent));
     }
 }
