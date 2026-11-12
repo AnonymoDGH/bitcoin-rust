@@ -368,26 +368,22 @@ struct Manager {
     refill: bool,
 }
 
-/// Random relay delay in [0, max]. Uses system-time entropy mixed with a
-/// process counter instead of pulling a `rand` dependency into the node.
+/// Random relay delay in [0, max], drawn from the OS RNG. (Previously a
+/// xorshift over the wall clock and a counter: an observer who knows roughly
+/// when the node relayed could predict the delays that jitter is meant to hide.)
 fn relay_delay(max: Duration) -> Duration {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let mut x = now ^ (n.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-    // xorshift64*
-    x ^= x >> 12;
-    x ^= x << 25;
-    x ^= x >> 27;
     let max_nanos = max.as_nanos() as u64;
     if max_nanos == 0 {
         return Duration::ZERO;
     }
-    Duration::from_nanos(x % max_nanos)
+    let mut bytes = [0u8; 8];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        // No OS entropy: fail safe with the maximum delay, never a guessable one.
+        return max;
+    }
+    // Multiply-shift range reduction: uniform up to 2^-64 bias, no modulo skew.
+    let r = u64::from_le_bytes(bytes) as u128;
+    Duration::from_nanos(((r * max_nanos as u128) >> 64) as u64)
 }
 
 impl Manager {
@@ -744,7 +740,12 @@ impl Manager {
 
     /// Starts a DNS seed lookup, at most once per `SEED_RETRY`.
     fn maybe_resolve_seeds(&mut self) {
-        if !self.config.dns_seed || self.ctx.params.seeds.is_empty() {
+        // Defence in depth: seed lookups are cleartext DNS and bypass the
+        // SOCKS proxy, so they never run while a proxy is configured.
+        if !self.config.dns_seed
+            || self.config.proxy.is_some()
+            || self.ctx.params.seeds.is_empty()
+        {
             return;
         }
         if self.last_seed.is_some_and(|at| at.elapsed() < SEED_RETRY) {
@@ -1205,6 +1206,23 @@ mod tests {
 
     fn op_true() -> ScriptBuf {
         ScriptBuf::from_bytes(vec![0x51])
+    }
+
+    #[test]
+    fn relay_delay_is_bounded_and_spread_across_the_window() {
+        assert_eq!(relay_delay(Duration::ZERO), Duration::ZERO);
+        let max = Duration::from_secs(2);
+        let samples: Vec<Duration> = (0..4000).map(|_| relay_delay(max)).collect();
+        assert!(samples.iter().all(|d| *d < max));
+        let distinct: std::collections::HashSet<_> = samples.iter().collect();
+        assert!(distinct.len() > 3990, "delays must not repeat");
+        let mean = samples.iter().map(|d| d.as_secs_f64()).sum::<f64>() / samples.len() as f64;
+        assert!((0.9..1.1).contains(&mean), "mean {mean} should be ~1s");
+        // Each quarter of the window is hit.
+        for q in 0..4 {
+            let lo = Duration::from_millis(500 * q);
+            assert!(samples.iter().any(|d| *d >= lo && *d < lo + Duration::from_millis(500)));
+        }
     }
 
     fn magic() -> [u8; 4] {

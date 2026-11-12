@@ -20,3 +20,4 @@ serde = { workspace = true }
 serde_json = "1"
 tokio = { workspace = true }
 thiserror = { workspace = true }
+getrandom = "0.2"

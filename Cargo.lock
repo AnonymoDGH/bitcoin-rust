@@ -402,6 +402,7 @@ dependencies = [
  "btc-storage",
  "btc-validation",
  "btc-wallet",
+ "getrandom 0.2.17",
  "primitive-types",
  "serde",
  "serde_json",
