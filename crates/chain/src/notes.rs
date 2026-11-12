@@ -343,6 +343,23 @@ pub fn verify_note_tx_block_with_caps(
     pool_root: Option<[u8; 32]>,
     funding_caps: Option<&std::collections::HashMap<[u8; 32], u64>>,
 ) -> Result<i64, NoteError> {
+    // No verifying key: SNARK proofs cannot be checked, so any spend
+    // carrying one is rejected (see the `_with_snark` variant).
+    verify_note_tx_block_with_snark(tx, spent_outs, pool_root, funding_caps, None)
+}
+
+/// As [`verify_note_tx_block_with_caps`], with the chain-pinned Groth16
+/// verifying key (`ChainParams::snark_vk`). With `snark_vk == None`
+/// a spend that carries a proof (`witness[3]`) is invalid: a proof that
+/// cannot be verified must never be accepted, ignored, or used to
+/// derive a fee or new commitments (shielded mode needs the proof).
+pub fn verify_note_tx_block_with_snark(
+    tx: &btc_primitives::Tx,
+    spent_outs: &[btc_primitives::TxOut],
+    pool_root: Option<[u8; 32]>,
+    funding_caps: Option<&std::collections::HashMap<[u8; 32], u64>>,
+    snark_vk: Option<&crate::value_snark::SnarkVk>,
+) -> Result<i64, NoteError> {
     if spent_outs.len() != tx.vin.len() || tx.vin.is_empty() {
         return Err(NoteError::Invalid);
     }
@@ -420,6 +437,10 @@ pub fn verify_note_tx_block_with_caps(
             if tx.vin.len() != 1 {
                 return Err(NoteError::Invalid);
             }
+            // No pinned verifying key => nothing can be proven.
+            let Some(snark_vk) = snark_vk else {
+                return Err(NoteError::Invalid);
+            };
             let proof =
                 crate::value_snark::deserialize_proof(proof_bytes).ok_or(NoteError::Invalid)?;
             let cap = match funding_caps {
@@ -457,7 +478,7 @@ pub fn verify_note_tx_block_with_caps(
                     c_old: crate::value_snark::value_commitment(note.value, &note.rcm, &pool_cmu),
                     c_new: [c_new0, c_new1],
                 };
-                if !crate::value_snark::verify(transcript, &proof) {
+                if !crate::value_snark::verify(snark_vk, transcript, &proof) {
                     return Err(NoteError::Invalid);
                 }
                 spent_fee = fee_u64 as i64;
@@ -470,7 +491,7 @@ pub fn verify_note_tx_block_with_caps(
                     fee_u64,
                     cap,
                 );
-                if !crate::value_snark::verify(transcript, &proof) {
+                if !crate::value_snark::verify(snark_vk, transcript, &proof) {
                     return Err(NoteError::Invalid);
                 }
             }
@@ -873,7 +894,9 @@ mod tests {
             v_new: [outputs_total, 0],
             rcm_new: [dummy, dummy],
         };
-        let proof = crate::value_snark::prove(transcript, witness).expect("proves");
+        let (pk, vk_raw) = crate::value_snark::ephemeral_process_parameters();
+        let vk = crate::value_snark::SnarkVk::from_vk(vk_raw).unwrap();
+        let proof = crate::value_snark::prove(pk, transcript, witness).expect("proves");
         let mut proof_tx = tx.clone();
         proof_tx.vin[0].witness = Witness::from_slice(&[
             encode_note(&n),
@@ -883,21 +906,51 @@ mod tests {
         ]);
         let mut caps = HashMap::new();
         caps.insert(cmu, n.value);
+        assert!(verify_note_tx_block_with_snark(
+            &proof_tx,
+            std::slice::from_ref(&spent_out),
+            Some(anchor),
+            Some(&caps),
+            Some(&vk),
+        )
+        .is_ok());
+        // No verifying key configured: a proof-carrying spend is rejected
+        // (never ignored, never trusted).
         assert!(verify_note_tx_block_with_caps(
             &proof_tx,
             std::slice::from_ref(&spent_out),
             Some(anchor),
             Some(&caps),
         )
-        .is_ok());
+        .is_err());
+        assert!(verify_note_tx_block_with_snark(
+            &proof_tx,
+            std::slice::from_ref(&spent_out),
+            Some(anchor),
+            Some(&caps),
+            None,
+        )
+        .is_err());
+        // A verifying key from another setup rejects the proof.
+        let (_, other_raw) = crate::value_snark::generate_parameters_os().unwrap();
+        let other = crate::value_snark::SnarkVk::from_vk(&other_raw).unwrap();
+        assert!(verify_note_tx_block_with_snark(
+            &proof_tx,
+            std::slice::from_ref(&spent_out),
+            Some(anchor),
+            Some(&caps),
+            Some(&other),
+        )
+        .is_err());
         // Proof bound to a different cap also fails (cap is public input).
         let mut bad_caps = HashMap::new();
         bad_caps.insert(cmu, n.value + 1);
-        assert!(verify_note_tx_block_with_caps(
+        assert!(verify_note_tx_block_with_snark(
             &proof_tx,
             std::slice::from_ref(&spent_out),
             Some(anchor),
             Some(&bad_caps),
+            Some(&vk),
         )
         .is_err());
         let _ = fee;
@@ -981,8 +1034,10 @@ mod tests {
             v_new: [new_value, 0],
             rcm_new: [new_note.rcm, dummy],
         };
-        let proof = crate::value_snark::prove(transcript, witness).expect("proves");
-        assert!(crate::value_snark::verify(transcript, &proof), "direct verify");
+        let (pk, vk_raw) = crate::value_snark::ephemeral_process_parameters();
+        let vk = crate::value_snark::SnarkVk::from_vk(vk_raw).unwrap();
+        let proof = crate::value_snark::prove(pk, transcript, witness).expect("proves");
+        assert!(crate::value_snark::verify(&vk, transcript, &proof), "direct verify");
         let mut shield = Vec::with_capacity(72);
         shield.extend_from_slice(&fee.to_le_bytes());
         shield.extend_from_slice(&crate::value_snark::field_to_bytes(&transcript.c_new[0]));
@@ -996,11 +1051,21 @@ mod tests {
         ]);
         let mut caps = HashMap::new();
         caps.insert(cmu, n.value);
-        let got_fee = verify_note_tx_block_with_caps(
+        // Without a configured verifying key the shielded spend (whose fee
+        // and new commitments would come from the proof) is rejected.
+        assert!(verify_note_tx_block_with_caps(
             &tx,
             std::slice::from_ref(&spent_out),
             Some(anchor),
             Some(&caps),
+        )
+        .is_err());
+        let got_fee = verify_note_tx_block_with_snark(
+            &tx,
+            std::slice::from_ref(&spent_out),
+            Some(anchor),
+            Some(&caps),
+            Some(&vk),
         )
         .expect("shielded spend verifies");
         assert_eq!(got_fee, fee as i64, "miner fee is the public fee");

@@ -47,6 +47,11 @@ pub struct Node {
     new_txs: Vec<Txid>,
     /// Loaded wallet (`-disablewallet` = None).
     pub wallet: Option<Wallet>,
+    /// Groth16 proving key matching the chain's pinned verifying key, if
+    /// the operator provided one (`snark_pk.bin` in the datadir). Without
+    /// it the wallet builds plain (proof-free) note spends and cannot
+    /// make shielded spends.
+    pub snark_pk: Option<Arc<btc_chain::value_snark::SnarkProvingKey>>,
 }
 
 /// Fee rate used when the estimator has no data (`-fallbackfee`, sat/kvB).
@@ -70,6 +75,7 @@ impl Node {
             new_tips: Vec::new(),
             new_txs: Vec::new(),
             wallet: None,
+            snark_pk: None,
         })
     }
 
@@ -241,6 +247,7 @@ impl Node {
     /// `spendnote`: spends a shielded note by its commitment hex.
     pub fn wallet_spend_note(&mut self, cmu: [u8; 32], amount: i64) -> Result<Txid, String> {
         use btc_chain::notes::{note_commitment, Note};
+        let snark_pk = self.snark_pk.clone();
         let wallet = self.wallet.as_mut().ok_or("wallet disabled")?;
         // Find the pool position + outpoint.
         let position = self
@@ -283,7 +290,7 @@ impl Node {
             .new_script(btc_wallet::ScriptKind::P2wpkh)
             .map_err(wallet_error_message)?;
         let tx = wallet
-            .create_note_spend(outpoint, note.clone(), &record.secret, anchor, position, path, recipient, amount, cap)
+            .create_note_spend(outpoint, note.clone(), &record.secret, anchor, position, path, recipient, amount, cap, snark_pk.as_deref())
             .map_err(wallet_error_message)?;
         let txid = self.submit_tx(tx.clone()).map_err(|e| format!("transaction rejected: {e:?}"))?;
         if let Some(w) = self.wallet.as_mut() {
@@ -296,6 +303,9 @@ impl Node {
     /// only the public fee leaves the pool.
     pub fn wallet_spend_note_shielded(&mut self, cmu: [u8; 32], fee: i64) -> Result<Txid, String> {
         use btc_chain::notes::{note_commitment, Note};
+        let snark_pk = self.snark_pk.clone().ok_or(
+            "no SNARK proving key configured (shielded spends need snark_pk.bin matching the chain's snark_vk)",
+        )?;
         let wallet = self.wallet.as_mut().ok_or("wallet disabled")?;
         let position = self
             .chainstate
@@ -343,6 +353,7 @@ impl Node {
                 path,
                 cap,
                 fee.max(0) as u64,
+                &snark_pk,
             )
             .map_err(wallet_error_message)?;
         let txid = self.submit_tx(tx.clone()).map_err(|e| format!("transaction rejected: {e:?}"))?;

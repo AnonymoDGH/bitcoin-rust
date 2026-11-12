@@ -45,6 +45,9 @@ struct SpecFile {
     allow_min_difficulty_blocks: Option<bool>,
     no_retargeting: Option<bool>,
     ct_enabled: Option<bool>,
+    /// Hex of the compressed Groth16 verifying key (`null`/absent: no
+    /// SNARK proofs are accepted).
+    snark_vk: Option<String>,
     bech32_hrp: Option<String>,
     pubkey_address_prefix: Option<u8>,
     script_address_prefix: Option<u8>,
@@ -129,6 +132,22 @@ pub fn parse_chain_spec(json: &str) -> Result<CustomChainSpec, ChainSpecError> {
     if let Some(flag) = file.ct_enabled {
         spec.ct_enabled = flag;
     }
+    if let Some(hex) = file.snark_vk {
+        let bytes = field_bytes("snark_vk", &hex)?;
+        // Refuse a key that is not a valid verifying key of the value
+        // circuit instead of silently disabling proofs at runtime.
+        if btc_chain::value_snark::vk_from_bytes(&bytes).is_none() {
+            return Err(field_err(
+                "snark_vk",
+                "not a valid compressed Groth16 verifying key for the value circuit",
+            ));
+        }
+        eprintln!(
+            "chainspec: pinned SNARK verifying key sha256={}",
+            btc_chain::value_snark::vk_sha256(&bytes).to_lower_hex_string()
+        );
+        spec.snark_vk = Some(bytes);
+    }
     if let Some(hrp) = file.bech32_hrp {
         spec.bech32_hrp = hrp;
     }
@@ -169,6 +188,7 @@ pub fn example_spec_json() -> String {
         "allow_min_difficulty_blocks": spec.allow_min_difficulty_blocks,
         "no_retargeting": spec.no_retargeting,
         "ct_enabled": spec.ct_enabled,
+        "snark_vk": spec.snark_vk.as_ref().map(|b| b.to_lower_hex_string()),
         "bech32_hrp": spec.bech32_hrp,
         "pubkey_address_prefix": spec.pubkey_address_prefix,
         "script_address_prefix": spec.script_address_prefix,
@@ -245,6 +265,33 @@ mod tests {
     fn example_round_trips_to_default() {
         let parsed = parse_chain_spec(&example_spec_json()).unwrap();
         assert_eq!(parsed, CustomChainSpec::default());
+    }
+
+    #[test]
+    fn snark_vk_is_loaded_validated_and_defaults_to_none() {
+        assert_eq!(CustomChainSpec::default().snark_vk, None);
+        let (_, vk) = btc_chain::value_snark::ephemeral_process_parameters();
+        let bytes = btc_chain::value_snark::vk_to_bytes(vk);
+        let spec = parse_chain_spec(&format!(
+            r#"{{"snark_vk": "{}"}}"#,
+            bytes.to_lower_hex_string()
+        ))
+        .unwrap();
+        assert_eq!(spec.snark_vk.as_deref(), Some(bytes.as_slice()));
+        // Round trips through the example printer.
+        assert_eq!(parse_chain_spec(&example_spec_json()).unwrap().snark_vk, None);
+        // Garbage / truncated keys are refused at load time.
+        assert!(matches!(
+            parse_chain_spec(r#"{"snark_vk": "deadbeef"}"#),
+            Err(ChainSpecError::Field { field: "snark_vk", .. })
+        ));
+        assert!(matches!(
+            parse_chain_spec(&format!(
+                r#"{{"snark_vk": "{}"}}"#,
+                bytes[..bytes.len() - 4].to_lower_hex_string()
+            )),
+            Err(ChainSpecError::Field { field: "snark_vk", .. })
+        ));
     }
 
     #[test]

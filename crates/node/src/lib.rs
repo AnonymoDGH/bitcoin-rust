@@ -4,4 +4,5 @@ pub mod chainspec;
 pub mod config;
 pub mod node;
 pub mod rpc_backend;
+pub mod snark_setup;
 pub mod p2p;

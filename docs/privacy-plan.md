@@ -238,6 +238,46 @@ protects the middle; the edges must be designed for too.
   permutation is simplified (production parameters + `C_new`
   binding remain); multiple new notes per spend are not yet
   supported (conservative single-note rule).
+- **SNARK trusted setup, keys and hash (security fix).** The original
+  prototype derived its Groth16 parameters from the public RNG seed
+  `0xA0C0` and proved with the fixed seed `0xC0FFEE`: the toxic waste
+  was public (any proof forgeable) and proofs were not zero-knowledge.
+  Both are gone. Consensus never creates or trusts a key: it verifies
+  only against `ChainParams::snark_vk` (chain spec `"snark_vk": "<hex>"`,
+  compressed `ark-serialize` verifying key; sha256 is logged at startup
+  and when the spec loads). **With no key configured every SNARK proof is
+  rejected** — a spend that carries `witness[3]` is invalid in
+  ConnectBlock (`verify_note_tx_block_with_snark`) and non-standard in
+  the mempool (`snark-proof-no-vk`); in particular the shielded mode,
+  whose fee and new commitments come from the proof, cannot be used.
+  Plain note spends (no proof) are unaffected and stay bounded by the
+  funding ledger. Provers draw fresh OS randomness for every proof.
+  The value-circuit hash is now real Poseidon over BN254 `Fr`
+  (`ark-crypto-primitives` sponge + R1CS gadget): width 3, S-box `x^5`
+  (a permutation since `gcd(5, p-1) = 1`), 8 full + 57 partial rounds
+  (the paper's 128-bit instance for `t = 3`), constants and Cauchy MDS
+  from the reference Grain-LFSR (`find_poseidon_ark_and_mds`), fixed
+  input lengths and leading domain tags (note digest 1, old commitment 2,
+  new commitment 3). Commitments are now Poseidon commitments
+  (`Poseidon(tag, value, rcm[, cmu])`) instead of the algebraic
+  `v + h(rcm)` stand-in, which was not binding. The circuit also ties
+  `v_old` and `rcm_old` to the Poseidon preimage inputs and range-checks
+  the public fee. A known-answer test pins the parameters (changing them
+  forks consensus).
+  *Setup tooling:* `btc-node -snarksetup=<dir>` runs a **single-party**
+  OS-RNG setup and writes `snark_pk.bin` / `snark_vk.bin` / `snark_vk.hex`
+  (loud warning: that machine saw the toxic waste; development networks
+  only). A node that finds `<datadir>/snark_pk.bin` matching the pinned
+  verifying key uses it for wallet proofs (`spendnote` attaches a proof,
+  `shieldspendnote` requires it).
+  *Ceremony required before mainnet:* run a multi-party Groth16 phase-2
+  ceremony for this exact circuit (e.g. a Powers-of-Tau phase-1 transcript
+  such as the Perpetual / Hermez BN254 ptau, then a circuit-specific
+  phase 2 with many independent contributors, each destroying their
+  randomness, a public random beacon, and published transcript + hash
+  verifiable by anyone); pin the final verifying key hash in the chain
+  spec and in the release notes. Any change to the circuit (including the
+  Poseidon parameters) invalidates the keys and needs a new ceremony.
 - **Remaining limits (honest):** spent note values are transparent
   at spend under the active (hash-note) scheme; onion inbound P2P
   is not supported (outbound SOCKS5 only).
