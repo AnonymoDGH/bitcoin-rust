@@ -174,8 +174,13 @@ pub trait WalletRpc: Send + Sync {
     /// one-time address per sender, so they cannot be linked.
     fn get_stealth_address(&self) -> Result<String, String>;
 
-    /// Scans blocks and the mempool for stealth payments to this wallet:
-    /// transactions carrying a marker output (`OP_RETURN <ephemeral_pub>`)
-    /// whose other outputs match the derived one-time addresses.
+    /// Unspent stealth payments the wallet has received. The wallet scans
+    /// each connected block and mempool transaction for marker outputs
+    /// (`OP_RETURN <ephemeral_pub>`) whose other outputs match its derived
+    /// one-time addresses and imports the recovered keys, so these are
+    /// ordinary wallet coins (balance, `listunspent`, spendable by
+    /// `sendtoaddress`). `spendable` is false while the wallet is locked.
+    /// While locked, payments are queued and credited on unlock.
+    /// `max_blocks` is ignored (kept for RPC compatibility).
     fn list_stealth_utxos(&self, minconf: u32, max_blocks: u32) -> Vec<WalletUtxo>;
 }

@@ -89,6 +89,7 @@ impl Node {
             return;
         }
         update_mempool_for_events(&self.chainstate, &mut self.mempool, &events);
+        let mut reorged: Vec<&[Tx]> = Vec::new();
         for event in &events {
             match event {
                 ChainEvent::BlockConnected { hash, height } => {
@@ -102,11 +103,24 @@ impl Node {
                     }
                     self.new_tips.push(*hash);
                 }
-                ChainEvent::BlockDisconnected { hash, height, .. } => {
+                ChainEvent::BlockDisconnected { hash, height, txs } => {
+                    reorged.push(txs);
                     if let (Some(w), Some(block)) = (self.wallet.as_mut(), self.chainstate.get_block(hash)) {
                         let _ = w.block_disconnected(&block, *height);
                         let prev = block.header.prev_blockhash;
                         let _ = w.set_best_block(prev, height.saturating_sub(1));
+                    }
+                }
+            }
+        }
+        // Transactions of disconnected blocks that went back to the mempool
+        // are unconfirmed wallet transactions again (their coins were dropped
+        // at disconnect). Lowest block first so parents precede children.
+        if let Some(w) = self.wallet.as_mut() {
+            for txs in reorged.into_iter().rev() {
+                for tx in txs.iter().filter(|t| !t.is_coin_base()) {
+                    if self.mempool.contains(&tx.txid()) {
+                        let _ = w.tx_added_to_mempool(tx);
                     }
                 }
             }
@@ -116,8 +130,11 @@ impl Node {
     /// Loads `wallet` and rescans blocks it has not seen (`AttachChain`).
     pub fn attach_wallet(&mut self, mut wallet: Wallet) -> Result<(), WalletError> {
         let cs = &self.chainstate;
+        // A wallet that never scanned for stealth payments (written before
+        // they were imported) rescans the whole chain once.
+        let rescan_stealth = wallet.needs_stealth_rescan();
         let start = match wallet.best_block() {
-            Some((hash, height)) if cs.block_hash_at(height) == Some(hash) => height + 1,
+            Some((hash, height)) if !rescan_stealth && cs.block_hash_at(height) == Some(hash) => height + 1,
             _ => 1,
         };
         for height in start..=cs.height() {
@@ -127,6 +144,9 @@ impl Node {
             }
         }
         wallet.set_best_block(cs.tip_hash(), cs.height())?;
+        if rescan_stealth {
+            wallet.mark_stealth_scanned()?;
+        }
         for entry in self.mempool.sorted_by_fee_rate() {
             wallet.tx_added_to_mempool(&entry.tx)?;
         }
@@ -396,6 +416,14 @@ impl Node {
     /// `ProcessNewBlock` + mempool/fee updates. Ok(true) if new.
     pub fn submit_block(&mut self, block: &Block) -> Result<bool, ValidationError> {
         let result = self.chainstate.process_new_block(block, now_secs());
+        self.after_chain_change();
+        result
+    }
+
+    /// `invalidateblock`: marks `hash` failed and reorganises away from it,
+    /// notifying the wallet of every disconnected and connected block.
+    pub fn invalidate_block(&mut self, hash: &BlockHash) -> Result<(), ValidationError> {
+        let result = self.chainstate.invalidate_block(hash);
         self.after_chain_change();
         result
     }
