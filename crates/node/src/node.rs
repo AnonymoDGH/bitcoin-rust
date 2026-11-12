@@ -89,6 +89,7 @@ impl Node {
             return;
         }
         update_mempool_for_events(&self.chainstate, &mut self.mempool, &events);
+        let mut reorged: Vec<&[Tx]> = Vec::new();
         for event in &events {
             match event {
                 ChainEvent::BlockConnected { hash, height } => {
@@ -102,11 +103,24 @@ impl Node {
                     }
                     self.new_tips.push(*hash);
                 }
-                ChainEvent::BlockDisconnected { hash, height, .. } => {
+                ChainEvent::BlockDisconnected { hash, height, txs } => {
+                    reorged.push(txs);
                     if let (Some(w), Some(block)) = (self.wallet.as_mut(), self.chainstate.get_block(hash)) {
                         let _ = w.block_disconnected(&block, *height);
                         let prev = block.header.prev_blockhash;
                         let _ = w.set_best_block(prev, height.saturating_sub(1));
+                    }
+                }
+            }
+        }
+        // Transactions of disconnected blocks that went back to the mempool
+        // are unconfirmed wallet transactions again (their coins were dropped
+        // at disconnect). Lowest block first so parents precede children.
+        if let Some(w) = self.wallet.as_mut() {
+            for txs in reorged.into_iter().rev() {
+                for tx in txs.iter().filter(|t| !t.is_coin_base()) {
+                    if self.mempool.contains(&tx.txid()) {
+                        let _ = w.tx_added_to_mempool(tx);
                     }
                 }
             }

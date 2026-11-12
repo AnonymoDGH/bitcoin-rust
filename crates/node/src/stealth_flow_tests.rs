@@ -239,8 +239,15 @@ fn reorg_removes_then_restores_stealth_coin() {
     relay(&c, &b, 102..=103);
     assert_eq!(b.rpc.with_node(|n| n.chainstate.height()), 103);
     assert!(approx(balance(&b), 0.0), "coin dropped with its block: {}", balance(&b));
-    assert!(stealth_rows(&b).is_empty());
+    assert!(ok(&b, "liststealthutxos", json!([1])).as_array().unwrap().is_empty());
     assert!(unspent_amounts(&b).is_empty());
+    // The payment tx went back to the mempool and the wallet knows it as
+    // unconfirmed again.
+    let unconfirmed = ok(&b, "liststealthutxos", json!([0]));
+    let unconfirmed = unconfirmed.as_array().unwrap();
+    assert_eq!(unconfirmed.len(), 1, "re-announced: {unconfirmed:?}");
+    assert_eq!(unconfirmed[0]["confirmations"], 0);
+    assert_eq!(unconfirmed[0]["spendable"], false);
 
     // The original branch overtakes again: the payment is re-found.
     mine(&a, 2, &miner(7));
@@ -288,4 +295,24 @@ fn wallet_without_stealth_scan_flag_rescans_chain_on_attach() {
     b.rpc.with_node(|n| n.attach_wallet(Wallet::open(&b.wallet_path).unwrap()).unwrap());
     assert!(approx(balance(&b), 1.0));
     assert_eq!(stealth_rows(&b).len(), 1);
+}
+
+#[test]
+fn dumpprivkey_refuses_stealth_keys_but_exports_normal_ones() {
+    let (a, b) = funded_pair("dump");
+    let stealth = ok(&b, "getnewstealthaddress", json!([]));
+    ok(&a, "sendtostealthaddress", json!([stealth.as_str().unwrap(), 1.0]));
+    mine(&a, 1, &miner(7));
+    relay(&a, &b, 102..=102);
+
+    let rows = stealth_rows(&b);
+    let stealth_coin_addr = rows[0]["address"].as_str().unwrap().to_owned();
+    let reply = call(&b, "dumpprivkey", json!([stealth_coin_addr]));
+    assert!(!reply["error"].is_null(), "must refuse: {reply}");
+    let message = reply["error"]["message"].as_str().unwrap();
+    assert!(message.contains("refusing to export a stealth one-time key"), "{message}");
+
+    let normal = ok(&b, "getnewaddress", json!(["", "legacy"]));
+    let wif = ok(&b, "dumpprivkey", json!([normal]));
+    assert!(!wif.as_str().unwrap().is_empty());
 }

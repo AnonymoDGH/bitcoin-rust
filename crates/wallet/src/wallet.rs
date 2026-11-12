@@ -71,6 +71,8 @@ pub enum WalletError {
     Key(#[from] KeyError),
     #[error(transparent)]
     Stealth(#[from] crate::stealth::StealthError),
+    #[error("refusing to export a stealth one-time key (it reveals the stealth spend key together with the view key)")]
+    StealthKeyExport,
 }
 
 /// How a wallet transaction affects the wallet, as `listtransactions` categorizes it.
@@ -253,7 +255,9 @@ pub struct Wallet {
     unlocked_until: Option<u64>,
     best_block: Option<(BlockHash, u32)>,
     /// Random root of the stealth scan/spend keys (independent of every
-    /// transparent key, so `dumpprivkey` cannot leak stealth funds). `None`
+    /// transparent key). The one-time keys recovered from stealth payments
+    /// are `spending + tweak`, so exporting one would reveal the stealth
+    /// spend key to anyone holding the view key: `dump_wif` refuses them. `None`
     /// for wallets created before the seed existed (legacy derivation from
     /// the first key) or while an encrypted wallet is locked.
     stealth_seed: Option<[u8; 32]>,
@@ -943,6 +947,9 @@ impl Wallet {
     /// WIF of the key that owns `script`. Requires the wallet to be unlocked when encrypted.
     pub fn dump_wif(&self, script: &ScriptBuf) -> Result<String, WalletError> {
         let (id, _) = self.script_index.get(script).ok_or(WalletError::NotMine)?;
+        if self.key_records.get(id).is_some_and(|rec| rec.stealth) {
+            return Err(WalletError::StealthKeyExport);
+        }
         if !self.is_unlocked_at(now_unix()) {
             return Err(WalletError::Locked);
         }
@@ -2688,6 +2695,31 @@ mod tests {
         // Flags and keys persist.
         let reopened = Wallet::open(&file.0).unwrap();
         assert_eq!(reopened.stealth_coins(1, 1).len(), 2);
+    }
+
+    #[test]
+    fn dump_wif_refuses_stealth_one_time_keys_only() {
+        let file = TestFile::new("stealth-dump");
+        let mut wallet = Wallet::create(&file.0).unwrap();
+        let normal = wallet.new_script(ScriptKind::P2wpkh).unwrap();
+        let addr = wallet.stealth_address().unwrap();
+        let p = addr.payment(&crate::stealth::ephemeral_secret().unwrap()).unwrap();
+        let tx = Tx::new(
+            2,
+            vec![TxIn::new(OutPoint::new(Txid::from_byte_array([6; 32]), 0))],
+            vec![
+                TxOut::new(0, crate::stealth::marker_script(&p.ephemeral_pub)),
+                TxOut::new(3_000, p.script_pubkey.clone()),
+            ],
+            0,
+        );
+        connect(&mut wallet, 1, vec![tx]);
+        assert!(wallet.is_mine(&p.script_pubkey));
+        assert!(matches!(
+            wallet.dump_wif(&p.script_pubkey),
+            Err(WalletError::StealthKeyExport)
+        ));
+        assert!(wallet.dump_wif(&normal).is_ok());
     }
 
     #[test]
