@@ -388,8 +388,10 @@ impl Wallet {
     }
 
     /// Builds a confidential spend of wallet-held CT coins: CT inputs are
-    /// authorised by 16-key ring signatures, amounts stay hidden, and a
-    /// balance proof ties inputs to outputs plus the public fee.
+    /// authorised by a Schnorr signature of the owner key (witness
+    /// `[sig, pubkey]`; input 0 additionally leads with the balance
+    /// proof), amounts stay hidden, and a balance proof ties inputs to
+    /// outputs plus the public fee. No sender ambiguity is provided.
     /// Returns the transaction plus blinding records for its outputs.
     pub fn create_ct_spend(
         &mut self,
@@ -401,8 +403,6 @@ impl Wallet {
             create_balance_proof, create_commitment, ct_context, encode_ct_script,
             serialize_balance_proof, with_fee, CtOutputData,
         };
-        use btc_chain::ringsig::sign_ring;
-        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
         if amounts.is_empty() {
             return Err(WalletError::Build("CT spend needs at least one output".into()));
         }
@@ -478,11 +478,8 @@ impl Wallet {
         }
 
         // Witness layout (see verify_ct_tx_block):
-        //   input 0: [balance_proof(73 + fee prefix ignored here), ring_sig, ring_keys]
-        //   input i>0: [ring_sig, ring_keys]
-        // Here the balance proof is embedded in the first witness with the
-        // public fee as the u64 prefix (73 = fee 8 + pub 33 + z 32).
-        let secp = Secp256k1::new();
+        //   input 0: [balance_proof (fee u64 prefix + r_pub 33 + z 32), sig(64), pubkey(33)]
+        //   input i>0: [sig(64), pubkey(33)]
         let mut vin: Vec<TxIn> = Vec::with_capacity(inputs_meta.len());
         for (outpoint, _info, _txout) in &inputs_meta {
             vin.push(TxIn::new(*outpoint));
@@ -494,47 +491,25 @@ impl Wallet {
         let (proof, _) = create_balance_proof(&input_blindings, &output_blindings, fee.max(0) as u64, &context)
             .map_err(|_| WalletError::Build("ct balance failed".into()))?;
         let balance_bytes = with_fee(serialize_balance_proof(&proof), fee.max(0) as u64);
-        for (i, (_outpoint, info, _txout)) in inputs_meta.iter().enumerate() {
-            // Ring: own key plus 15 random decoys.
-            let mut ring = Vec::with_capacity(16);
-            let mut signer_pos = 0usize;
-            for j in 0..16 {
-                if j == 0 {
-                    ring.push(
-                        PublicKey::from_secret_key(
-                            &secp,
-                            &SecretKey::from_slice(&info.secret)
-                                .map_err(|_| WalletError::Build("ct secret invalid".into()))?,
-                        )
-                        .serialize(),
-                    );
-                    signer_pos = 0;
-                } else {
-                    let mut decoy = [0u8; 32];
-                    getrandom::getrandom(&mut decoy)
-                        .map_err(|_| WalletError::Build("ct decoy failed".into()))?;
-                    let decoy_sk = SecretKey::from_slice(&decoy)
-                        .map_err(|_| WalletError::Build("ct decoy invalid".into()))?;
-                    ring.push(PublicKey::from_secret_key(&secp, &decoy_sk).serialize());
-                }
-            }
-            let sig = sign_ring(&context, &ring, signer_pos, &info.secret)
-                .map_err(|_| WalletError::Build("ct ring sign failed".into()))?;
-            let mut keys_bytes = Vec::with_capacity(16 * 33);
-            for key in &ring {
-                keys_bytes.extend_from_slice(key);
-            }
+        for (i, (_outpoint, info, txout)) in inputs_meta.iter().enumerate() {
+            // Owner authorisation: BIP340 Schnorr signature by the key whose
+            // hash160 is the spent output's pubkey_hash.
+            let sighash = btc_chain::confidential::ct_input_sighash(
+                &context,
+                i,
+                txout.script_pubkey.as_bytes(),
+            );
+            let (sig, pubkey) = btc_chain::confidential::sign_ct_input(&sighash, &info.secret)
+                .map_err(|_| WalletError::Build("ct input sign failed".into()))?;
             if i == 0 {
                 tx.vin[i].witness = bitcoin::Witness::from_slice(&[
                     balance_bytes.clone(),
-                    btc_chain::confidential::serialize_ring_sig(&sig),
-                    keys_bytes,
+                    sig.to_vec(),
+                    pubkey.to_vec(),
                 ]);
             } else {
-                tx.vin[i].witness = bitcoin::Witness::from_slice(&[
-                    btc_chain::confidential::serialize_ring_sig(&sig),
-                    keys_bytes,
-                ]);
+                tx.vin[i].witness =
+                    bitcoin::Witness::from_slice(&[sig.to_vec(), pubkey.to_vec()]);
             }
         }
         let outpoints: Vec<OutPoint> = (0..tx.vout.len() as u32)
@@ -2031,7 +2006,7 @@ mod tests {
         fill(&mut wallet, 2, 101);
 
         // Shield 40 coins with the wallet, record the CT coin, then spend
-        // 30 of them with a ring signature.
+        // 30 of them with an owner signature.
         let (shield_tx, shield_info, shield_op) =
             wallet.create_hybrid_ct(101, 40_00000000, 10_000).unwrap();
         wallet
@@ -2045,7 +2020,22 @@ mod tests {
         let spent = [TxOut::new(0, shield_tx.vout[0].script_pubkey.clone())];
         let check = |_tx: &Tx, _spent: &[TxOut], _indices: &[usize]| -> Result<(), btc_chain::ValidationError> { Ok(()) };
         btc_chain::confidential::verify_ct_tx_block(&tx, &spent, &check)
-            .expect("CT spend with ring signature must verify");
+            .expect("CT spend with owner Schnorr signature must verify");
+        // Layout: input 0 = [balance, sig(64), pubkey(33)].
+        let items: Vec<Vec<u8>> = tx.vin[0].witness.iter().map(|w| w.to_vec()).collect();
+        assert_eq!(items.len(), 3);
+        assert_eq!((items[1].len(), items[2].len()), (64, 33));
+        // A signature by someone else's key must be rejected.
+        let mut stolen = tx.clone();
+        let mut forged = items.clone();
+        let sighash = btc_chain::confidential::ct_input_sighash(
+            &btc_chain::confidential::ct_context(&stolen),
+            0,
+            spent[0].script_pubkey.as_bytes(),
+        );
+        forged[1] = btc_chain::confidential::sign_ct_input(&sighash, &[9u8; 32]).unwrap().0.to_vec();
+        stolen.vin[0].witness = bitcoin::Witness::from_slice(&forged);
+        assert!(btc_chain::confidential::verify_ct_tx_block(&stolen, &spent, &check).is_err());
     }
 
     #[test]

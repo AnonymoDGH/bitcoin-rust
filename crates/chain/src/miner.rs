@@ -614,7 +614,7 @@ mod tests {
     fn miner_includes_ct_spend_and_pays_public_fee() {
         use crate::confidential::{
             create_balance_proof, create_commitment, ct_context, ct_public_fee, encode_ct_script,
-            encode_shield_marker, is_ct_tx, serialize_balance_proof, serialize_ring_sig,
+            encode_shield_marker, is_ct_tx, serialize_balance_proof,
             with_fee, CtOutputData,
         };
         use crate::mempool_accept::accept_to_mempool;
@@ -673,6 +673,7 @@ mod tests {
             ScriptBuf::from_bytes(encode_shield_marker(&r_in, &balance)),
         );
         let shield_id = shield_tx.txid();
+        let shield_out_script = shield_tx.vout[0].script_pubkey.clone();
         assert_eq!(ct_public_fee(&shield_tx), shield_fee);
         let mut pool = Mempool::new(100);
         pool.add(pool_entry(shield_tx, shield_fee as i64)).unwrap();
@@ -707,16 +708,37 @@ mod tests {
         let context = ct_context(&ct_tx);
         let (proof2, _) = create_balance_proof(&[r_out], &[r2_out], ct_fee, &context).unwrap();
         let balance2 = with_fee(serialize_balance_proof(&proof2), ct_fee);
-        let sig = crate::ringsig::sign_ring(&context, &pubs, own, &secrets[own]).unwrap();
-        let mut ring_bytes = Vec::new();
-        for key in &pubs {
-            ring_bytes.extend_from_slice(key);
-        }
+        // Owner authorisation: Schnorr sig over the per-input CT digest of
+        // the shield output being spent; witness [balance, sig, pubkey].
+        let spent_script = shield_out_script.clone();
+        let sighash = crate::confidential::ct_input_sighash(&context, 0, spent_script.as_bytes());
+        let (sig, pubkey) = crate::confidential::sign_ct_input(&sighash, &secrets[own]).unwrap();
+        assert_eq!(pubkey, pubs[own]);
         ct_tx.vin[0].witness =
-            Witness::from_slice(&[balance2, serialize_ring_sig(&sig), ring_bytes]);
+            Witness::from_slice(&[balance2, sig.to_vec(), pubkey.to_vec()]);
         let ct_id = ct_tx.txid();
         assert_eq!(ct_public_fee(&ct_tx), ct_fee);
         let _ = is_ct_tx(&ct_tx, &[]);
+        // Theft attempt through the mempool: attacker signs with his own
+        // key and presents either his pubkey or the owner's; both rejected.
+        let (atk_secret, atk_pub) = {
+            let mut buf = [0u8; 32];
+            buf[0] = 99;
+            buf[31] = 5;
+            let pk = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&buf).unwrap()).serialize();
+            (buf, pk)
+        };
+        for presented in [atk_pub, pubs[own]] {
+            let mut stolen = ct_tx.clone();
+            let ctx = ct_context(&stolen);
+            let sh = crate::confidential::ct_input_sighash(&ctx, 0, spent_script.as_bytes());
+            let (bad_sig, _) = crate::confidential::sign_ct_input(&sh, &atk_secret).unwrap();
+            let balance_item = stolen.vin[0].witness.iter().next().unwrap().to_vec();
+            stolen.vin[0].witness =
+                Witness::from_slice(&[balance_item, bad_sig.to_vec(), presented.to_vec()]);
+            let mut p = Mempool::new(100);
+            assert!(accept_to_mempool(&cs, &mut p, stolen).is_err(), "theft must not enter mempool");
+        }
         let mut pool = Mempool::new(100);
         accept_to_mempool(&cs, &mut pool, ct_tx)
             .expect("all-CT spend accepted to mempool");
