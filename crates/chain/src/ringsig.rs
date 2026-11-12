@@ -14,6 +14,19 @@
 //! - Verification recomputes every `L_i = z_i*G - c_i*P_i` and checks
 //!   `sum(c_i) == H(message || L_0 || ... || L_15)`.
 //!
+//! # NOT consensus authorisation
+//!
+//! This is library code for a future Monero-style design. A ring
+//! signature proves knowledge of the secret of SOME ring member and
+//! binds to no particular owner, so it MUST NOT be used to authorise
+//! spending an output that explicitly names its owner (that was the
+//! CT theft bug: attacker ring = victim key + attacker key, signed by
+//! the attacker). It also has no key image, hence no double-spend
+//! detection. CT inputs are authorised by an owner Schnorr signature
+//! (`confidential::verify_ct_input_auth`). A sound ring design needs
+//! inputs that reference a ring of outputs, a linkable scheme
+//! (LSAG/CLSAG) and a key-image registry; see `docs/privacy-plan.md`.
+//!
 //! Fixed ring size matters: variable sizes leak how many decoys a
 //! signer bothered to add, which shrinks the anonymity set.
 

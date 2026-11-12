@@ -85,7 +85,7 @@ protects the middle; the edges must be designed for too.
 - Amounts remain visible in this phase (documented limitation);
   the address graph is already broken.
 
-### Phase 2 - hidden amounts and ambiguous sender (implemented, consensus-active)
+### Phase 2 - hidden amounts (implemented, consensus-active; sender ambiguity NOT provided)
 - **Confidential Transactions**: Pedersen commitments `C(v,r) = v*G + r*H`
   (`H = SHA256("AnonCoin-H-v1")*G`) with 64-bit range proofs (binary
   Schnorr disjunctions) and Schnorr balance proofs proving
@@ -93,7 +93,7 @@ protects the middle; the edges must be designed for too.
   Activated in consensus behind the `ct_enabled` chain parameter
   (`-chainspec` field, on for AnonCoin): `ConnectBlock` and
   `AcceptToMemoryPool` verify CT transactions (range proofs, balance
-  proof, per-input ring signatures), CT outputs are spendable UTXOs
+  proof, per-input owner signatures), CT outputs are spendable UTXOs
   (value 0 in the ledger), and the CT output script
   `OP_RETURN 0x01 <commitment> <pubkey_hash> <range_proof>` is defined
   in `crates/chain/src/confidential.rs`.
@@ -105,9 +105,41 @@ protects the middle; the edges must be designed for too.
   proof in a shield marker (`OP_RETURN 0x51 | r_in | balance`, 106-byte
   payload; the CT context zeroes its balance bytes, breaking the
   fixed-point), and runs script checks only for plaintext inputs.
-  wallet `create_ct_spend`) are authorised by 16-key ring
-  signatures over the on-chain keys. First CT liquidity therefore
-  enters via the wallet shield itself.
+  wallet `create_ct_spend`) are authorised by an **owner signature**
+  (see below). First CT liquidity therefore enters via the wallet
+  shield itself.
+- **CT input authorisation (fixed, was a critical bug).** A CT input
+  names its prevout explicitly, and that prevout's script embeds the
+  owner's `pubkey_hash`. The first implementation additionally asked
+  for a 16-key ring signature over keys listed in the witness, accepting
+  it when exactly one ring key hashed to the `pubkey_hash`. That was
+  unsound: a ring signature proves knowledge of the secret of *some*
+  ring member, not of the owner, so an attacker could list the
+  victim's (public) key plus his own among 16 keys, sign with his own
+  key, and spend any CT output (given the output's blinding for the
+  balance proof, which e.g. the original sender knows). Consensus now requires a BIP340 Schnorr
+  signature by the key whose `hash160` equals the spent output's
+  `pubkey_hash`, over `ct_input_sighash = SHA256(tag || ct_context ||
+  input_index || len || spent_script)`. `ct_context` commits to the
+  version, locktime, every input outpoint and sequence and every output
+  (scriptSigs and witnesses stripped, shield-marker balance bytes
+  zeroed because the balance proof, itself bound to `ct_context`,
+  carries them); the sighash additionally binds the input slot and the
+  exact spent output, so signatures cannot be replayed onto another
+  transaction, input or output. Witness layout: input 0 is
+  `[balance_proof, sig(64), pubkey(33)]`, every other CT input is
+  `[sig(64), pubkey(33)]`; item counts and sizes are exact. Ring
+  signatures (`ringsig.rs`) are retained as library code only and are
+  not accepted by consensus. Tests: theft variants rejected, owner spend
+  accepted, wrong pubkey / wrong signature / replay to another tx / wrong
+  input slot rejected, at the `verify_ct_tx_block`, `ConnectBlock` and
+  mempool level.
+- **Sender ambiguity is NOT provided.** Because inputs name their
+  prevout explicitly, observers see exactly which output is spent;
+  hidden amounts are the only privacy gained by CT today. The ring
+  that used to be in the witness hid nothing (the prevout was already
+  public) and has been removed. Receiver unlinkability still comes from
+  stealth/one-time addresses, not from CT inputs.
 - **Shielded pool active in consensus** (`crates/chain/src/notes.rs` +
   `Chainstate`): pool note outputs (`OP_RETURN 0x02 <cmu>`) are inserted
   into the commitment tree by `refresh_pool()` on every activation and
@@ -146,7 +178,7 @@ protects the middle; the edges must be designed for too.
   ConnectBlock, mempool entry fees and the block assembler all use
   the prefix fee. Covered end to end by
   `miner_includes_ct_spend_and_pays_public_fee` (shield at 102,
-  all-CT ring spend at 103, coinbase = subsidy + prefix fee).
+  all-CT owner-signed spend at 103, coinbase = subsidy + prefix fee).
 - **SNARK layer (prototype, `crates/chain/src/value_snark.rs`).**
   Groth16/BN254 value-hiding circuit over the pool note definition:
   proves `C_old` opens, `v_old = v_new0 + v_new1 + fee`, values in
@@ -195,6 +227,27 @@ protects the middle; the edges must be designed for too.
   at spend under the active (hash-note) scheme; onion inbound P2P
   is not supported (outbound SOCKS5 only).
 
+#### Future work: real sender ambiguity (Monero-style)
+Needed to actually hide the sender, none of it implemented yet:
+1. Inputs must not name one prevout but reference a **ring of outputs**
+   (fixed size, e.g. 16, chosen from the UTXO set with a sound decoy
+   distribution), each with its one-time public key and amount
+   commitment.
+2. A linkable ring signature (LSAG, or CLSAG which also proves the
+   pseudo-output commitment differs from the real input commitment by a
+   commitment to zero) with a **key image** `I = x * Hp(P)`; the
+   amount side uses pseudo-output commitments so the balance proof does
+   not reveal which ring member is spent.
+3. A **key-image registry** in the chainstate (insert on connect, remove
+   on disconnect, checked in the mempool and across a block) to detect
+   double spends; this replaces the "prevout is spent" rule for these
+   inputs.
+4. Strictly consensus-checked ring composition (distinct members, valid
+   outputs, coinbase maturity) and wallet-side decoy selection, plus
+   one-time-key outputs so the key image cannot be linked to a public
+   address. `ringsig.rs` is the starting point for the non-linkable
+   core only; it lacks key images and the commitment layer.
+
 ### Phase 3 — shielded pool
 **Implemented now (pre-zk milestone):** `crates/chain/src/notes.rs` —
 notes with `cmu = SHA256("AnonCoin-NOTE-v1" || pub || value || rcm)`,
@@ -233,7 +286,7 @@ inbound P2P.
 | Stealth addresses + scan | `btc-wallet` (`stealth.rs`) | done in Phase 1 first step |
 | CoinJoin coordination | `btc-wallet` / `btc-network` | P2P rounds, fixed sizes |
 | Relay privacy | `btc-network` / `btc-node` | Tor, Dandelion++, cover traffic |
-| Confidential amounts + rings | `btc-consensus` / `btc-chain` | new validity rules + proofs |
+| Confidential amounts (rings: future work) | `btc-consensus` / `btc-chain` | new validity rules + proofs |
 | Shielded notes + zk | `btc-chain` / `btc-wallet` | notes, nullifiers, view keys |
 | RPC | `btc-rpc` / `btc-node` | `getnewstealthaddress`, `shielded_transfer` |
 

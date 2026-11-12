@@ -168,7 +168,7 @@ pub fn connect_block(
             return Err(ValidationError::BadBlkSigops);
         }
 
-        // Confidential transactions are authorised by ring signatures and
+        // Confidential transactions are authorised by owner Schnorr signatures and
         // CT balance/range proofs, not by scriptPubKey execution.
         let mut is_ct = false;
         if params.ct_enabled && !is_coinbase {
@@ -622,15 +622,16 @@ mod tests {
         r_out: [u8; 32],
         value_in: u64,
         value_out: u64,
+        in_script: &ScriptBuf,
         tamper: bool,
     ) -> Tx {
         use crate::confidential::{
             create_balance_proof, create_commitment, ct_context, encode_ct_script,
-            serialize_balance_proof, serialize_ring_sig, with_fee, CtOutputData,
+            serialize_balance_proof, with_fee, CtOutputData,
         };
         use bitcoin::Witness;
         use bitcoin_hashes::Hash as _;
-        let in_c = create_commitment(value_in, r_in).unwrap();
+        let _ = value_in;
         let out_c = create_commitment(value_out, r_out).unwrap();
         let out_data = CtOutputData {
             commitment: out_c.commitment,
@@ -647,14 +648,12 @@ mod tests {
         if tamper {
             proof_bytes[10] ^= 1;
         }
-        let sig = crate::ringsig::sign_ring(&context, ring, signer, secret).unwrap();
-        let mut ring_keys_bytes = Vec::new();
-        for key in ring {
-            ring_keys_bytes.extend_from_slice(key);
-        }
-        let witness = Witness::from_slice(&[proof_bytes, serialize_ring_sig(&sig), ring_keys_bytes]);
+        // Owner authorisation: Schnorr sig by `ring[signer]` (the owner key)
+        // over the per-input CT digest; witness [balance, sig, pubkey].
+        let sighash = crate::confidential::ct_input_sighash(&context, 0, in_script.as_bytes());
+        let (sig, pubkey) = crate::confidential::sign_ct_input(&sighash, secret).unwrap();
+        let witness = Witness::from_slice(&[proof_bytes, sig.to_vec(), pubkey.to_vec()]);
         tx.vin[0].witness = witness;
-        let _ = in_c;
         tx
     }
 
@@ -690,6 +689,7 @@ mod tests {
             pubkey_hash: own_hash20,
             proof: in_c.proof,
         };
+        let in_script = encode_ct_script(&in_data).unwrap();
         let coin_outpoint = OutPoint {
             txid: bitcoin::Txid::from_slice(&[99u8; 32]).unwrap(),
             vout: 0,
@@ -697,7 +697,7 @@ mod tests {
         f.base.batch_write(vec![(
             coin_outpoint,
             Some(Coin {
-                txout: TxOut::new(0, encode_ct_script(&in_data).unwrap()),
+                txout: TxOut::new(0, in_script.clone()),
                 height: 1,
                 is_coinbase: false,
             }),
@@ -712,6 +712,7 @@ mod tests {
             r_out,
             5_00000000,
             4_99990000,
+            &in_script,
             false,
         );
         let height = f.tree.get(f.tip).height + 1;
@@ -753,6 +754,7 @@ mod tests {
             pubkey_hash: own_hash20,
             proof: in_c.proof,
         };
+        let in_script = encode_ct_script(&in_data).unwrap();
         let coin_outpoint = OutPoint {
             txid: bitcoin::Txid::from_slice(&[88u8; 32]).unwrap(),
             vout: 0,
@@ -760,7 +762,7 @@ mod tests {
         f.base.batch_write(vec![(
             coin_outpoint,
             Some(Coin {
-                txout: TxOut::new(0, encode_ct_script(&in_data).unwrap()),
+                txout: TxOut::new(0, in_script.clone()),
                 height: 1,
                 is_coinbase: false,
             }),
@@ -775,6 +777,7 @@ mod tests {
             [44u8; 32],
             5_00000000,
             4_99990000,
+            &in_script,
             true,
         );
         let height = f.tree.get(f.tip).height + 1;
@@ -784,5 +787,54 @@ mod tests {
             connect(&mut f.base, &f.tree, &params, id, &block).unwrap_err(),
             ValidationError::BadCt
         );
+    }
+    #[test]
+    fn ct_tx_signed_by_non_owner_is_rejected_in_block() {
+        use crate::confidential::{create_commitment, encode_ct_script, CtOutputData};
+        use btc_validation::coins::Coin;
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let mut f = Fixture::new(1);
+        let mut params = f.params.clone();
+        params.ct_enabled = true;
+        let secp = Secp256k1::new();
+        let key = |i: u8| {
+            let mut buf = [0u8; 32];
+            buf[0] = i;
+            buf[31] = 5;
+            let sk = SecretKey::from_slice(&buf).unwrap();
+            (buf, PublicKey::from_secret_key(&secp, &sk).serialize())
+        };
+        let (_vs, victim_pub) = key(1);
+        let (attacker_secret, attacker_pub) = key(2);
+        let r_in = [31u8; 32];
+        let in_c = create_commitment(5_00000000u64, r_in).unwrap();
+        let mut victim_hash = [0u8; 20];
+        victim_hash.copy_from_slice(&bitcoin_hashes::hash160::Hash::hash(&victim_pub).to_byte_array()[..20]);
+        let in_script = encode_ct_script(&CtOutputData {
+            commitment: in_c.commitment,
+            pubkey_hash: victim_hash,
+            proof: in_c.proof,
+        })
+        .unwrap();
+        let coin_outpoint = OutPoint {
+            txid: bitcoin::Txid::from_slice(&[77u8; 32]).unwrap(),
+            vout: 0,
+        };
+        f.base.batch_write(vec![(
+            coin_outpoint,
+            Some(Coin { txout: TxOut::new(0, in_script.clone()), height: 1, is_coinbase: false }),
+        )]);
+        // Attacker ring = victim + attacker (legacy theft shape); the signer
+        // is the attacker, whose pubkey does not hash to the owner hash.
+        let ring = vec![victim_pub, attacker_pub];
+        let tx = ct_tx(coin_outpoint, &ring, 1, &attacker_secret, r_in, [44u8; 32], 5_00000000, 4_99990000, &in_script, false);
+        let height = f.tree.get(f.tip).height + 1;
+        let cb = coinbase_tx(height, f.params.block_subsidy(height) + 10_000);
+        let (id, block) = next_block(&mut f.tree, f.tip, vec![cb, tx], height);
+        assert_eq!(
+            connect(&mut f.base, &f.tree, &params, id, &block).unwrap_err(),
+            ValidationError::BadCt
+        );
+        assert!(f.base.get_coin(&coin_outpoint).is_some(), "victim coin untouched");
     }
 }

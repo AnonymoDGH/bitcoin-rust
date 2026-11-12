@@ -734,14 +734,94 @@ pub fn is_ct_tx(
         || !shield_markers(tx).is_empty()
 }
 
+/// Domain tag of the per-input CT authorisation digest.
+const TAG_CT_INPUT_AUTH: &[u8] = b"AnonCoin-CT-INPUT-AUTH-v1";
+
+/// Digest signed by the owner of one CT input:
+/// `SHA256(tag || ct_context(tx) || input_index(4 LE) || len(script)(4 LE) || prevout_script)`.
+///
+/// `ct_context` already commits to version, locktime, every input outpoint
+/// and sequence, and every output script/value (shield-marker balance
+/// bytes zeroed, which breaks the proof fixed-point but are covered by the
+/// balance proof, itself bound to the same context). On top of it the
+/// digest binds the input index (a signature cannot be moved to another
+/// input slot) and the full spent script (commitment + pubkey_hash), so the
+/// signature is tied to exactly the output being spent.
+pub fn ct_input_sighash(
+    context: &[u8; 32],
+    input_index: usize,
+    spent_script: &[u8],
+) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(TAG_CT_INPUT_AUTH.len() + 32 + 8 + spent_script.len());
+    buf.extend_from_slice(TAG_CT_INPUT_AUTH);
+    buf.extend_from_slice(context);
+    buf.extend_from_slice(&(input_index as u32).to_le_bytes());
+    buf.extend_from_slice(&(spent_script.len() as u32).to_le_bytes());
+    buf.extend_from_slice(spent_script);
+    sha256::Hash::hash(&buf).to_byte_array()
+}
+
+/// Signs a CT input digest with the owner secret (BIP340 Schnorr,
+/// deterministic nonce). Returns the 64-byte signature and the 33-byte
+/// compressed pubkey to place in the witness.
+pub fn sign_ct_input(
+    sighash: &[u8; 32],
+    secret: &[u8; 32],
+) -> Result<([u8; 64], [u8; 33]), CtError> {
+    use bitcoin::secp256k1::{Keypair, Message};
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(secret).map_err(|_| CtError::BadScalar)?;
+    let keypair = Keypair::from_secret_key(&secp, &sk);
+    let msg = Message::from_digest(*sighash);
+    let sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+    Ok((
+        *sig.as_ref(),
+        PublicKey::from_secret_key(&secp, &sk).serialize(),
+    ))
+}
+
+/// Verifies one CT input authorisation. Witness layout (documented
+/// consensus format): input 0 is `[balance_proof, sig(64), pubkey(33)]`,
+/// every other CT input is `[sig(64), pubkey(33)]`. Requirements:
+/// exact item count and sizes, `hash160(pubkey) == pubkey_hash` of the
+/// spent output, and a valid BIP340 signature by that key over
+/// [`ct_input_sighash`].
+pub fn verify_ct_input_auth(
+    witness: &[&[u8]],
+    input_index: usize,
+    pubkey_hash: &[u8; 20],
+    sighash: &[u8; 32],
+) -> Result<(), CtError> {
+    use bitcoin::secp256k1::{schnorr::Signature, Message};
+    let (sig_pos, key_pos, expected_len) = if input_index == 0 { (1, 2, 3) } else { (0, 1, 2) };
+    if witness.len() != expected_len {
+        return Err(CtError::BalanceProof);
+    }
+    let pubkey: [u8; 33] = witness[key_pos].try_into().map_err(|_| CtError::BalanceProof)?;
+    let hash160 = bitcoin_hashes::hash160::Hash::hash(&pubkey).to_byte_array();
+    if &hash160[..20] != pubkey_hash.as_slice() {
+        return Err(CtError::BalanceProof);
+    }
+    let full = PublicKey::from_slice(&pubkey).map_err(|_| CtError::BadPoint)?;
+    let (xonly, _) = full.x_only_public_key();
+    let sig = Signature::from_slice(witness[sig_pos]).map_err(|_| CtError::BalanceProof)?;
+    let secp = Secp256k1::verification_only();
+    secp.verify_schnorr(&sig, &Message::from_digest(*sighash), &xonly)
+        .map_err(|_| CtError::BalanceProof)
+}
+
 /// Full chain-level CT verification for one transaction.
 ///
 /// Rules:
 /// - every output is CT, or a plaintext output only when the transaction
 ///   also spends a plaintext input (hybrid shielding spend),
 /// - range proofs for CT inputs and outputs verify,
-/// - CT inputs are authorised by a valid ring signature whose ring
-///   contains the pubkey hashing to the embedded pubkey_hash,
+/// - CT inputs are authorised by a BIP340 Schnorr signature made by the
+///   OWNER key, i.e. the 33-byte pubkey whose hash160 equals the spent
+///   output's `pubkey_hash`, over [`ct_input_sighash`] (see
+///   [`verify_ct_input_auth`]). Ring signatures are NOT accepted as
+///   authorisation: a ring signature only proves knowledge of the secret
+///   of SOME member and cannot bind to the named owner,
 /// - plaintext inputs are authorised by ordinary script execution
 ///   (scriptSig) and carry their blinding in `witness[0]` so the
 ///   verifier rebuilds `v*G + r*H` for them,
@@ -811,41 +891,15 @@ pub fn verify_ct_tx_block(
     }
 
     let context = ct_context(tx);
-    // Ring signature per CT input.
+    // Owner authorisation per CT input: Schnorr signature by the key whose
+    // hash160 is the spent output's pubkey_hash (NOT a ring signature).
     for (i, input) in tx.vin.iter().enumerate() {
         let Some(hash) = input_key_hashes[i] else {
             continue;
         };
         let stack: Vec<&[u8]> = input.witness.iter().collect();
-        // input 0: [balance, ring_sig, ring_keys]; others: [ring_sig, ring_keys]
-        let (sig_pos, keys_pos) = if i == 0 { (1, 2) } else { (0, 1) };
-        let ring_keys: Vec<[u8; 33]> = stack
-            .get(keys_pos)
-            .and_then(|data| {
-                data.chunks_exact(33)
-                    .map(|chunk| chunk.try_into().ok())
-                    .collect::<Option<Vec<[u8; 33]>>>()
-            })
-            .unwrap_or_default();
-        if ring_keys.len() != crate::ringsig::RING_SIZE {
-            return Err(CtError::BalanceProof);
-        }
-        let Some(sig_bytes) = stack.get(sig_pos) else {
-            return Err(CtError::BalanceProof);
-        };
-        let sig = deserialize_ring_sig(sig_bytes).ok_or(CtError::BalanceProof)?;
-        let matches: Vec<_> = ring_keys
-            .iter()
-            .filter(|key| {
-                let hash160 = bitcoin_hashes::hash160::Hash::hash(*key);
-                &hash160.to_byte_array()[..20] == hash.as_slice()
-            })
-            .collect();
-        if matches.len() != 1 {
-            return Err(CtError::BalanceProof);
-        }
-        crate::ringsig::verify_ring(&context, &ring_keys, &sig)
-            .map_err(|_| CtError::BalanceProof)?;
+        let sighash = ct_input_sighash(&context, i, spent_outs[i].script_pubkey.as_bytes());
+        verify_ct_input_auth(&stack, i, &hash, &sighash)?;
     }
 
     // Plaintext inputs: ordinary script execution (scriptSig).
@@ -902,57 +956,204 @@ mod tests {
         assert!(!is_ct_script(&ScriptBuf::from_bytes(vec![0x6a]).as_bytes()));
     }
 
+    fn test_key(i: u8) -> ([u8; 32], [u8; 33]) {
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let mut buf = [0u8; 32];
+        buf[0] = i;
+        buf[31] = 5;
+        let sk = SecretKey::from_slice(&buf).unwrap();
+        (buf, PublicKey::from_secret_key(&secp, &sk).serialize())
+    }
+
+    fn hash20(pubkey: &[u8; 33]) -> [u8; 20] {
+        let mut out = [0u8; 20];
+        out.copy_from_slice(&bitcoin_hashes::hash160::Hash::hash(pubkey).to_byte_array()[..20]);
+        out
+    }
+
+    /// One CT output owned by `owner_hash`, worth 5 coins with blinding `R_IN`.
+    const R_IN: [u8; 32] = [11u8; 32];
+    const R_OUT: [u8; 32] = [22u8; 32];
+
+    fn victim_output(owner_hash: [u8; 20]) -> btc_primitives::TxOut {
+        let in_c = create_commitment(5_00000000u64, R_IN).unwrap();
+        btc_primitives::TxOut::new(
+            0,
+            encode_ct_script(&CtOutputData {
+                commitment: in_c.commitment,
+                pubkey_hash: owner_hash,
+                proof: in_c.proof,
+            })
+            .unwrap(),
+        )
+    }
+
+    /// Unsigned 1-in-1-out CT tx paying `to_hash` (prevout txid seed
+    /// selects the outpoint, `value_out` is the hidden output amount).
+    fn unsigned_ct_tx(to_hash: [u8; 20], seed: u8, value_out: u64) -> btc_primitives::Tx {
+        let out_c = create_commitment(value_out, R_OUT).unwrap();
+        let out_script = encode_ct_script(&CtOutputData {
+            commitment: out_c.commitment,
+            pubkey_hash: to_hash,
+            proof: out_c.proof,
+        })
+        .unwrap();
+        let prevout = btc_primitives::OutPoint {
+            txid: bitcoin::Txid::from_slice(&[seed; 32]).unwrap(),
+            vout: 0,
+        };
+        btc_primitives::Tx::new(
+            2,
+            vec![btc_primitives::TxIn::new(prevout)],
+            vec![btc_primitives::TxOut::new(0, out_script)],
+            0,
+        )
+    }
+
+    /// Witness `[balance, sig, pubkey]` for input 0 of `tx`, signing the
+    /// input digest with `signer` and presenting `pubkey`.
+    fn auth_witness(
+        tx: &btc_primitives::Tx,
+        spent: &btc_primitives::TxOut,
+        signer: &[u8; 32],
+        pubkey: &[u8; 33],
+    ) -> bitcoin::Witness {
+        let context = ct_context(tx);
+        let (proof, _) = create_balance_proof(&[R_IN], &[R_OUT], 10_000, &context).unwrap();
+        let sighash = ct_input_sighash(&context, 0, spent.script_pubkey.as_bytes());
+        let (sig, _) = sign_ct_input(&sighash, signer).unwrap();
+        bitcoin::Witness::from_slice(&[
+            with_fee(serialize_balance_proof(&proof), 10_000),
+            sig.to_vec(),
+            pubkey.to_vec(),
+        ])
+    }
+
+    fn accepts(tx: &btc_primitives::Tx, spent: &btc_primitives::TxOut) -> bool {
+        verify_ct_tx_block(tx, &[spent.clone()], &|_t, _s, _i| Ok(())).is_ok()
+    }
+
     #[test]
     fn ct_tx_block_verify_end_to_end() {
+        let (owner_secret, owner_pub) = test_key(3);
+        let spent = victim_output(hash20(&owner_pub));
+        let mut tx = unsigned_ct_tx([7u8; 20], 99, 4_99990000);
+        tx.vin[0].witness = auth_witness(&tx, &spent, &owner_secret, &owner_pub);
+        assert!(decode_ct_script(spent.script_pubkey.as_bytes()).is_some());
+        assert!(accepts(&tx, &spent), "owner spend must be accepted");
+    }
+
+    /// Former critical bug: a ring signature proves knowledge of the secret
+    /// of SOME ring member, so an attacker could put the victim's pubkey
+    /// plus his own key in a ring and sign with his own key. All variants
+    /// of the attack must now be rejected.
+    #[test]
+    fn theft_via_ring_membership_is_rejected() {
         use crate::ringsig::sign_ring;
-        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
-        use bitcoin::Witness;
-        let secp = Secp256k1::new();
-        let mut secrets = Vec::new();
-        let mut pubs: Vec<[u8; 33]> = Vec::new();
-        for i in 1..=16u8 {
-            let mut buf = [0u8; 32];
-            buf[0] = i;
-            buf[31] = 5;
-            let sk = SecretKey::from_slice(&buf).unwrap();
-            secrets.push(buf);
-            pubs.push(PublicKey::from_secret_key(&secp, &sk).serialize());
-        }
-        let own = 3usize;
-        let r_in = [11u8; 32];
-        let r_out = [22u8; 32];
-        let in_c = create_commitment(5_00000000u64, r_in).unwrap();
-        let own_hash = bitcoin_hashes::hash160::Hash::hash(&pubs[own]).to_byte_array();
-        let mut own_hash20 = [0u8; 20];
-        own_hash20.copy_from_slice(&own_hash[..20]);
-        let in_data = CtOutputData { commitment: in_c.commitment, pubkey_hash: own_hash20, proof: in_c.proof };
-        let in_script = encode_ct_script(&in_data).unwrap();
-        let out_c = create_commitment(4_99990000u64, r_out).unwrap();
-        let out_data = CtOutputData { commitment: out_c.commitment, pubkey_hash: [7u8; 20], proof: out_c.proof };
-        let out_script = encode_ct_script(&out_data).unwrap();
-        let prevout = btc_primitives::OutPoint { txid: bitcoin::Txid::from_slice(&[99u8; 32]).unwrap(), vout: 0 };
-        let mut input = btc_primitives::TxIn::new(prevout);
-        let mut tx = btc_primitives::Tx::new(2, vec![input.clone()], vec![btc_primitives::TxOut::new(0, out_script.clone())], 0);
+        let (_victim_secret, victim_pub) = test_key(1);
+        let (attacker_secret, attacker_pub) = test_key(2);
+        let spent = victim_output(hash20(&victim_pub));
+        let mut tx = unsigned_ct_tx(hash20(&attacker_pub), 99, 4_99990000);
         let context = ct_context(&tx);
-        let (proof, _) = create_balance_proof(&[r_in], &[r_out], 10_000, &context).unwrap();
-        let sig = sign_ring(&context, &pubs, own, &secrets[own]).unwrap();
-        let mut ring_bytes = Vec::new();
-        for key in &pubs {
-            ring_bytes.extend_from_slice(key);
+        let (proof, _) = create_balance_proof(&[R_IN], &[R_OUT], 10_000, &context).unwrap();
+        let balance = with_fee(serialize_balance_proof(&proof), 10_000);
+
+        // (a) Exact old attack: ring = victim + attacker + 14 decoys, signed
+        // by the attacker. The legacy witness layout is no longer valid.
+        let mut ring: Vec<[u8; 33]> = vec![victim_pub, attacker_pub];
+        for i in 3..=16u8 {
+            ring.push(test_key(i).1);
         }
-        input.witness = Witness::from_slice(&[with_fee(serialize_balance_proof(&proof), 10_000), serialize_ring_sig(&sig).to_vec(), ring_bytes]);
-        tx.vin[0] = input;
-        // Stage 1: script decoding and stack parsing.
-        assert!(decode_ct_script(in_script.as_bytes()).is_some());
-        assert!(decode_ct_script(out_script.as_bytes()).is_some());
-        // Stage 2: full verification.
-        let spent = [btc_primitives::TxOut::new(0, in_script.clone())];
-        let result = verify_ct_tx_block(
-            &tx,
-            &spent,
-            &|_tx, _spent, _indices| Ok(()),
-        );
-        assert!(result.is_ok());
+        let ring_sig = sign_ring(&context, &ring, 1, &attacker_secret).unwrap();
+        let ring_bytes: Vec<u8> = ring.iter().flat_map(|k| k.to_vec()).collect();
+        tx.vin[0].witness =
+            bitcoin::Witness::from_slice(&[balance.clone(), serialize_ring_sig(&ring_sig), ring_bytes]);
+        assert!(!accepts(&tx, &spent), "legacy ring witness must be rejected");
+
+        // (b) Attacker signs with his key and presents the victim's pubkey.
+        tx.vin[0].witness = auth_witness(&tx, &spent, &attacker_secret, &victim_pub);
+        assert!(!accepts(&tx, &spent), "attacker sig under victim pubkey");
+
+        // (c) Attacker signs and presents his own pubkey (hash mismatch).
+        tx.vin[0].witness = auth_witness(&tx, &spent, &attacker_secret, &attacker_pub);
+        assert!(!accepts(&tx, &spent), "attacker pubkey does not hash to owner");
+    }
+
+    #[test]
+    fn ct_input_auth_rejects_wrong_pubkey_wrong_sig_and_replay() {
+        let (owner_secret, owner_pub) = test_key(3);
+        let (_other_secret, other_pub) = test_key(4);
+        let spent = victim_output(hash20(&owner_pub));
+        let mut tx = unsigned_ct_tx([7u8; 20], 99, 4_99990000);
+
+        // Baseline: valid.
+        tx.vin[0].witness = auth_witness(&tx, &spent, &owner_secret, &owner_pub);
+        assert!(accepts(&tx, &spent));
+        let good: Vec<Vec<u8>> = tx.vin[0].witness.iter().map(|w| w.to_vec()).collect();
+
+        // Wrong pubkey (valid key, wrong hash).
+        let mut w = good.clone();
+        w[2] = other_pub.to_vec();
+        tx.vin[0].witness = bitcoin::Witness::from_slice(&w);
+        assert!(!accepts(&tx, &spent), "wrong pubkey");
+
+        // Malformed pubkey.
+        let mut w = good.clone();
+        w[2] = vec![2u8; 32];
+        tx.vin[0].witness = bitcoin::Witness::from_slice(&w);
+        assert!(!accepts(&tx, &spent), "short pubkey");
+
+        // Corrupted signature.
+        let mut w = good.clone();
+        w[1][5] ^= 1;
+        tx.vin[0].witness = bitcoin::Witness::from_slice(&w);
+        assert!(!accepts(&tx, &spent), "wrong sig");
+
+        // Signature by a different key presented under the owner's pubkey.
+        let (other_secret, _) = test_key(4);
+        tx.vin[0].witness = auth_witness(&tx, &spent, &other_secret, &owner_pub);
+        assert!(!accepts(&tx, &spent), "sig by non-owner key");
+
+        // Missing / extra witness items.
+        tx.vin[0].witness = bitcoin::Witness::from_slice(&good[..2]);
+        assert!(!accepts(&tx, &spent), "missing pubkey");
+        let mut w = good.clone();
+        w.push(vec![0u8]);
+        tx.vin[0].witness = bitcoin::Witness::from_slice(&w);
+        assert!(!accepts(&tx, &spent), "extra item");
+
+        // Replay: a valid owner witness copied onto a different tx (other
+        // recipient and other outpoint) must fail, both the sighash and the
+        // balance proof are bound to the tx.
+        let mut tx2 = unsigned_ct_tx([8u8; 20], 99, 4_99990000);
+        tx2.vin[0].witness = bitcoin::Witness::from_slice(&good);
+        assert!(!accepts(&tx2, &spent), "replay onto another recipient");
+        let mut tx3 = unsigned_ct_tx([7u8; 20], 98, 4_99990000);
+        tx3.vin[0].witness = bitcoin::Witness::from_slice(&good);
+        assert!(!accepts(&tx3, &spent), "replay onto another outpoint");
+
+        // Signature only (balance proof valid for tx2, auth from tx): the
+        // auth signature alone must not authorise another tx.
+        let mut tx4 = unsigned_ct_tx([8u8; 20], 99, 4_99990000);
+        let fresh = auth_witness(&tx4, &spent, &owner_secret, &owner_pub);
+        let mut w: Vec<Vec<u8>> = fresh.iter().map(|x| x.to_vec()).collect();
+        w[1] = good[1].clone();
+        tx4.vin[0].witness = bitcoin::Witness::from_slice(&w);
+        assert!(!accepts(&tx4, &spent), "stolen signature from another tx");
+
+        // Signature bound to the input slot: same tx signed as index 1.
+        let context = ct_context(&tx);
+        let wrong_index = ct_input_sighash(&context, 1, spent.script_pubkey.as_bytes());
+        let (sig, _) = sign_ct_input(&wrong_index, &owner_secret).unwrap();
+        let mut w = good.clone();
+        w[1] = sig.to_vec();
+        tx.vin[0].witness = bitcoin::Witness::from_slice(&w);
+        assert!(!accepts(&tx, &spent), "sig for another input index");
+
+        // Sanity: the original witness is still accepted.
+        tx.vin[0].witness = bitcoin::Witness::from_slice(&good);
+        assert!(accepts(&tx, &spent));
     }
 
     #[test]
