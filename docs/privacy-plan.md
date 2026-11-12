@@ -78,10 +78,22 @@ protects the middle; the edges must be designed for too.
   derives a fresh one-time address per sender via ECDH. Observers
   cannot link payments to the same recipient, the recipient can scan
   and recover the one-time secret.
-- **Decentralised CoinJoin**: P2P coordination, fixed mix size,
-  equal-value outputs, jittered broadcast. No coordinator server.
-- **Network**: Tor/I2P for RPC and P2P, Dandelion++-style relay
-  decoys, encrypted `peers.dat`.
+- **Decentralised CoinJoin** (`crates/wallet/src/coinjoin.rs`):
+  library-level round logic only (equal-value outputs, commitments,
+  sorted outputs, per-signer verification of the assembled transaction).
+  There is **no P2P transport** for rounds yet, mix size is bounded
+  (2..=16) but not fixed, there is no coordinator server and no
+  broadcast jitter specific to CoinJoin. Inputs are averaged into one
+  denomination, so each signer states the loss it accepts
+  (`max_loss`); change outputs are not produced.
+- **Network (honest status)**: implemented: outbound SOCKS5 proxy
+  (`-proxy`, e.g. Tor's SOCKS port; no inbound listener and no
+  cleartext DNS seeding while it is set) and a uniform random relay
+  delay of up to 2 s per peer (OS RNG), enabled only when `-proxy` is
+  set. **Not implemented**: I2P, onion (inbound / `.onion`) peers,
+  Tor for RPC, Dandelion++ stem/fluff relay or relay decoys, cover
+  traffic, encrypted `peers.dat`. Without `-proxy` the node relays
+  transactions to all peers immediately and exposes the node's IP.
 - Amounts remain visible in this phase (documented limitation);
   the address graph is already broken.
 
@@ -159,7 +171,10 @@ protects the middle; the edges must be designed for too.
 - **Pool notes end to end.** Wallet `create_pool_note` /
   `create_note_spend` with persisted `NoteCoinInfo`; RPC
   `createpoolnote`/`spendnote`/`listnotes`/`exportviewkey` (view key =
-  `SHA256(scan_secret || "anon-view")` for blind audit scans);
+  65 bytes `scan_secret || spending_pubkey`: it recognises every stealth
+  payment to the wallet but holds no spending secret; share it only
+  with a trusted auditor, since it reveals the wallet's incoming
+  payments);
   `getpoolinfo` exposes anchor/height/note count. Mempool E2E tests
   cover append-accept and spend-accept+mine; the funding cap rejects
   inflated spends (unit tested).
@@ -274,7 +289,7 @@ inbound P2P.
 |---|---|---|---|
 | Casual ledger observer | protected (unlinkable addresses) | protected | protected |
 | Chain analytics (clustering) | largely protected | protected | protected |
-| Passive network observer | Tor/I2P required | Tor/I2P required | Tor/I2P required |
+| Passive network observer | Tor required (`-proxy`); I2P unsupported | Tor required | Tor required |
 | Exchange with KYC | **not protected** (ramp links name) | not protected | not protected |
 | Compromised device / CCTV | not protected | not protected | not protected |
 | Global passive adversary | reduced, not eliminated | reduced | reduced |

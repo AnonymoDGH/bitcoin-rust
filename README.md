@@ -55,7 +55,8 @@ Wallet RPCs: `getnewaddress`, `getbalance`, `getbalances`, `listunspent`, `sendt
 `validateaddress`, `getnewstealthaddress`, `liststealthutxos`, `sendtostealthaddress`. Flags: `-wallet=<file>`, `-disablewallet`, `-seednode`, `-addnode`, `-dnsseed`,
 `-externalip`, `-maxconnections`, `-proxy`. Add `"seeds": ["host:port", ...]` to the chain spec for discovery.
 
-Privacy (AnonCoin): stealth addresses, coordinator-free CoinJoin, SOCKS5 proxy + relay jitter,
+Privacy (AnonCoin): stealth addresses, coordinator-free CoinJoin round logic (no network transport yet),
+outbound SOCKS5 proxy (Tor) + relay jitter while proxied (no I2P, no Dandelion),
 and consensus-active confidential transactions (CT outputs `OP_RETURN 0x01` with
 commitments + range proofs, transactions checked by `ConnectBlock`/`AcceptToMemoryPool`
 with balance proofs and 16-key ring signatures) — see `docs/privacy-plan.md`

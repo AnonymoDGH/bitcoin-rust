@@ -103,7 +103,7 @@ pub struct Coin {
 
 /// Wallet bookkeeping for a confidential coin: the blinding is required
 /// to spend it (balance proof), and the one-time key secret to sign.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CtCoinInfo {
     pub value: u64,
     pub blinding: [u8; 32],
@@ -111,13 +111,79 @@ pub struct CtCoinInfo {
     pub pubkey_hash: [u8; 20],
 }
 
+impl std::fmt::Debug for CtCoinInfo {
+    /// Never prints the blinding or the signing secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CtCoinInfo")
+            .field("value", &self.value)
+            .field("blinding", &"<redacted>")
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Wallet bookkeeping for a shielded pool note.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NoteCoinInfo {
     pub value: u64,
     pub rcm: [u8; 32],
     pub secret: [u8; 32],
     pub pubkey_hash: [u8; 20],
+}
+
+impl std::fmt::Debug for NoteCoinInfo {
+    /// Never prints the note randomness or the spending secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoteCoinInfo")
+            .field("value", &self.value)
+            .field("rcm", &"<redacted>")
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Overwrites `buf` in a way the optimiser may not elide.
+fn wipe(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        // SAFETY: `b` is a valid, aligned `&mut u8`.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Encrypts `plain` under the wallet master key with a fresh random IV
+/// (`iv16 || AES-256-CBC(plain || sha256d(plain)[..8])`).
+fn seal(master: &[u8; KEY_SIZE], plain: &[u8]) -> Result<Vec<u8>, WalletError> {
+    let mut iv_hash = [0u8; 32];
+    getrandom::getrandom(&mut iv_hash[..16]).map_err(KeyError::Random)?;
+    let mut body = plain.to_vec();
+    body.extend_from_slice(&sha256d::Hash::hash(plain).to_byte_array()[..8]);
+    let mut out = iv_hash[..16].to_vec();
+    out.extend_from_slice(&Crypter::from_key(*master, &iv_hash).encrypt(&body));
+    wipe(&mut body);
+    Ok(out)
+}
+
+fn unseal(master: &[u8; KEY_SIZE], blob: &[u8]) -> Result<Vec<u8>, WalletError> {
+    if blob.len() < 16 {
+        return Err(corrupt("sealed record too short".into()));
+    }
+    let mut iv_hash = [0u8; 32];
+    iv_hash[..16].copy_from_slice(&blob[..16]);
+    let mut body = Crypter::from_key(*master, &iv_hash)
+        .decrypt(&blob[16..])
+        .map_err(|_| corrupt("sealed record does not decrypt".into()))?;
+    if body.len() < 8 {
+        return Err(corrupt("sealed record too short".into()));
+    }
+    let split = body.len() - 8;
+    let check = sha256d::Hash::hash(&body[..split]).to_byte_array();
+    if body[split..] != check[..8] {
+        wipe(&mut body);
+        return Err(corrupt("sealed record failed its integrity check".into()));
+    }
+    body.truncate(split);
+    Ok(body)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -168,6 +234,16 @@ pub struct Wallet {
     master_key: Option<[u8; KEY_SIZE]>,
     unlocked_until: Option<u64>,
     best_block: Option<(BlockHash, u32)>,
+    /// Random root of the stealth scan/spend keys (independent of every
+    /// transparent key, so `dumpprivkey` cannot leak stealth funds). `None`
+    /// for wallets created before the seed existed (legacy derivation from
+    /// the first key) or while an encrypted wallet is locked.
+    stealth_seed: Option<[u8; 32]>,
+    /// The seed under the master key; present in the file of encrypted wallets.
+    stealth_seed_sealed: Option<Vec<u8>>,
+    /// CT/note secrets of coins under the master key, kept while the wallet is
+    /// locked (their plaintext lives in `Coin::ct` / `Coin::note` only while unlocked).
+    sealed_coins: BTreeMap<OutPoint, Vec<u8>>,
 }
 
 impl Wallet {
@@ -176,7 +252,11 @@ impl Wallet {
         if path.exists() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "wallet file exists").into());
         }
-        let wallet = Wallet::empty(path.to_path_buf());
+        let mut wallet = Wallet::empty(path.to_path_buf());
+        let mut seed = [0u8; 32];
+        getrandom::getrandom(&mut seed).map_err(KeyError::Random)?;
+        wallet.stealth_seed = Some(seed);
+        wipe(&mut seed);
         wallet.save()?;
         Ok(wallet)
     }
@@ -202,6 +282,9 @@ impl Wallet {
             master_key: None,
             unlocked_until: None,
             best_block: None,
+            stealth_seed: None,
+            stealth_seed_sealed: None,
+            sealed_coins: BTreeMap::new(),
         }
     }
 
@@ -219,15 +302,16 @@ impl Wallet {
 
     /// Derives the wallet's reusable stealth invitation address.
     ///
-    /// Deterministically derived from the first wallet key (spending and
-    /// scan secrets are domain-separated hashes of the key secret), so no
-    /// new secret material is stored and encrypted wallets keep the
-    /// protection of the existing crypter. Creates a key if the wallet is
-    /// empty, like `new_script`. Requires the wallet to be unlocked.
+    /// New wallets derive the spending and scan secrets (domain-separated
+    /// hashes) from a dedicated random stealth seed that is stored with the
+    /// wallet and, once encrypted, sealed under the master key. Wallets
+    /// created before the seed existed keep deriving from the first key so
+    /// their published address does not change. Requires the wallet to be
+    /// unlocked.
     pub fn stealth_address(&mut self) -> Result<crate::stealth::StealthAddress, WalletError> {
         self.check_unlocked()?;
-        if self.keys.is_empty() {
-            // Ensure at least one wallet key exists to derive from.
+        if self.stealth_seed.is_none() && self.keys.is_empty() {
+            // Legacy wallet without any key: create one to derive from.
             self.new_script(ScriptKind::P2wpkh)?;
         }
         Ok(self.stealth_keys()?.address())
@@ -236,27 +320,36 @@ impl Wallet {
     /// The stealth keypair behind `stealth_address`.
     pub fn stealth_keys(&self) -> Result<crate::stealth::StealthKeys, WalletError> {
         use bitcoin_hashes::{sha256, Hash as _};
-        // Anchor to the first key ever added: generating later keys must
-        // not change the invitation address.
-        let id = self
-            .first_key
-            .or_else(|| self.keys.key_ids().next().copied())
-            .ok_or(WalletError::Locked)?;
-        let key = self.keys.private_key(&id).ok_or(WalletError::Locked)?;
-        let secret = key.inner.secret_bytes();
-        let derive = |label: &[u8]| -> Result<[u8; 32], WalletError> {
+        let mut secret = match self.stealth_seed {
+            Some(seed) => seed,
+            None => {
+                // Legacy: anchored to the first key ever added, so generating
+                // later keys does not change the invitation address.
+                let id = self
+                    .first_key
+                    .or_else(|| self.keys.key_ids().next().copied())
+                    .ok_or(WalletError::Locked)?;
+                let key = self.keys.private_key(&id).ok_or(WalletError::Locked)?;
+                key.inner.secret_bytes()
+            }
+        };
+        let derive = |label: &[u8]| -> [u8; 32] {
             let mut buf = secret.to_vec();
             buf.extend_from_slice(label);
             let hash = sha256::Hash::hash(&buf);
+            wipe(&mut buf);
             let mut out = [0u8; 32];
             out.copy_from_slice(hash.as_ref());
-            Ok(out)
+            out
         };
-        crate::stealth::StealthKeys::from_secrets(
-            &derive(b"anoncoin-stealth-spending")?,
-            &derive(b"anoncoin-stealth-scan")?,
-        )
-        .map_err(WalletError::Stealth)
+        let mut spending = derive(b"anoncoin-stealth-spending");
+        let mut scan = derive(b"anoncoin-stealth-scan");
+        wipe(&mut secret);
+        let keys = crate::stealth::StealthKeys::from_secrets(&spending, &scan)
+            .map_err(WalletError::Stealth);
+        wipe(&mut spending);
+        wipe(&mut scan);
+        keys
     }
 
     /// Imports a WIF private key. Importing a known key changes nothing.
@@ -823,6 +916,7 @@ impl Wallet {
         let keys = self.stealth_keys()?;
         Ok(keys
             .view_key()
+            .to_bytes()
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>())
@@ -969,7 +1063,14 @@ impl Wallet {
             encrypted,
             check,
         });
+        if let Some(seed) = self.stealth_seed {
+            self.stealth_seed_sealed = Some(seal(&master, &seed)?);
+        }
+        // `lock_secrets` seals CT/note coin secrets under the master key
+        // before it forgets that key.
+        self.master_key = Some(master);
         self.lock_secrets();
+        wipe(&mut master);
         self.save()
     }
 
@@ -1009,9 +1110,37 @@ impl Wallet {
             keys.import_private_key(key);
         }
 
+        // Privacy secrets: stealth seed and per-coin CT/note openings.
+        let seed = match &self.stealth_seed_sealed {
+            Some(blob) => {
+                let plain = unseal(&master, blob)?;
+                Some(fixed::<32>(&plain)?)
+            }
+            None => None,
+        };
+        let mut restored: Vec<(OutPoint, Option<CtCoinInfo>, Option<NoteCoinInfo>)> = Vec::new();
+        for (outpoint, blob) in &self.sealed_coins {
+            let plain = unseal(&master, blob)?;
+            let secrets: CoinSecretsFile = serde_json::from_slice(&plain)
+                .map_err(|e| corrupt(format!("sealed coin secrets: {e}")))?;
+            let (ct, note) = coin_secrets_from_file(secrets)?;
+            restored.push((*outpoint, ct, note));
+        }
+
         self.keys = keys;
+        self.stealth_seed = seed;
+        for (outpoint, ct, note) in restored {
+            if let Some(coin) = self.coins.get_mut(&outpoint) {
+                coin.ct = ct;
+                coin.note = note;
+            }
+        }
+        self.sealed_coins.clear();
         self.master_key = Some(master);
         self.unlocked_until = Some(until_unix);
+        // Re-persist: scrubs plaintext privacy secrets left by wallets that
+        // were encrypted before they were sealed. Best effort.
+        let _ = self.save();
         Ok(())
     }
 
@@ -1025,7 +1154,28 @@ impl Wallet {
     }
 
     fn lock_secrets(&mut self) {
-        self.master_key = None;
+        if let Some(master) = self.master_key {
+            // Move CT/note openings to their sealed form, then forget the plaintext.
+            for (outpoint, coin) in self.coins.iter_mut() {
+                if coin.ct.is_none() && coin.note.is_none() {
+                    continue;
+                }
+                let secrets = coin_secrets_to_file(coin);
+                if let Ok(json) = serde_json::to_vec(&secrets) {
+                    if let Ok(blob) = seal(&master, &json) {
+                        self.sealed_coins.insert(*outpoint, blob);
+                        coin.ct = None;
+                        coin.note = None;
+                    }
+                }
+            }
+        }
+        if let Some(mut master) = self.master_key.take() {
+            wipe(&mut master);
+        }
+        if let Some(mut seed) = self.stealth_seed.take() {
+            wipe(&mut seed);
+        }
         self.keys = KeyStore::new();
         self.unlocked_until = None;
     }
@@ -1479,6 +1629,43 @@ impl Wallet {
         Ok(())
     }
 
+    /// The `(ct, note, sealed)` file fields of one coin. Unencrypted wallets
+    /// store the openings in the clear (as before); encrypted wallets store
+    /// only the sealed blob, so blindings, note `rcm` and one-time spend
+    /// secrets never reach the disk in plaintext.
+    fn persisted_coin_secrets(
+        &self,
+        outpoint: &OutPoint,
+        coin: &Coin,
+    ) -> (Option<CtFile>, Option<NoteFile>, Option<String>) {
+        let plain = || (coin.ct.as_ref().map(ct_to_file), coin.note.as_ref().map(note_to_file));
+        if !self.is_encrypted() {
+            let (ct, note) = plain();
+            return (ct, note, None);
+        }
+        if coin.ct.is_some() || coin.note.is_some() {
+            if let Some(master) = &self.master_key {
+                let sealed = serde_json::to_vec(&coin_secrets_to_file(coin))
+                    .ok()
+                    .and_then(|json| seal(master, &json).ok());
+                if let Some(blob) = sealed {
+                    return (None, None, Some(blob.to_lower_hex_string()));
+                }
+            }
+            // Legacy plaintext loaded while locked: cannot seal without the
+            // master key; `unlock` migrates it.
+            let (ct, note) = plain();
+            return (ct, note, None);
+        }
+        (
+            None,
+            None,
+            self.sealed_coins
+                .get(outpoint)
+                .map(|blob| blob.to_lower_hex_string()),
+        )
+    }
+
     fn to_file(&self) -> WalletFile {
         WalletFile {
             version: FILE_VERSION,
@@ -1514,26 +1701,20 @@ impl Wallet {
             coins: self
                 .coins
                 .iter()
-                .map(|(outpoint, coin)| CoinFile {
-                    txid: outpoint.txid.to_string(),
-                    vout: outpoint.vout,
-                    value: coin.txout.value,
-                    script_pubkey: coin.txout.script_pubkey.as_bytes().to_lower_hex_string(),
-                    height: coin.height,
-                    is_coinbase: coin.is_coinbase,
-                    spent_by: coin.spent_by.map(|t| t.to_string()),
-                    ct: coin.ct.as_ref().map(|info| CtFile {
-                        value: info.value,
-                        blinding: info.blinding.to_lower_hex_string(),
-                        secret: info.secret.to_lower_hex_string(),
-                        pubkey_hash: info.pubkey_hash.to_lower_hex_string(),
-                    }),
-                    note: coin.note.as_ref().map(|info| NoteFile {
-                        value: info.value,
-                        rcm: info.rcm.to_lower_hex_string(),
-                        secret: info.secret.to_lower_hex_string(),
-                        pubkey_hash: info.pubkey_hash.to_lower_hex_string(),
-                    }),
+                .map(|(outpoint, coin)| {
+                    let (ct, note, sealed) = self.persisted_coin_secrets(outpoint, coin);
+                    CoinFile {
+                        txid: outpoint.txid.to_string(),
+                        vout: outpoint.vout,
+                        value: coin.txout.value,
+                        script_pubkey: coin.txout.script_pubkey.as_bytes().to_lower_hex_string(),
+                        height: coin.height,
+                        is_coinbase: coin.is_coinbase,
+                        spent_by: coin.spent_by.map(|t| t.to_string()),
+                        ct,
+                        note,
+                        sealed,
+                    }
                 })
                 .collect(),
             transactions: self
@@ -1552,6 +1733,15 @@ impl Wallet {
             first_key: self
                 .first_key
                 .map(|id| id.to_byte_array().to_lower_hex_string()),
+            stealth_seed: if self.is_encrypted() {
+                None
+            } else {
+                self.stealth_seed.map(|seed| seed.to_lower_hex_string())
+            },
+            stealth_seed_sealed: self
+                .stealth_seed_sealed
+                .as_ref()
+                .map(|blob| blob.to_lower_hex_string()),
             best_block: self.best_block.map(|(hash, height)| BestBlockFile {
                 hash: hash.to_string(),
                 height,
@@ -1613,6 +1803,19 @@ impl Wallet {
             );
         }
 
+        if let Some(hex) = &file.stealth_seed {
+            if encrypted {
+                return Err(corrupt("plaintext stealth seed in an encrypted wallet".into()));
+            }
+            wallet.stealth_seed = Some(fixed::<32>(&hex_bytes(hex)?)?);
+        }
+        if let Some(hex) = &file.stealth_seed_sealed {
+            if !encrypted {
+                return Err(corrupt("sealed stealth seed without a master key".into()));
+            }
+            wallet.stealth_seed_sealed = Some(hex_bytes(hex)?);
+        }
+
         wallet.first_key = match &file.first_key {
             Some(hex) => {
                 let bytes = hex_bytes(hex)?;
@@ -1635,28 +1838,16 @@ impl Wallet {
 
         for cf in file.coins {
             let outpoint = OutPoint::new(parse_txid(&cf.txid)?, cf.vout);
-            let ct = cf
-                .ct
-                .map(|entry| -> Result<CtCoinInfo, WalletError> {
-                    Ok(CtCoinInfo {
-                        value: entry.value,
-                        blinding: fixed::<32>(&hex_bytes(&entry.blinding)?)?,
-                        secret: fixed::<32>(&hex_bytes(&entry.secret)?)?,
-                        pubkey_hash: fixed::<20>(&hex_bytes(&entry.pubkey_hash)?)?,
-                    })
-                })
-                .transpose()?;
-            let note = cf
-                .note
-                .map(|entry| -> Result<NoteCoinInfo, WalletError> {
-                    Ok(NoteCoinInfo {
-                        value: entry.value,
-                        rcm: fixed::<32>(&hex_bytes(&entry.rcm)?)?,
-                        secret: fixed::<32>(&hex_bytes(&entry.secret)?)?,
-                        pubkey_hash: fixed::<20>(&hex_bytes(&entry.pubkey_hash)?)?,
-                    })
-                })
-                .transpose()?;
+            let (ct, note) = coin_secrets_from_file(CoinSecretsFile {
+                ct: cf.ct,
+                note: cf.note,
+            })?;
+            if let Some(sealed) = &cf.sealed {
+                if !encrypted {
+                    return Err(corrupt("sealed coin secrets without a master key".into()));
+                }
+                wallet.sealed_coins.insert(outpoint, hex_bytes(sealed)?);
+            }
             let coin = Coin {
                 txout: TxOut::new(
                     cf.value,
@@ -1712,6 +1903,12 @@ struct WalletFile {
     #[serde(default)]
     first_key: Option<String>,
     best_block: Option<BestBlockFile>,
+    /// Plaintext stealth seed (hex); only in unencrypted wallets.
+    #[serde(default)]
+    stealth_seed: Option<String>,
+    /// Stealth seed under the master key (hex); only in encrypted wallets.
+    #[serde(default)]
+    stealth_seed_sealed: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1757,6 +1954,70 @@ struct CoinFile {
     ct: Option<CtFile>,
     #[serde(default)]
     note: Option<NoteFile>,
+    /// CT blinding / note rcm and spend secrets under the master key (hex).
+    /// In an encrypted wallet `ct` and `note` stay empty.
+    #[serde(default)]
+    sealed: Option<String>,
+}
+
+/// What `CoinFile::sealed` decrypts to.
+#[derive(Serialize, Deserialize)]
+struct CoinSecretsFile {
+    ct: Option<CtFile>,
+    note: Option<NoteFile>,
+}
+
+fn ct_to_file(info: &CtCoinInfo) -> CtFile {
+    CtFile {
+        value: info.value,
+        blinding: info.blinding.to_lower_hex_string(),
+        secret: info.secret.to_lower_hex_string(),
+        pubkey_hash: info.pubkey_hash.to_lower_hex_string(),
+    }
+}
+
+fn note_to_file(info: &NoteCoinInfo) -> NoteFile {
+    NoteFile {
+        value: info.value,
+        rcm: info.rcm.to_lower_hex_string(),
+        secret: info.secret.to_lower_hex_string(),
+        pubkey_hash: info.pubkey_hash.to_lower_hex_string(),
+    }
+}
+
+fn coin_secrets_to_file(coin: &Coin) -> CoinSecretsFile {
+    CoinSecretsFile {
+        ct: coin.ct.as_ref().map(ct_to_file),
+        note: coin.note.as_ref().map(note_to_file),
+    }
+}
+
+fn coin_secrets_from_file(
+    file: CoinSecretsFile,
+) -> Result<(Option<CtCoinInfo>, Option<NoteCoinInfo>), WalletError> {
+    let ct = file
+        .ct
+        .map(|entry| -> Result<CtCoinInfo, WalletError> {
+            Ok(CtCoinInfo {
+                value: entry.value,
+                blinding: fixed::<32>(&hex_bytes(&entry.blinding)?)?,
+                secret: fixed::<32>(&hex_bytes(&entry.secret)?)?,
+                pubkey_hash: fixed::<20>(&hex_bytes(&entry.pubkey_hash)?)?,
+            })
+        })
+        .transpose()?;
+    let note = file
+        .note
+        .map(|entry| -> Result<NoteCoinInfo, WalletError> {
+            Ok(NoteCoinInfo {
+                value: entry.value,
+                rcm: fixed::<32>(&hex_bytes(&entry.rcm)?)?,
+                secret: fixed::<32>(&hex_bytes(&entry.secret)?)?,
+                pubkey_hash: fixed::<20>(&hex_bytes(&entry.pubkey_hash)?)?,
+            })
+        })
+        .transpose()?;
+    Ok((ct, note))
 }
 
 #[derive(Serialize, Deserialize)]

@@ -28,14 +28,36 @@ pub enum StealthError {
     InvalidPublicKey,
     #[error("tweak derivation failed")]
     Tweak,
+    #[error("spending and scan keys must be distinct")]
+    KeysNotSeparated,
+    #[error("invalid view key encoding")]
+    InvalidViewKey,
 }
+
+/// Domain tag for the stealth tweak hash. Binds the tweak to this protocol
+/// so the ECDH secret is never hashed bare (any other protocol hashing the
+/// same shared secret would otherwise yield the same scalar).
+const TWEAK_DOMAIN: &[u8] = b"AnonCoin/stealth-tweak/v1";
 
 /// Recipient keypair for stealth payments.
 /// `spending` controls funds; `scan` only tests incoming outputs.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct StealthKeys {
     spending: SecretKey,
     scan: SecretKey,
+}
+
+impl std::fmt::Debug for StealthKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StealthKeys { <redacted> }")
+    }
+}
+
+impl Drop for StealthKeys {
+    fn drop(&mut self) {
+        self.spending.non_secure_erase();
+        self.scan.non_secure_erase();
+    }
 }
 
 impl StealthKeys {
@@ -49,6 +71,10 @@ impl StealthKeys {
 
     /// Builds from raw 32-byte secrets (for import / tests).
     pub fn from_secrets(spending: &[u8; 32], scan: &[u8; 32]) -> Result<Self, StealthError> {
+        // Equal keys would let anyone holding the (shareable) scan key spend.
+        if spending == scan {
+            return Err(StealthError::KeysNotSeparated);
+        }
         Ok(Self {
             spending: SecretKey::from_slice(spending).map_err(|_| StealthError::InvalidSecret)?,
             scan: SecretKey::from_slice(scan).map_err(|_| StealthError::InvalidSecret)?,
@@ -63,13 +89,16 @@ impl StealthKeys {
         PublicKey::from_secret_key(&Secp256k1::new(), &self.scan)
     }
 
-    /// Internal view key for audit: `SHA256(scan_secret || "anon-view")`.
-    /// It detects payments without the spending key.
-    pub fn view_key(&self) -> [u8; 32] {
-        let mut buf = Vec::with_capacity(32 + 9);
-        buf.extend_from_slice(&self.scan.secret_bytes());
-        buf.extend_from_slice(b"anon-view");
-        sha256::Hash::hash(&buf).to_byte_array()
+    /// View key for audit scans: the scan secret plus the spending *public*
+    /// key. It can recognise every payment to this wallet (and compute the
+    /// one-time public keys) but contains no spending secret, so it cannot
+    /// sign. (The previous `SHA256(scan_secret || "anon-view")` was a one-way
+    /// hash that could not scan anything.)
+    pub fn view_key(&self) -> ViewKey {
+        ViewKey {
+            scan: self.scan,
+            spending_pub: self.spending_pubkey(),
+        }
     }
 
     /// The reusable invitation address shown to senders.
@@ -80,31 +109,126 @@ impl StealthKeys {
         }
     }
 
-    /// Scans an output's HASH160 against `ephemeral_pub`.
-    /// Returns the one-time secret if the output pays this recipient.
+    /// Scans an output's HASH160 against `ephemeral_pub` (first stealth
+    /// output of that ephemeral key, plus the legacy un-indexed derivation
+    /// so earlier payments stay recoverable). Returns the one-time secret
+    /// if the output pays this recipient.
     pub fn scan_output(
         &self,
         ephemeral_pub: &PublicKey,
         candidate: &PubkeyHash,
     ) -> Result<Option<SecretKey>, StealthError> {
+        self.scan_output_indexed(ephemeral_pub, 0, candidate)
+    }
+
+    /// Like [`scan_output`](Self::scan_output) for the stealth output
+    /// numbered `index` under one ephemeral key.
+    pub fn scan_output_indexed(
+        &self,
+        ephemeral_pub: &PublicKey,
+        index: u32,
+        candidate: &PubkeyHash,
+    ) -> Result<Option<SecretKey>, StealthError> {
         let secp = Secp256k1::new();
         let shared = SharedSecret::new(ephemeral_pub, &self.scan);
-        let tweak = shared_tweak(shared.secret_bytes());
-        let one_time_pub = self
-            .spending_pubkey()
-            .add_exp_tweak(&secp, &tweak)
-            .map_err(|_| StealthError::Tweak)?;
-        let derived = PubkeyHash::from_slice(hash160::Hash::hash(&one_time_pub.serialize()).as_ref())
-            .map_err(|_| StealthError::InvalidPublicKey)?;
-        if derived != *candidate {
-            return Ok(None);
+        let mut candidates = vec![shared_tweak(shared.secret_bytes(), index)];
+        if index == 0 {
+            candidates.push(legacy_tweak(shared.secret_bytes()));
         }
-        Ok(Some(
-            self.spending
-                .add_tweak(&tweak)
-                .map_err(|_| StealthError::Tweak)?,
-        ))
+        for tweak in candidates {
+            if one_time_hash(&secp, &self.spending_pubkey(), &tweak)? == *candidate {
+                return Ok(Some(
+                    self.spending
+                        .add_tweak(&tweak)
+                        .map_err(|_| StealthError::Tweak)?,
+                ));
+            }
+        }
+        Ok(None)
     }
+}
+
+/// Watch-only key for stealth payments: detects incoming outputs but cannot
+/// spend (it holds the scan secret and only the spending public key).
+#[derive(Clone)]
+pub struct ViewKey {
+    scan: SecretKey,
+    spending_pub: PublicKey,
+}
+
+impl std::fmt::Debug for ViewKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ViewKey { <redacted> }")
+    }
+}
+
+impl Drop for ViewKey {
+    fn drop(&mut self) {
+        self.scan.non_secure_erase();
+    }
+}
+
+impl ViewKey {
+    /// 65 bytes: scan secret || compressed spending public key.
+    pub fn to_bytes(&self) -> [u8; 65] {
+        let mut out = [0u8; 65];
+        out[..32].copy_from_slice(&self.scan.secret_bytes());
+        out[32..].copy_from_slice(&self.spending_pub.serialize());
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, StealthError> {
+        if bytes.len() != 65 {
+            return Err(StealthError::InvalidViewKey);
+        }
+        Ok(Self {
+            scan: SecretKey::from_slice(&bytes[..32]).map_err(|_| StealthError::InvalidViewKey)?,
+            spending_pub: PublicKey::from_slice(&bytes[32..])
+                .map_err(|_| StealthError::InvalidViewKey)?,
+        })
+    }
+
+    /// The one-time public key paid by `ephemeral_pub` at `index` if
+    /// `candidate` matches it (legacy derivation tried for index 0).
+    pub fn scan_output(
+        &self,
+        ephemeral_pub: &PublicKey,
+        index: u32,
+        candidate: &PubkeyHash,
+    ) -> Result<Option<PublicKey>, StealthError> {
+        let secp = Secp256k1::new();
+        let shared = SharedSecret::new(ephemeral_pub, &self.scan);
+        let mut tweaks = vec![shared_tweak(shared.secret_bytes(), index)];
+        if index == 0 {
+            tweaks.push(legacy_tweak(shared.secret_bytes()));
+        }
+        for tweak in tweaks {
+            let one_time = self
+                .spending_pub
+                .add_exp_tweak(&secp, &tweak)
+                .map_err(|_| StealthError::Tweak)?;
+            if pubkey_hash_of(&one_time)? == *candidate {
+                return Ok(Some(one_time));
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn pubkey_hash_of(pk: &PublicKey) -> Result<PubkeyHash, StealthError> {
+    PubkeyHash::from_slice(hash160::Hash::hash(&pk.serialize()).as_ref())
+        .map_err(|_| StealthError::InvalidPublicKey)
+}
+
+fn one_time_hash(
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+    spending_pub: &PublicKey,
+    tweak: &Scalar,
+) -> Result<PubkeyHash, StealthError> {
+    let one_time = spending_pub
+        .add_exp_tweak(secp, tweak)
+        .map_err(|_| StealthError::Tweak)?;
+    pubkey_hash_of(&one_time)
 }
 
 /// Reusable stealth invitation address.
@@ -135,21 +259,29 @@ impl StealthAddress {
         })
     }
 
-    /// Derives the unique one-time payment address for `ephemeral`.
-    pub fn payment(
+    /// Derives the one-time payment address for `ephemeral` (output 0).
+    pub fn payment(&self, ephemeral: &SecretKey) -> Result<StealthPayment, StealthError> {
+        self.payment_indexed(ephemeral, 0)
+    }
+
+    /// Derives the one-time payment address for stealth output `index`
+    /// under `ephemeral`. Distinct indices give unrelated addresses even
+    /// for the same recipient and ephemeral key, so one transaction can
+    /// pay a recipient several times without address reuse.
+    pub fn payment_indexed(
         &self,
         ephemeral: &SecretKey,
+        index: u32,
     ) -> Result<StealthPayment, StealthError> {
         let secp = Secp256k1::new();
         let ephemeral_pub = PublicKey::from_secret_key(&secp, ephemeral);
         let shared = SharedSecret::new(&self.scan_pub, ephemeral);
-        let tweak = shared_tweak(shared.secret_bytes());
+        let tweak = shared_tweak(shared.secret_bytes(), index);
         let one_time_pub = self
             .spending_pub
             .add_exp_tweak(&secp, &tweak)
             .map_err(|_| StealthError::Tweak)?;
-        let hash = PubkeyHash::from_slice(hash160::Hash::hash(&one_time_pub.serialize()).as_ref())
-            .map_err(|_| StealthError::InvalidPublicKey)?;
+        let hash = pubkey_hash_of(&one_time_pub)?;
         let mut script = vec![0x76, 0xa9, 0x14];
         script.extend_from_slice(hash.as_ref());
         script.extend_from_slice(&[0x88, 0xac]);
@@ -205,18 +337,33 @@ pub fn extract_hash160(script: &ScriptBuf) -> Option<PubkeyHash> {
     }
 }
 
-fn shared_tweak(shared: [u8; 32]) -> Scalar {
-    // SHA256 of the ECDH secret; the chance of it exceeding the curve
-    // order (and Scalar::from_be_bytes failing) is negligible, but fall
-    // back to a reduced hash instead of panicking.
-    let hashed = sha256::Hash::hash(&shared);
-    let mut buf = [0u8; 32];
-    buf.copy_from_slice(hashed.as_ref());
-    Scalar::from_be_bytes(buf).unwrap_or_else(|_| {
-        let again = sha256::Hash::hash(&buf);
-        let mut smaller = [0u8; 32];
-        smaller.copy_from_slice(again.as_ref());
-        // Mask the high bits so the reduced value is provably in range.
+/// `SHA256(domain || shared_secret || index_be)` reduced into the scalar
+/// range. Out-of-range hashes (probability ~2^-128) are re-hashed with a
+/// counter instead of panicking.
+fn shared_tweak(shared: [u8; 32], index: u32) -> Scalar {
+    let mut counter = 0u8;
+    loop {
+        let mut buf = Vec::with_capacity(TWEAK_DOMAIN.len() + 32 + 4 + 1);
+        buf.extend_from_slice(TWEAK_DOMAIN);
+        buf.extend_from_slice(&shared);
+        buf.extend_from_slice(&index.to_be_bytes());
+        if counter > 0 {
+            buf.push(counter);
+        }
+        let hashed = sha256::Hash::hash(&buf).to_byte_array();
+        if let Ok(scalar) = Scalar::from_be_bytes(hashed) {
+            return scalar;
+        }
+        counter = counter.wrapping_add(1);
+    }
+}
+
+/// Pre-audit derivation (`SHA256(shared)`), kept only so outputs paid
+/// before the domain-separated tweak existed can still be recovered.
+fn legacy_tweak(shared: [u8; 32]) -> Scalar {
+    let hashed = sha256::Hash::hash(&shared).to_byte_array();
+    Scalar::from_be_bytes(hashed).unwrap_or_else(|_| {
+        let mut smaller = sha256::Hash::hash(&hashed).to_byte_array();
         smaller[0] &= 0x1f;
         Scalar::from_be_bytes(smaller).expect("masked scalar is in range")
     })
@@ -326,5 +473,113 @@ mod tests {
             payment.one_time_pub
         );
         let _ = Sk::from_slice(&[9u8; 32]).unwrap(); // touch import path
+    }
+
+    fn hash_of(pk: &PublicKey) -> PubkeyHash {
+        PubkeyHash::from_slice(hash160::Hash::hash(&pk.serialize()).as_ref()).unwrap()
+    }
+
+    /// Audit: the tweak was a bare `SHA256(shared_secret)`: no domain
+    /// separation, no output index. Any other protocol hashing the same ECDH
+    /// secret got the same scalar, and one ephemeral key paid twice to the
+    /// same recipient produced the *same* address (address reuse).
+    #[test]
+    fn tweak_is_domain_separated_and_not_the_bare_hash() {
+        let keys = StealthKeys::from_secrets(&[1u8; 32], &[2u8; 32]).unwrap();
+        let ephemeral = SecretKey::from_slice(&[3u8; 32]).unwrap();
+        let payment = keys.address().payment(&ephemeral).unwrap();
+        let secp = Secp256k1::new();
+        let shared = SharedSecret::new(&keys.address().scan_pub, &ephemeral);
+        let bare = Scalar::from_be_bytes(sha256::Hash::hash(&shared.secret_bytes()).to_byte_array())
+            .unwrap();
+        let bare_pub = keys.spending_pubkey().add_exp_tweak(&secp, &bare).unwrap();
+        assert_ne!(payment.one_time_pub, bare_pub, "tweak must be domain separated");
+    }
+
+    #[test]
+    fn same_ephemeral_different_index_gives_different_addresses() {
+        let keys = StealthKeys::generate().unwrap();
+        let ephemeral = random_secret().unwrap();
+        let a = keys.address().payment_indexed(&ephemeral, 0).unwrap();
+        let b = keys.address().payment_indexed(&ephemeral, 1).unwrap();
+        assert_ne!(a.script_pubkey, b.script_pubkey);
+        assert_eq!(a.ephemeral_pub, b.ephemeral_pub);
+        // Both are recoverable at their own index only.
+        let (ha, hb) = (hash_of(&a.one_time_pub), hash_of(&b.one_time_pub));
+        assert!(keys.scan_output_indexed(&a.ephemeral_pub, 1, &hb).unwrap().is_some());
+        assert!(keys.scan_output_indexed(&a.ephemeral_pub, 0, &ha).unwrap().is_some());
+        assert!(keys.scan_output_indexed(&a.ephemeral_pub, 0, &hb).unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_outputs_remain_recoverable() {
+        let keys = StealthKeys::from_secrets(&[1u8; 32], &[2u8; 32]).unwrap();
+        let ephemeral = SecretKey::from_slice(&[3u8; 32]).unwrap();
+        let secp = Secp256k1::new();
+        let shared = SharedSecret::new(&keys.address().scan_pub, &ephemeral);
+        let tweak = legacy_tweak(shared.secret_bytes());
+        let old_pub = keys.spending_pubkey().add_exp_tweak(&secp, &tweak).unwrap();
+        let eph_pub = PublicKey::from_secret_key(&secp, &ephemeral);
+        let secret = keys.scan_output(&eph_pub, &hash_of(&old_pub)).unwrap().unwrap();
+        assert_eq!(PublicKey::from_secret_key(&secp, &secret), old_pub);
+    }
+
+    /// Audit: the old "view key" was `SHA256(scan_secret || "anon-view")`,
+    /// a one-way hash that cannot scan anything. A real view key must find
+    /// payments yet carry no spending secret.
+    #[test]
+    fn view_key_scans_but_cannot_spend() {
+        let keys = StealthKeys::generate().unwrap();
+        let payment = keys.address().payment(&random_secret().unwrap()).unwrap();
+        let hash = hash_of(&payment.one_time_pub);
+
+        let exported = keys.view_key().to_bytes();
+        let view = ViewKey::from_bytes(&exported).unwrap();
+        assert_eq!(
+            view.scan_output(&payment.ephemeral_pub, 0, &hash).unwrap(),
+            Some(payment.one_time_pub)
+        );
+        let stranger = StealthKeys::generate().unwrap();
+        let other = stranger.address().payment(&random_secret().unwrap()).unwrap();
+        assert!(view
+            .scan_output(&other.ephemeral_pub, 0, &hash_of(&other.one_time_pub))
+            .unwrap()
+            .is_none());
+
+        // The exported bytes hold neither the spending secret nor anything
+        // from which the one-time secret follows.
+        let spending = keys.spending.secret_bytes();
+        assert!(!exported.windows(32).any(|w| w == spending));
+        assert_eq!(&exported[32..], &keys.spending_pubkey().serialize());
+        assert!(ViewKey::from_bytes(&exported[..64]).is_err());
+    }
+
+    #[test]
+    fn spend_and_scan_keys_must_differ() {
+        assert!(matches!(
+            StealthKeys::from_secrets(&[5u8; 32], &[5u8; 32]),
+            Err(StealthError::KeysNotSeparated)
+        ));
+    }
+
+    #[test]
+    fn hostile_chain_data_never_panics() {
+        // Truncated / non-curve markers and odd scripts are rejected, not panicked on.
+        let mut bad = vec![0x6a, 0x21];
+        bad.extend_from_slice(&[0x05; 33]);
+        assert!(parse_marker(&ScriptBuf::from_bytes(bad)).is_none());
+        let mut zero = vec![0x6a, 0x21, 0x02];
+        zero.extend_from_slice(&[0u8; 32]);
+        assert!(parse_marker(&ScriptBuf::from_bytes(zero)).is_none());
+        assert_eq!(extract_hash160(&ScriptBuf::from_bytes(vec![0x76, 0xa9])), None);
+        assert!(StealthAddress::from_bytes(&[0u8; 66]).is_err());
+        assert!(StealthAddress::from_bytes(&[]).is_err());
+    }
+
+    #[test]
+    fn debug_output_does_not_leak_secrets() {
+        let keys = StealthKeys::from_secrets(&[0xabu8; 32], &[0xcdu8; 32]).unwrap();
+        let shown = format!("{keys:?} {:?}", keys.view_key());
+        assert!(!shown.contains("abab") && !shown.contains("cdcd") && !shown.contains("171"));
     }
 }
