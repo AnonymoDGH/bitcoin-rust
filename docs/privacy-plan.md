@@ -99,7 +99,7 @@ protects the middle; the edges must be designed for too.
 
 ### Phase 2 - hidden amounts (implemented, consensus-active; sender ambiguity NOT provided)
 - **Confidential Transactions**: Pedersen commitments `C(v,r) = v*G + r*H`
-  (`H = SHA256("AnonCoin-H-v1")*G`) with 64-bit range proofs (binary
+  (`H` = NUMS point, try-and-increment hash-to-curve of `"AnonCoin-H-v2"`; no known dlog) with 64-bit range proofs (binary
   Schnorr disjunctions) and Schnorr balance proofs proving
   `sum_in - sum_out - fee` consistent without revealing amounts.
   Activated in consensus behind the `ct_enabled` chain parameter
