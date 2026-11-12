@@ -178,6 +178,14 @@ pub fn connect_block(
         // Confidential transactions are authorised by owner Schnorr signatures and
         // CT balance/range proofs, not by scriptPubKey execution.
         let mut is_ct = false;
+        // A coinbase is never CT-verified, so a CT output there would hide an
+        // unchecked amount (range proofs are re-checked only up to 2^64 at
+        // spend time): forbid it outright.
+        if is_coinbase
+            && tx.vout.iter().any(|o| crate::confidential::is_ct_script(o.script_pubkey.as_bytes()))
+        {
+            return Err(ValidationError::BadCt);
+        }
         if params.ct_enabled && !is_coinbase {
             is_ct = tx.vout.iter().any(|o| crate::confidential::is_ct_script(o.script_pubkey.as_bytes()))
                 || spent_outs.iter().any(|o| crate::confidential::is_ct_script(o.script_pubkey.as_bytes()));
@@ -783,6 +791,24 @@ mod tests {
             ValidationError::BadCt
         );
     }
+    #[test]
+    fn coinbase_with_ct_output_is_rejected() {
+        use crate::confidential::{create_commitment, encode_ct_script, CtOutputData};
+        let mut f = Fixture::new(1);
+        let mut params = f.params.clone();
+        params.ct_enabled = true;
+        // Hidden 10^15 sat output in the coinbase: never balance-checked.
+        let c = create_commitment(1_000_000_000_000_000, [9u8; 32]).unwrap();
+        let script = encode_ct_script(&CtOutputData::unaddressed(c.commitment, [1u8; 20], c.proof)).unwrap();
+        let height = f.tree.get(f.tip).height + 1;
+        let mut cb = coinbase_tx(height, f.params.block_subsidy(height));
+        cb.vout.push(TxOut::new(0, script));
+        let (id, block) = next_block(&mut f.tree, f.tip, vec![cb], height);
+        assert_eq!(connect(&mut f.base, &f.tree, &params, id, &block).unwrap_err(), ValidationError::BadCt);
+        // Also when CT is disabled for the chain.
+        assert_eq!(connect(&mut f.base, &f.tree, &f.params, id, &block).unwrap_err(), ValidationError::BadCt);
+    }
+
     #[test]
     fn ct_tx_signed_by_non_owner_is_rejected_in_block() {
         use crate::confidential::{create_commitment, encode_ct_script, CtOutputData};
