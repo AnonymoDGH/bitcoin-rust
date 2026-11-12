@@ -116,8 +116,11 @@ impl Node {
     /// Loads `wallet` and rescans blocks it has not seen (`AttachChain`).
     pub fn attach_wallet(&mut self, mut wallet: Wallet) -> Result<(), WalletError> {
         let cs = &self.chainstate;
+        // A wallet that never scanned for stealth payments (written before
+        // they were imported) rescans the whole chain once.
+        let rescan_stealth = wallet.needs_stealth_rescan();
         let start = match wallet.best_block() {
-            Some((hash, height)) if cs.block_hash_at(height) == Some(hash) => height + 1,
+            Some((hash, height)) if !rescan_stealth && cs.block_hash_at(height) == Some(hash) => height + 1,
             _ => 1,
         };
         for height in start..=cs.height() {
@@ -127,6 +130,9 @@ impl Node {
             }
         }
         wallet.set_best_block(cs.tip_hash(), cs.height())?;
+        if rescan_stealth {
+            wallet.mark_stealth_scanned()?;
+        }
         for entry in self.mempool.sorted_by_fee_rate() {
             wallet.tx_added_to_mempool(&entry.tx)?;
         }
@@ -368,6 +374,14 @@ impl Node {
     /// `ProcessNewBlock` + mempool/fee updates. Ok(true) if new.
     pub fn submit_block(&mut self, block: &Block) -> Result<bool, ValidationError> {
         let result = self.chainstate.process_new_block(block, now_secs());
+        self.after_chain_change();
+        result
+    }
+
+    /// `invalidateblock`: marks `hash` failed and reorganises away from it,
+    /// notifying the wallet of every disconnected and connected block.
+    pub fn invalidate_block(&mut self, hash: &BlockHash) -> Result<(), ValidationError> {
+        let result = self.chainstate.invalidate_block(hash);
         self.after_chain_change();
         result
     }

@@ -33,6 +33,14 @@ const COINBASE_MATURITY: u32 = 100;
 /// Passes of the fee-subtraction loop before the last transaction is accepted as is.
 const FEE_SUBTRACTION_PASSES: usize = 4;
 
+/// Stealth-marker transactions queued while an encrypted wallet is locked
+/// (oldest dropped beyond this; see `Wallet::stealth_pending`).
+const MAX_PENDING_STEALTH: usize = 50_000;
+
+/// Marker outputs scanned per transaction (each costs up to
+/// `stealth::MAX_SCAN_INDEX` point additions).
+const MAX_MARKERS_PER_TX: usize = 4;
+
 #[derive(Debug, Error)]
 pub enum WalletError {
     #[error("wallet file I/O failed: {0}")]
@@ -207,6 +215,16 @@ struct KeyRecord {
     testnet: bool,
     scripts: Vec<(ScriptKind, ScriptBuf)>,
     secret: Secret,
+    /// One-time key recovered from a stealth payment (not user-derived).
+    stealth: bool,
+}
+
+/// A transaction that carries a stealth marker, seen while the stealth seed
+/// was sealed. Public chain data only: it is scanned and credited on unlock.
+#[derive(Clone)]
+struct PendingStealth {
+    tx: Tx,
+    conf: Confirmation,
 }
 
 /// `CMasterKey`: the random master key, encrypted under the passphrase-derived key.
@@ -244,6 +262,13 @@ pub struct Wallet {
     /// CT/note secrets of coins under the master key, kept while the wallet is
     /// locked (their plaintext lives in `Coin::ct` / `Coin::note` only while unlocked).
     sealed_coins: BTreeMap<OutPoint, Vec<u8>>,
+    /// Stealth-marker transactions seen while locked (the scan key is sealed
+    /// with the seed, so they cannot be matched yet). Drained by `unlock`.
+    /// Capped at `MAX_PENDING_STEALTH`, oldest dropped first.
+    stealth_pending: Vec<PendingStealth>,
+    /// False for wallets written before stealth payments were scanned into
+    /// the wallet: the node rescans the whole chain once on attach.
+    stealth_scanned: bool,
 }
 
 impl Wallet {
@@ -256,6 +281,7 @@ impl Wallet {
         let mut seed = [0u8; 32];
         getrandom::getrandom(&mut seed).map_err(KeyError::Random)?;
         wallet.stealth_seed = Some(seed);
+        wallet.stealth_scanned = true;
         wipe(&mut seed);
         wallet.save()?;
         Ok(wallet)
@@ -285,6 +311,8 @@ impl Wallet {
             stealth_seed: None,
             stealth_seed_sealed: None,
             sealed_coins: BTreeMap::new(),
+            stealth_pending: Vec::new(),
+            stealth_scanned: false,
         }
     }
 
@@ -973,10 +1001,16 @@ impl Wallet {
 
     /// Adds `key` to the wallet and returns its id. The caller saves the file.
     fn add_key(&mut self, key: PrivateKey) -> Result<KeyId, WalletError> {
+        self.add_key_flagged(key, false)
+    }
+
+    /// `add_key`, marking the key as a one-time stealth key when `stealth`.
+    fn add_key_flagged(&mut self, key: PrivateKey, stealth: bool) -> Result<KeyId, WalletError> {
         let secp = Secp256k1::new();
         let pubkey = PublicKey::from_private_key(&secp, &key);
         let id = pubkey.pubkey_hash();
-        if self.key_records.contains_key(&id) {
+        if let Some(rec) = self.key_records.get_mut(&id) {
+            rec.stealth |= stealth;
             return Ok(id);
         }
         let secret = if self.is_encrypted() {
@@ -1006,6 +1040,7 @@ impl Wallet {
                 testnet: key.network == NetworkKind::Test,
                 scripts,
                 secret,
+                stealth,
             },
         );
         if self.first_key.is_none() {
@@ -1149,6 +1184,7 @@ impl Wallet {
         self.sealed_coins.clear();
         self.master_key = Some(master);
         self.unlocked_until = Some(until_unix);
+        self.process_pending_stealth();
         // Re-persist: scrubs plaintext privacy secrets left by wallets that
         // were encrypted before they were sealed. Best effort.
         let _ = self.save();
@@ -1237,6 +1273,7 @@ impl Wallet {
                 }
             }
             self.coins.retain(|outpoint, _| outpoint.txid != txid);
+            self.stealth_pending.retain(|p| p.tx.txid() != txid);
             if let Some(rec) = self.txs.iter_mut().find(|t| t.txid == txid) {
                 rec.height = None;
                 rec.block_hash = None;
@@ -1275,6 +1312,12 @@ impl Wallet {
 
     /// Forgets an unconfirmed transaction that left the mempool, with its descendants.
     pub fn tx_removed_from_mempool(&mut self, txid: &Txid) -> Result<(), WalletError> {
+        let queued = self.stealth_pending.len();
+        self.stealth_pending
+            .retain(|p| !(p.conf.height.is_none() && p.tx.txid() == *txid));
+        if self.stealth_pending.len() != queued {
+            self.save()?;
+        }
         if self
             .txs
             .iter()
@@ -1320,6 +1363,10 @@ impl Wallet {
                     ours_in += 1;
                 }
             }
+        }
+
+        if !is_coinbase {
+            self.scan_stealth(tx, conf);
         }
 
         let mut received = 0i64;
@@ -1382,6 +1429,103 @@ impl Wallet {
         }
     }
 
+    /// Detects stealth payments to this wallet in `tx` (an `OP_RETURN
+    /// <ephemeral_pub>` marker plus P2PKH/P2WPKH outputs) and imports the
+    /// recovered one-time secrets as ordinary wallet keys, so `apply_tx` then
+    /// credits the outputs like any other coin. Both the indexed tweak and the
+    /// legacy un-indexed one are tried. While an encrypted wallet is locked the
+    /// scan key is unavailable: the transaction is queued and handled on unlock.
+    /// Idempotent. The caller saves the wallet.
+    fn scan_stealth(&mut self, tx: &Tx, conf: Confirmation) {
+        use crate::stealth::{extract_hash160, parse_marker};
+        let ephemerals: Vec<_> = tx
+            .vout
+            .iter()
+            .filter_map(|o| parse_marker(&o.script_pubkey))
+            .take(MAX_MARKERS_PER_TX)
+            .collect();
+        if ephemerals.is_empty() {
+            return;
+        }
+        let candidates: Vec<(usize, bitcoin::PubkeyHash)> = tx
+            .vout
+            .iter()
+            .enumerate()
+            .filter_map(|(n, o)| extract_hash160(&o.script_pubkey).map(|h| (n, h)))
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        if self.check_unlocked().is_err() {
+            let txid = tx.txid();
+            self.stealth_pending.retain(|p| p.tx.txid() != txid);
+            self.stealth_pending.push(PendingStealth { tx: tx.clone(), conf });
+            if self.stealth_pending.len() > MAX_PENDING_STEALTH {
+                let excess = self.stealth_pending.len() - MAX_PENDING_STEALTH;
+                self.stealth_pending.drain(..excess);
+            }
+            return;
+        }
+        let Ok(keys) = self.stealth_keys() else {
+            return;
+        };
+        for ephemeral in &ephemerals {
+            let Ok(found) = keys.scan_tx_outputs(ephemeral, &candidates) else {
+                continue;
+            };
+            for (_, secret) in found {
+                let key = PrivateKey::new(secret, NetworkKind::Main);
+                let _ = self.add_key_flagged(key, true);
+            }
+        }
+    }
+
+    /// Credits the stealth payments queued while locked. Called by `unlock`
+    /// once the seed is available.
+    fn process_pending_stealth(&mut self) {
+        let pending = std::mem::take(&mut self.stealth_pending);
+        for p in pending {
+            self.apply_tx(&p.tx, p.conf);
+        }
+    }
+
+    /// True until the chain has been scanned for stealth payments once.
+    pub fn needs_stealth_rescan(&self) -> bool {
+        !self.stealth_scanned
+    }
+
+    /// Records that a full stealth scan of the chain has been done.
+    pub fn mark_stealth_scanned(&mut self) -> Result<(), WalletError> {
+        self.stealth_scanned = true;
+        self.save()
+    }
+
+    /// Number of marker transactions waiting for the next unlock.
+    pub fn pending_stealth_count(&self) -> usize {
+        self.stealth_pending.len()
+    }
+
+    /// Unspent coins received through stealth payments with at least
+    /// `minconf` confirmations: `(outpoint, txout, confirmations, spendable)`.
+    /// `spendable` follows the same rule as `create_transaction`.
+    pub fn stealth_coins(&self, tip: u32, minconf: u32) -> Vec<(OutPoint, TxOut, u32, bool)> {
+        self.coins
+            .iter()
+            .filter(|(_, c)| c.spent_by.is_none())
+            .filter(|(_, c)| {
+                self.script_index
+                    .get(&c.txout.script_pubkey)
+                    .and_then(|(id, _)| self.key_records.get(id))
+                    .is_some_and(|rec| rec.stealth)
+            })
+            .filter_map(|(outpoint, c)| {
+                let depth = Self::depth(c, tip);
+                (depth >= minconf)
+                    .then(|| (*outpoint, c.txout.clone(), depth, self.is_spendable(outpoint, c, tip)))
+            })
+            .collect()
+    }
+
     /// Removes an unconfirmed transaction, the coins it created, and any unconfirmed
     /// transactions that spend those coins. Its own spends become available again.
     fn evict_unconfirmed(&mut self, txid: Txid) {
@@ -1408,6 +1552,7 @@ impl Wallet {
             }
         }
         self.txs.retain(|t| t.txid != txid);
+        self.stealth_pending.retain(|p| p.tx.txid() != txid);
     }
 
     pub fn best_block(&self) -> Option<(BlockHash, u32)> {
@@ -1687,6 +1832,7 @@ impl Wallet {
                     pubkey: rec.pubkey.to_bytes().to_lower_hex_string(),
                     compressed: rec.compressed,
                     testnet: rec.testnet,
+                    stealth: rec.stealth,
                     scripts: rec
                         .scripts
                         .iter()
@@ -1757,6 +1903,17 @@ impl Wallet {
                 hash: hash.to_string(),
                 height,
             }),
+            stealth_pending: self
+                .stealth_pending
+                .iter()
+                .map(|p| PendingFile {
+                    tx: bitcoin::consensus::encode::serialize_hex(&p.tx),
+                    height: p.conf.height,
+                    block_hash: p.conf.block_hash.map(|h| h.to_string()),
+                    time: p.conf.time,
+                })
+                .collect(),
+            stealth_scanned: self.stealth_scanned,
         }
     }
 
@@ -1810,6 +1967,7 @@ impl Wallet {
                     testnet: kf.testnet,
                     scripts,
                     secret,
+                    stealth: kf.stealth,
                 },
             );
         }
@@ -1891,6 +2049,21 @@ impl Wallet {
             });
         }
 
+        wallet.stealth_scanned = file.stealth_scanned;
+        for pf in file.stealth_pending {
+            let tx: Tx = bitcoin::consensus::encode::deserialize_hex(&pf.tx)
+                .map_err(|e| corrupt(format!("pending stealth tx: {e}")))?;
+            let block_hash = pf
+                .block_hash
+                .as_deref()
+                .map(|h| BlockHash::from_str(h).map_err(|e| corrupt(format!("pending block hash: {e}"))))
+                .transpose()?;
+            wallet.stealth_pending.push(PendingStealth {
+                tx,
+                conf: Confirmation { height: pf.height, block_hash, time: pf.time },
+            });
+        }
+
         wallet.best_block = match file.best_block {
             Some(bb) => Some((
                 BlockHash::from_str(&bb.hash).map_err(|e| corrupt(format!("best block: {e}")))?,
@@ -1920,6 +2093,21 @@ struct WalletFile {
     /// Stealth seed under the master key (hex); only in encrypted wallets.
     #[serde(default)]
     stealth_seed_sealed: Option<String>,
+    /// Stealth-marker transactions queued while locked.
+    #[serde(default)]
+    stealth_pending: Vec<PendingFile>,
+    /// Whether the chain was scanned for stealth payments (absent = no).
+    #[serde(default)]
+    stealth_scanned: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PendingFile {
+    /// Consensus-serialised transaction (hex).
+    tx: String,
+    height: Option<u32>,
+    block_hash: Option<String>,
+    time: i64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1929,6 +2117,8 @@ struct KeyFile {
     testnet: bool,
     scripts: Vec<ScriptFile>,
     secret: SecretFile,
+    #[serde(default)]
+    stealth: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2465,6 +2655,39 @@ mod tests {
         drop(wallet);
         let wallet = Wallet::open(&file.0).unwrap();
         assert_eq!(wallet.stealth_keys().unwrap().address(), first);
+    }
+
+    #[test]
+    fn stealth_outputs_of_one_tx_are_all_imported_and_spendable() {
+        let file = TestFile::new("stealth-multi");
+        let mut wallet = Wallet::create(&file.0).unwrap();
+        let addr = wallet.stealth_address().unwrap();
+        let ephemeral = crate::stealth::ephemeral_secret().unwrap();
+        let p0 = addr.payment_indexed(&ephemeral, 0).unwrap();
+        let p1 = addr.payment_indexed(&ephemeral, 1).unwrap();
+        let tx = Tx::new(
+            2,
+            vec![TxIn::new(OutPoint::new(Txid::from_byte_array([5; 32]), 0))],
+            vec![
+                TxOut::new(0, crate::stealth::marker_script(&p0.ephemeral_pub)),
+                TxOut::new(3_000, p0.script_pubkey.clone()),
+                TxOut::new(4_000, payee(0x42)),
+                TxOut::new(5_000, p1.script_pubkey.clone()),
+            ],
+            0,
+        );
+        connect(&mut wallet, 1, vec![tx]);
+        let coins = wallet.stealth_coins(1, 1);
+        let mut amounts: Vec<i64> = coins.iter().map(|c| c.1.value).collect();
+        amounts.sort_unstable();
+        assert_eq!(amounts, vec![3_000, 5_000]);
+        assert!(coins.iter().all(|c| c.3), "confirmed stealth coins are spendable");
+        assert_eq!(wallet.balance(1, 1), 8_000);
+        assert_eq!(wallet.list_unspent(1, 1, 9_999).len(), 2);
+
+        // Flags and keys persist.
+        let reopened = Wallet::open(&file.0).unwrap();
+        assert_eq!(reopened.stealth_coins(1, 1).len(), 2);
     }
 
     #[test]

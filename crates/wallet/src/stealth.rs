@@ -39,6 +39,10 @@ pub enum StealthError {
 /// same shared secret would otherwise yield the same scalar).
 const TWEAK_DOMAIN: &[u8] = b"AnonCoin/stealth-tweak/v1";
 
+/// Most stealth output indices scanned per ephemeral key in one transaction
+/// (bounds the work an attacker-crafted marker can cost the scanner).
+pub const MAX_SCAN_INDEX: u32 = 64;
+
 /// Recipient keypair for stealth payments.
 /// `spending` controls funds; `scan` only tests incoming outputs.
 #[derive(Clone)]
@@ -145,6 +149,41 @@ impl StealthKeys {
             }
         }
         Ok(None)
+    }
+}
+
+impl StealthKeys {
+    /// Scans every candidate output of one transaction against a single
+    /// ephemeral key: one ECDH, then the current indexed derivation for
+    /// `index` in `0..candidates.len()` (capped at [`MAX_SCAN_INDEX`]) and the
+    /// legacy un-indexed derivation. Returns `(position, one_time_secret)`
+    /// for each candidate that pays this recipient. `candidates` pairs an
+    /// output position with its HASH160.
+    pub fn scan_tx_outputs(
+        &self,
+        ephemeral_pub: &PublicKey,
+        candidates: &[(usize, PubkeyHash)],
+    ) -> Result<Vec<(usize, SecretKey)>, StealthError> {
+        let secp = Secp256k1::new();
+        let spending_pub = self.spending_pubkey();
+        let shared = SharedSecret::new(ephemeral_pub, &self.scan).secret_bytes();
+        let max_index = (candidates.len() as u32).min(MAX_SCAN_INDEX);
+        let mut tweaks: Vec<Scalar> = (0..max_index).map(|i| shared_tweak(shared, i)).collect();
+        tweaks.push(legacy_tweak(shared));
+        let mut found: Vec<(usize, SecretKey)> = Vec::new();
+        for tweak in tweaks {
+            let hash = one_time_hash(&secp, &spending_pub, &tweak)?;
+            for (pos, candidate) in candidates {
+                if *candidate == hash && !found.iter().any(|(p, _)| p == pos) {
+                    let secret = self
+                        .spending
+                        .add_tweak(&tweak)
+                        .map_err(|_| StealthError::Tweak)?;
+                    found.push((*pos, secret));
+                }
+            }
+        }
+        Ok(found)
     }
 }
 
@@ -581,5 +620,44 @@ mod tests {
         let keys = StealthKeys::from_secrets(&[0xabu8; 32], &[0xcdu8; 32]).unwrap();
         let shown = format!("{keys:?} {:?}", keys.view_key());
         assert!(!shown.contains("abab") && !shown.contains("cdcd") && !shown.contains("171"));
+    }
+
+    #[test]
+    fn scan_tx_outputs_finds_indexed_and_legacy_outputs() {
+        let keys = StealthKeys::from_secrets(&[1u8; 32], &[2u8; 32]).unwrap();
+        let ephemeral = SecretKey::from_slice(&[3u8; 32]).unwrap();
+        let secp = Secp256k1::new();
+        let eph_pub = PublicKey::from_secret_key(&secp, &ephemeral);
+        let addr = keys.address();
+        let p0 = addr.payment_indexed(&ephemeral, 0).unwrap();
+        let p2 = addr.payment_indexed(&ephemeral, 2).unwrap();
+        let shared = SharedSecret::new(&addr.scan_pub, &ephemeral);
+        let legacy = keys
+            .spending_pubkey()
+            .add_exp_tweak(&secp, &legacy_tweak(shared.secret_bytes()))
+            .unwrap();
+        let stranger = StealthKeys::generate().unwrap()
+            .address().payment(&random_secret().unwrap()).unwrap();
+        let candidates = vec![
+            (0usize, hash_of(&stranger.one_time_pub)),
+            (1, hash_of(&p2.one_time_pub)),
+            (3, hash_of(&p0.one_time_pub)),
+            (4, hash_of(&legacy)),
+        ];
+        let found = keys.scan_tx_outputs(&eph_pub, &candidates).unwrap();
+        let mut positions: Vec<usize> = found.iter().map(|(p, _)| *p).collect();
+        positions.sort_unstable();
+        assert_eq!(positions, vec![1, 3, 4]);
+        for (pos, secret) in found {
+            let expected = match pos {
+                1 => p2.one_time_pub,
+                3 => p0.one_time_pub,
+                _ => legacy,
+            };
+            assert_eq!(PublicKey::from_secret_key(&secp, &secret), expected);
+        }
+        // A different ephemeral key matches nothing.
+        let other = PublicKey::from_secret_key(&secp, &random_secret().unwrap());
+        assert!(keys.scan_tx_outputs(&other, &candidates).unwrap().is_empty());
     }
 }
