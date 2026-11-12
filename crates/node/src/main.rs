@@ -42,6 +42,24 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    if let Some(dir) = &config.snark_setup {
+        eprintln!("WARNING: single-party Groth16 setup. This process holds the toxic waste while it");
+        eprintln!("WARNING: runs; anyone who obtains it can forge proofs and mint unlimited shielded value.");
+        eprintln!("WARNING: Use for development networks only. A multi-party ceremony is REQUIRED before mainnet.");
+        return match btc_node::snark_setup::run_snark_setup(dir) {
+            Ok(out) => {
+                println!("wrote snark_pk.bin, snark_vk.bin, snark_vk.hex to {}", dir.display());
+                println!("snark_vk sha256: {}", bitcoin::hex::DisplayHex::to_lower_hex_string(&out.vk_sha256));
+                println!("pin it in the chain spec: \"snark_vk\": \"<contents of snark_vk.hex>\"");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
     match run(config).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -92,6 +110,21 @@ async fn run(config: NodeConfig) -> Result<(), Box<dyn Error>> {
             .map_err(|e| format!("wallet {}: {e}", path.display()))?;
         node.attach_wallet(wallet).map_err(|e| format!("wallet rescan: {e}"))?;
         println!("wallet: {}", path.display());
+    }
+    match &params.snark_vk {
+        Some(vk) => println!(
+            "snark: verifying key pinned, sha256 {}",
+            bitcoin::hex::DisplayHex::to_lower_hex_string(&btc_chain::value_snark::vk_sha256(vk))
+        ),
+        None => println!("snark: no verifying key configured; SNARK proofs are rejected"),
+    }
+    match btc_node::snark_setup::load_proving_key(&config.datadir, params.snark_vk.as_deref()) {
+        Ok(Some(pk)) => {
+            node.snark_pk = Some(Arc::new(pk));
+            println!("snark: proving key loaded from {}", config.datadir.join("snark_pk.bin").display());
+        }
+        Ok(None) => {}
+        Err(err) => eprintln!("warning: snark proving key ignored: {err}"),
     }
     let node: SharedNode = node.shared();
 

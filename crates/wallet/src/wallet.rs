@@ -662,8 +662,12 @@ impl Wallet {
     /// Builds a note spend: spends the pool output at `prevout` with the
     /// note opening, anchor authorisation and membership path, to the
     /// given recipient script. `cap` is the note's on-chain funding
-    /// cap (from the funding ledger); a Groth16 value-hiding proof is
-    /// generated and attached as `witness[3]`.
+    /// cap (from the funding ledger). With `snark_pk` a Groth16
+    /// value-hiding proof is generated (fresh OS randomness) and
+    /// attached as `witness[3]`; it only validates on chains whose
+    /// parameters pin the matching verifying key. Without a key the spend
+    /// is plain (ledger-bounded) and carries no proof.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_note_spend(
         &mut self,
         prevout: OutPoint,
@@ -675,6 +679,7 @@ impl Wallet {
         recipient_script: ScriptBuf,
         amount: i64,
         cap: u64,
+        snark_pk: Option<&btc_chain::value_snark::SnarkProvingKey>,
     ) -> Result<Tx, WalletError> {
         use btc_chain::notes::{
             authorize_spend, encode_note, encode_path, encode_spend_auth,
@@ -689,30 +694,33 @@ impl Wallet {
         let context = btc_chain::confidential::ct_context(&tx);
         let sig = authorize_spend(&note, secret, &anchor, &context)
             .map_err(|_| WalletError::Build("note authorize failed".into()))?;
-        let fee = note.value - amount as u64;
-        let transcript = btc_chain::value_snark::transcript_for_spend(
-            &note,
-            &btc_chain::notes::note_commitment(&note),
-            amount as u64,
-            fee,
-            cap,
-        );
-        let dummy = [0u8; 32];
-        let snark_witness = btc_chain::value_snark::ValueWitness {
-            v_old: note.value,
-            rcm_old: note.rcm,
-            spending_pub: note.spending_pub,
-            v_new: [amount as u64, 0],
-            rcm_new: [dummy, dummy],
-        };
-        let proof = btc_chain::value_snark::prove(transcript, snark_witness)
-            .map_err(|_| WalletError::Build("note value proof failed".into()))?;
-        tx.vin[0].witness = bitcoin::Witness::from_slice(&[
+        let mut items = vec![
             encode_note(&note),
             encode_spend_auth(&anchor, index, &sig),
             encode_path(&path),
-            btc_chain::value_snark::serialize_proof(&proof),
-        ]);
+        ];
+        if let Some(pk) = snark_pk {
+            let fee = note.value - amount as u64;
+            let transcript = btc_chain::value_snark::transcript_for_spend(
+                &note,
+                &btc_chain::notes::note_commitment(&note),
+                amount as u64,
+                fee,
+                cap,
+            );
+            let dummy = [0u8; 32];
+            let snark_witness = btc_chain::value_snark::ValueWitness {
+                v_old: note.value,
+                rcm_old: note.rcm,
+                spending_pub: note.spending_pub,
+                v_new: [amount as u64, 0],
+                rcm_new: [dummy, dummy],
+            };
+            let proof = btc_chain::value_snark::prove(pk, transcript, snark_witness)
+                .map_err(|_| WalletError::Build("note value proof failed".into()))?;
+            items.push(btc_chain::value_snark::serialize_proof(&proof));
+        }
+        tx.vin[0].witness = bitcoin::Witness::from_slice(&items);
         Ok(tx)
     }
 
@@ -720,7 +728,9 @@ impl Wallet {
     /// single new pool note (hidden value), with a public fee proven by
     /// a Groth16 proof (`witness[3]`) and the fee + new commitments in
     /// `witness[4]`. `cap` is the spent note's funding cap (sats);
-    /// `fee` is the public miner fee in sats.
+    /// `fee` is the public miner fee in sats. The proof needs the
+    /// setup's proving key (`snark_pk`).
+    #[allow(clippy::too_many_arguments)]
     pub fn create_note_spend_shielded(
         &mut self,
         prevout: OutPoint,
@@ -731,6 +741,7 @@ impl Wallet {
         path: Vec<[u8; 32]>,
         cap: u64,
         fee: u64,
+        snark_pk: &btc_chain::value_snark::SnarkProvingKey,
     ) -> Result<(Tx, NoteCoinInfo, OutPoint), WalletError> {
         use btc_chain::notes::{
             authorize_spend, encode_note, encode_path, encode_spend_auth,
@@ -801,7 +812,7 @@ impl Wallet {
             v_new: [new_value, 0],
             rcm_new: [rcm, dummy],
         };
-        let proof = btc_chain::value_snark::prove(transcript, snark_witness)
+        let proof = btc_chain::value_snark::prove(snark_pk, transcript, snark_witness)
             .map_err(|_| WalletError::Build("note value proof failed".into()))?;
         let mut shield = Vec::with_capacity(72);
         shield.extend_from_slice(&fee.to_le_bytes());
@@ -2092,7 +2103,7 @@ mod tests {
         let spendscript = ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([0x42; 20]));
         let spent_tx = Wallet::open(&file.0)
             .unwrap()
-            .create_note_spend(note_op, note.clone(), &note_coin.secret, anchor, 0, path, spendscript, 99_990000, note.value)
+            .create_note_spend(note_op, note.clone(), &note_coin.secret, anchor, 0, path.clone(), spendscript.clone(), 99_990000, note.value, None)
             .unwrap();
         let spent_outs = [btc_primitives::TxOut::new(0, note_tx.vout[0].script_pubkey.clone())];
         btc_chain::notes::verify_note_tx_block(
@@ -2101,6 +2112,17 @@ mod tests {
             Some(anchor),
         )
         .expect("note spend must verify at chain level");
+        // With a proving key the spend carries a SNARK proof: valid under
+        // the matching verifying key, rejected when no key is configured.
+        let (pk, vk_raw) = btc_chain::value_snark::ephemeral_process_parameters();
+        let vk = btc_chain::value_snark::SnarkVk::from_vk(vk_raw).unwrap();
+        let proof_tx = Wallet::open(&file.0)
+            .unwrap()
+            .create_note_spend(note_op, note.clone(), &note_coin.secret, anchor, 0, path, spendscript, 99_990000, note.value, Some(pk))
+            .unwrap();
+        assert!(btc_chain::notes::verify_note_tx_block(&proof_tx, &spent_outs, Some(anchor)).is_err());
+        btc_chain::notes::verify_note_tx_block_with_snark(&proof_tx, &spent_outs, Some(anchor), None, Some(&vk))
+            .expect("proof spend verifies under the pinned key");
     }
 
     #[test]
@@ -2141,6 +2163,8 @@ mod tests {
         let anchor = tree.root();
         let path = tree.path(0);
         let cap: u64 = 1_00000000 + 10_000;
+        let (pk, vk_raw) = btc_chain::value_snark::ephemeral_process_parameters();
+        let vk = btc_chain::value_snark::SnarkVk::from_vk(vk_raw).unwrap();
         let (spent_tx, new_info, new_op) = Wallet::open(&file.0)
             .unwrap()
             .create_note_spend_shielded(
@@ -2152,6 +2176,7 @@ mod tests {
                 path,
                 cap,
                 5_000,
+                pk,
             )
             .unwrap();
         assert_eq!(new_info.value, note.value - 5_000);
@@ -2159,11 +2184,12 @@ mod tests {
         let spent_outs = [btc_primitives::TxOut::new(0, note_tx.vout[0].script_pubkey.clone())];
         let mut caps = std::collections::HashMap::new();
         caps.insert(btc_chain::notes::note_commitment(&note), cap);
-        let fee = btc_chain::notes::verify_note_tx_block_with_caps(
+        let fee = btc_chain::notes::verify_note_tx_block_with_snark(
             &spent_tx,
             &spent_outs,
             Some(anchor),
             Some(&caps),
+            Some(&vk),
         )
         .expect("shielded spend verifies at chain level");
         assert_eq!(fee, 5_000);

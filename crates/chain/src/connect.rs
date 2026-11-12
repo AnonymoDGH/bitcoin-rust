@@ -98,11 +98,18 @@ pub fn connect_block(
                 .iter()
                 .any(|o| crate::notes::is_pool_script(o.script_pubkey.as_bytes()));
             if has_note_input {
-                let fee_note = crate::notes::verify_note_tx_block_with_caps(
+                // SNARK proofs count only under the chain-pinned verifying
+                // key; with none configured a proof-carrying spend is invalid.
+                let snark_vk = params
+                    .snark_vk
+                    .as_deref()
+                    .and_then(crate::value_snark::snark_vk_cached);
+                let fee_note = crate::notes::verify_note_tx_block_with_snark(
                     tx,
                     &spent_outs,
                     opts.pool_root,
                     opts.pool_funding.as_ref(),
+                    snark_vk.as_deref(),
                 )
                 .map_err(|_| ValidationError::BadCt)?;
                 fees += fee_note;

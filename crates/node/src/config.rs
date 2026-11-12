@@ -73,6 +73,9 @@ pub struct NodeConfig {
     pub max_blocks: Option<u32>,
     /// Print an example chain spec and exit (`-printchainspec`).
     pub print_chainspec: bool,
+    /// Run a single-party Groth16 setup, write the key files to this
+    /// directory and exit (`-snarksetup=<dir>`; development networks only).
+    pub snark_setup: Option<PathBuf>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -132,6 +135,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
     let mut block_interval: Option<u64> = None;
     let mut max_blocks: Option<u32> = None;
     let mut print_chainspec = false;
+    let mut snark_setup: Option<PathBuf> = None;
 
     for arg in args {
         let body = match arg.strip_prefix("--").or_else(|| arg.strip_prefix('-')) {
@@ -192,6 +196,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
                 max_blocks = Some(blocks);
             }
             "printchainspec" => print_chainspec = parse_bool("printchainspec", value)?,
+            "snarksetup" => snark_setup = Some(PathBuf::from(required("snarksetup", value)?)),
             _ => return Err(ConfigError::UnknownOption(arg.to_string())),
         }
     }
@@ -285,6 +290,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<NodeConfig,
         block_interval,
         max_blocks,
         print_chainspec,
+        snark_setup,
     })
 }
 

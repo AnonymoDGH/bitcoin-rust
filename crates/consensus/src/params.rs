@@ -107,6 +107,12 @@ pub struct ChainParams {
     /// range and balance proofs, see `btc-chain::confidential`) are valid
     /// on this chain. Off for mainnet/testnet/regtest; on for AnonCoin.
     pub ct_enabled: bool,
+    /// Serialized (ark-serialize compressed) Groth16 verifying key for the
+    /// value-hiding SNARK (`btc-chain::value_snark`). `None` means no key
+    /// is configured: SNARK proofs are rejected by consensus and mempool.
+    /// The key is a trusted-setup artefact and must come from a ceremony;
+    /// it is never derived from a seed.
+    pub snark_vk: Option<Vec<u8>>,
     /// `enforce_BIP94` (testnet4 timewarp mitigation; off for these chains).
     pub enforce_bip94: bool,
     /// `bech32_hrp`: human-readable part for segwit/taproot addresses.
@@ -163,6 +169,7 @@ impl ChainParams {
             allow_min_difficulty_blocks: false,
             no_retargeting: false,
             ct_enabled: false,
+            snark_vk: None,
             enforce_bip94: false,
             deployments: Deployments {
                 bip34_height: 227_931,
@@ -212,6 +219,7 @@ impl ChainParams {
             allow_min_difficulty_blocks: true,
             no_retargeting: false,
             ct_enabled: false,
+            snark_vk: None,
             enforce_bip94: false,
             deployments: Deployments {
                 bip34_height: 21_111,
@@ -255,6 +263,7 @@ impl ChainParams {
             allow_min_difficulty_blocks: true,
             no_retargeting: true,
             ct_enabled: false,
+            snark_vk: None,
             enforce_bip94: false,
             deployments: Deployments::all_active(),
             bech32_hrp: "bcrt".to_string(),
@@ -302,6 +311,7 @@ impl ChainParams {
             allow_min_difficulty_blocks: spec.allow_min_difficulty_blocks,
             no_retargeting: spec.no_retargeting,
             ct_enabled: spec.ct_enabled,
+            snark_vk: spec.snark_vk.clone(),
             enforce_bip94: false,
             deployments: Deployments::all_active(),
             bech32_hrp: spec.bech32_hrp.clone(),
@@ -384,6 +394,9 @@ pub struct CustomChainSpec {
     pub no_retargeting: bool,
     /// Whether confidential outputs/transactions are valid on this chain.
     pub ct_enabled: bool,
+    /// Serialized Groth16 verifying key (see [`ChainParams::snark_vk`]).
+    /// `None` rejects every SNARK proof.
+    pub snark_vk: Option<Vec<u8>>,
     /// `bech32_hrp`.
     pub bech32_hrp: String,
     /// `base58Prefixes[PUBKEY_ADDRESS]`.
@@ -421,6 +434,7 @@ impl Default for CustomChainSpec {
             allow_min_difficulty_blocks: false,
             no_retargeting: false,
             ct_enabled: true,
+            snark_vk: None,
             bech32_hrp: "an".to_string(),
             pubkey_address_prefix: 65,
             script_address_prefix: 10,

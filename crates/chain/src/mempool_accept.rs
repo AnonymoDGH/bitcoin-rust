@@ -195,8 +195,24 @@ pub fn accept_to_mempool(chainstate: &Chainstate, mempool: &mut Mempool, tx: Tx)
         // returned fee is the real miner revenue for block assembly.
         let root = chainstate.pool_root();
         let caps = chainstate.pool_funding();
-        match crate::notes::verify_note_tx_block_with_caps(&tx, &spent_outs, Some(root), Some(caps))
-        {
+        // Proofs are only checked against the chain-pinned verifying key.
+        // Without one a proof-carrying note spend is non-standard (and
+        // consensus-invalid): reject it before any proof work.
+        let snark_vk = chainstate
+            .params
+            .snark_vk
+            .as_deref()
+            .and_then(crate::value_snark::snark_vk_cached);
+        if snark_vk.is_none() && tx.vin.iter().any(|i| i.witness.len() > 3) {
+            return Err(MempoolReject::Policy("snark-proof-no-vk".into()));
+        }
+        match crate::notes::verify_note_tx_block_with_snark(
+            &tx,
+            &spent_outs,
+            Some(root),
+            Some(caps),
+            snark_vk.as_deref(),
+        ) {
             Ok(note_fee) => {
                 fee_used = note_fee;
             }
